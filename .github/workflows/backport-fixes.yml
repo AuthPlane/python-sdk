@@ -1,0 +1,125 @@
+name: Backport fixes to default branch
+
+# Thin wrapper around scripts/backport-fixes.sh for maintainers who
+# prefer dispatching from the Actions UI. Behavior:
+#
+#   - Happy path (no conflicts): runs the script, pushes the backport
+#     branch, opens a PR against the target.
+#   - Any conflict: cherry-pick fails, the workflow fails loudly. Re-run
+#     the script locally to finish:
+#         scripts/backport-fixes.sh --from <fromBranch> --to <toBranch>
+#     and resolve conflicts via git's native cherry-pick state machine.
+#
+# fromBranch can be a branch (release/v*, hotfix/v*) or a tag (vX.Y.Z).
+# After the release workflow runs, the release branch is deleted — use the
+# tag as the fromBranch instead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      fromBranch:
+        description: 'Source ref on origin (branch or tag, e.g. release/v0.6.0, hotfix/v0.5.1, or v0.6.0). Do not include origin/.'
+        required: true
+        type: string
+      toBranch:
+        description: 'Target branch on origin. Leave empty to use the repository default branch.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: backport-${{ inputs.fromBranch }}-to-${{ inputs.toBranch }}
+  cancel-in-progress: false
+
+jobs:
+  backport:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Resolve target branch
+        id: target
+        run: |
+          to="${{ inputs.toBranch }}"
+          if [[ -z "$to" ]]; then
+            to="${{ github.event.repository.default_branch }}"
+          fi
+          echo "to=$to" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repo with full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run backport script
+        id: run
+        run: |
+          ./scripts/backport-fixes.sh \
+            --from "${{ inputs.fromBranch }}" \
+            --to   "${{ steps.target.outputs.to }}"
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push backport branch
+        if: startsWith(steps.run.outputs.branch, 'backport/')
+        run: |
+          git push origin "${{ steps.run.outputs.branch }}"
+
+      - name: Open pull request
+        if: startsWith(steps.run.outputs.branch, 'backport/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          from="${{ inputs.fromBranch }}"
+          to="${{ steps.target.outputs.to }}"
+          branch="${{ steps.run.outputs.branch }}"
+          title="chore: backport from $from to $to"
+          body=$(cat <<EOF
+          Automated backport from \`$from\` to \`$to\`.
+
+          All candidate commits applied cleanly. If the set looks wrong,
+          curate this branch locally:
+
+          \`\`\`
+          git fetch origin
+          git checkout $branch
+          git rebase -i origin/$to   # drop commits you don't want
+          git push --force-with-lease
+          \`\`\`
+
+          **Merge with "Rebase and merge"** (not squash) — preserves
+          per-commit \`-x\` attribution on \`$to\`.
+          EOF
+          )
+          gh pr create \
+            --base "$to" \
+            --head "$branch" \
+            --title "$title" \
+            --body "$body"
+
+      - name: Nothing to backport notice
+        if: steps.run.outputs.branch != '' && !startsWith(steps.run.outputs.branch, 'backport/')
+        run: |
+          echo "::notice::Nothing to backport — all commits on origin/${{ inputs.fromBranch }} are already present on origin/${{ steps.target.outputs.to }}."
+
+      - name: Conflict guidance (on failure)
+        if: failure()
+        run: |
+          {
+            echo "### Backport failed"
+            echo ""
+            echo "At least one cherry-pick conflicted. Finish manually:"
+            echo ""
+            echo '```'
+            echo "scripts/backport-fixes.sh \\"
+            echo "  --from ${{ inputs.fromBranch }} \\"
+            echo "  --to   ${{ steps.target.outputs.to }}"
+            echo '```'
+            echo ""
+            echo "Then resolve conflicts and \`git cherry-pick --continue\` (or \`--skip\` / \`--abort\`)."
+          } >> "$GITHUB_STEP_SUMMARY"

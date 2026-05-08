@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/suzuki-shunsuke/pinact/refs/heads/main/json-schema/pinact.json
+# pinact - https://github.com/suzuki-shunsuke/pinact
+#
+# Every `uses:` in a workflow must be SHA-pinned with a version comment.
+# Run `pinact run` before committing workflow changes. CI style check is
+# `pinact run --check` (exits non-zero if anything is unpinned).
+
+version: 3
+
+ignore_actions:
+  # PyPA's official publishing action uses a rolling `release/v1` branch by
+  # design — users opt into continuous updates of the trusted publisher flow.
+  # The action is maintained by PyPA and is not SHA-pinnable via tags.
+  # See https://github.com/pypa/gh-action-pypi-publish
+  - name: pypa/gh-action-pypi-publish
+    ref: release/v\d+

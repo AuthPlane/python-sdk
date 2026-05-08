@@ -1,0 +1,213 @@
+name: Cut release branch
+
+# Step 1 of the single-branch release: cut the branch that will be
+# stabilized and tagged by `release.yml`.
+#
+# Two modes, selected by whether `hotfixBase` is provided:
+#
+#   - Current-line release (hotfixBase empty):
+#       Branches off the repository's default branch. New branch is
+#       `release/v<releaseVersion>`. Requires CHANGELOG has `## [Unreleased]`.
+#
+#   - Older-line hotfix (hotfixBase = v<A.B.C>):
+#       Branches off the given tag. New branch is `hotfix/v<releaseVersion>`.
+#       Refuses unless:
+#         - hotfixBase is an existing vX.Y.Z tag
+#         - releaseVersion is on the same minor line as hotfixBase (same
+#           major.minor, patch strictly greater)
+#         - (major, minor) is strictly older than the default branch's
+#           latest vX.Y.Z tag (so current-line patches go through the
+#           release/v* path instead).
+#
+# There are no version-string edits at cut time — hatch-vcs reads the tag
+# written by `release.yml` to derive the published version.
+#
+# Trigger: maintainer dispatches from the Actions UI on the default branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseVersion:
+        description: 'New version being released (e.g. 1.3.0 or 0.5.2). No v prefix, no suffix.'
+        required: true
+        type: string
+      hotfixBase:
+        description: 'Optional: base tag for a hotfix cut (e.g. v0.5.1). Leave empty for a current-line release off the default branch.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse if not dispatched from the default branch
+        run: |
+          ref="${{ github.ref_name }}"
+          default="${{ github.event.repository.default_branch }}"
+          if [[ "$ref" != "$default" ]]; then
+            echo "::error::This workflow must be dispatched from '$default' (got: $ref)."
+            exit 1
+          fi
+
+      - name: Validate inputs and compute branch name
+        id: validate
+        run: |
+          v="${{ inputs.releaseVersion }}"
+          base="${{ inputs.hotfixBase }}"
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::releaseVersion must match X.Y.Z (got: $v)"
+            exit 1
+          fi
+          if [[ -n "$base" ]] && ! [[ "$base" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::hotfixBase must match vX.Y.Z (got: $base)"
+            exit 1
+          fi
+
+          if [[ -z "$base" ]]; then
+            branch="release/v$v"
+            mode="release"
+          else
+            branch="hotfix/v$v"
+            mode="hotfix"
+          fi
+
+          {
+            echo "release=$v"
+            echo "branch=$branch"
+            echo "tag=v$v"
+            echo "mode=$mode"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out default branch with full history and tags
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      - name: Refuse if branch or tag already exist
+        run: |
+          branch="${{ steps.validate.outputs.branch }}"
+          tag="${{ steps.validate.outputs.tag }}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "::error::Branch $branch already exists. Aborting."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists. Aborting."
+            exit 1
+          fi
+
+      # Hotfix-mode guards: ensure hotfixBase exists, the new version is a
+      # strict patch bump on the same minor line, and the line is strictly
+      # older than the default branch's latest v<X.Y.Z>.
+      - name: Validate hotfixBase and older-line invariant
+        if: steps.validate.outputs.mode == 'hotfix'
+        run: |
+          default="${{ github.event.repository.default_branch }}"
+          base="${{ inputs.hotfixBase }}"
+          v="${{ steps.validate.outputs.release }}"
+
+          if ! git rev-parse --verify "refs/tags/$base" >/dev/null 2>&1; then
+            echo "::error::hotfixBase tag '$base' does not exist in the repository."
+            exit 1
+          fi
+
+          [[ "$base" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          base_major="${BASH_REMATCH[1]}"
+          base_minor="${BASH_REMATCH[2]}"
+          base_patch="${BASH_REMATCH[3]}"
+
+          [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          new_major="${BASH_REMATCH[1]}"
+          new_minor="${BASH_REMATCH[2]}"
+          new_patch="${BASH_REMATCH[3]}"
+
+          if (( new_major != base_major )) || (( new_minor != base_minor )); then
+            echo "::error::releaseVersion v$v is not on the same minor line as hotfixBase $base (expected v${base_major}.${base_minor}.*)."
+            exit 1
+          fi
+          if (( new_patch <= base_patch )); then
+            echo "::error::releaseVersion v$v must be a strict patch bump over hotfixBase $base."
+            exit 1
+          fi
+
+          if ! main_tag=$(git describe --tags --abbrev=0 "origin/$default" 2>/dev/null); then
+            echo "::error::Cannot determine $default's latest tag — has a release ever shipped? If not, use a release/v* cut for the first release."
+            exit 1
+          fi
+          echo "$default's latest tag: $main_tag"
+
+          if ! [[ "$main_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::$default's latest tag '$main_tag' does not match vX.Y.Z."
+            exit 1
+          fi
+          main_major="${BASH_REMATCH[1]}"
+          main_minor="${BASH_REMATCH[2]}"
+
+          if (( new_major > main_major )) || { (( new_major == main_major )) && (( new_minor >= main_minor )); }; then
+            echo "::error::hotfix/v$v is on line v${new_major}.${new_minor}, which is not strictly older than $default's line v${main_major}.${main_minor}."
+            echo "::error::Current-line patches must use a release/v* cut (leave hotfixBase empty)."
+            exit 1
+          fi
+          echo "Confirmed older-line hotfix: v${new_major}.${new_minor} < v${main_major}.${main_minor}"
+
+      - name: Verify CHANGELOG has an [Unreleased] section
+        if: steps.validate.outputs.mode == 'release'
+        run: |
+          if ! grep -q "^## \[Unreleased\]" CHANGELOG.md 2>/dev/null; then
+            echo "::error::CHANGELOG.md is missing '## [Unreleased]' — add one (with pending changes) before cutting a release branch."
+            exit 1
+          fi
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create and push branch
+        run: |
+          branch="${{ steps.validate.outputs.branch }}"
+          if [[ "${{ steps.validate.outputs.mode }}" == "hotfix" ]]; then
+            base="${{ inputs.hotfixBase }}"
+            git checkout -b "$branch" "refs/tags/$base"
+          else
+            git checkout -b "$branch"
+          fi
+          git push origin "$branch"
+
+      - name: Summary
+        run: |
+          default="${{ github.event.repository.default_branch }}"
+          v="${{ steps.validate.outputs.release }}"
+          branch="${{ steps.validate.outputs.branch }}"
+          mode="${{ steps.validate.outputs.mode }}"
+          {
+            if [[ "$mode" == "hotfix" ]]; then
+              echo "### Hotfix branch cut"
+              echo ""
+              echo "- **Release version**: \`$v\`"
+              echo "- **Branch**: \`$branch\` (based on \`${{ inputs.hotfixBase }}\`)"
+              echo ""
+              echo "**Next steps**:"
+              echo "1. On \`$branch\`: add a \`## [$v]\` section to \`CHANGELOG.md\`, land the fix (cherry-pick or direct commit)."
+              echo "2. When ready, run the **Release** workflow from \`$branch\` (optionally with dry-run first)."
+              echo "3. After publication, backport any commits that should also reach \`$default\` via the **Backport fixes** workflow using \`fromBranch=v$v\` (the tag — the branch is deleted after release)."
+            else
+              echo "### Release branch cut"
+              echo ""
+              echo "- **Release version**: \`$v\`"
+              echo "- **Branch**: \`$branch\`"
+              echo ""
+              echo "**Next steps**:"
+              echo "1. On \`$branch\`: rename \`## [Unreleased]\` to \`## [$v]\` (or add a new dated entry), land any stabilization fixes."
+              echo "2. On \`$default\`: add a fresh \`## [Unreleased]\` header so the next release can be cut."
+              echo "3. When ready, run the **Release** workflow from \`$branch\` (optionally with dry-run first)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

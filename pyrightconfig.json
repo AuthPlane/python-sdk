@@ -1,0 +1,16 @@
+{
+  "pythonVersion": "3.12",
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "strict",
+  "reportMissingModuleSource": "none",
+  "include": [
+    "authplane",
+    "tests",
+    "conformance-tests"
+  ],
+  "exclude": [
+    "authplane-fastmcp",
+    "authplane-mcp"
+  ]
+}

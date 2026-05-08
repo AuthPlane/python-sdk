@@ -1,0 +1,43 @@
+name: Stale Issues and PRs
+
+on:
+  schedule:
+    # Daily 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark stale issues and PRs
+        uses: actions/stale@b5d41d4e1d5dceea10e7104786b73624c18a190f # v10.2.0
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 30
+          days-before-pr-stale: 30
+          days-before-pr-close: 30
+          stale-issue-label: stale
+          stale-pr-label: stale
+          exempt-issue-labels: "pinned,security,good first issue"
+          exempt-pr-labels: "pinned,security"
+          stale-issue-message: |
+            This issue has been automatically marked as stale because it has
+            not had activity in 60 days. It will be closed in 30 days if no
+            further activity occurs. Add a comment or the `pinned` label to
+            keep it open. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+          stale-pr-message: |
+            This PR has been automatically marked as stale because it has
+            not had activity in 30 days. It will be closed in 30 days if no
+            further activity occurs. Rebase, address review feedback, or add
+            the `pinned` label to keep it open.
+          close-issue-message: |
+            Closing as stale. Reopen if this is still relevant — we're happy
+            to take another look.
+          close-pr-message: |
+            Closing as stale. Reopen if you'd like to continue this work.

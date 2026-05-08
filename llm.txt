@@ -1,0 +1,86 @@
+# Authplane Python Monorepo — LLM Quick Guide
+
+Short, self-contained index for AI agents. Read `llm-full.txt` for everything else.
+
+## Packages
+
+- `authplane-sdk` (folder `authplane/`) — framework-agnostic OAuth 2.1 JWT
+  validation, RFC 8414 discovery, JWKS cache, RFC 7662 / 7009 / 8693 token
+  ops, RFC 9449 DPoP, RFC 9728 PRM, SSRF-hardened fetches.
+- `authplane-mcp` (folder `authplane-mcp/`) — adapter for the official MCP
+  Python SDK.
+- `authplane-fastmcp` (folder `authplane-fastmcp/`) — adapter for FastMCP.
+
+Adapter packages depend on `authplane-sdk`, so installing one adapter brings
+the core SDK along. Adapter packages export only their own glue
+(`authplane_auth`, `AuthplaneAuthResult`, `AuthplaneTokenVerifier`, etc.);
+core types come from `authplane` (and `authplane.oauth` for
+`TokenExchangeOptions` / `TokenResponse`). Requires Python 3.11+.
+
+## Most common task: protect an MCP server with one call
+
+### FastMCP
+
+```python
+import asyncio
+from authplane_fastmcp import authplane_auth
+from fastmcp import FastMCP
+from fastmcp.server.auth import require_scopes
+
+async def main() -> None:
+    result = await authplane_auth(
+        issuer="https://auth.company.com",
+        base_url="https://mcp.company.com",
+        scopes=["tools/query"],
+    )
+    mcp = FastMCP("My Server", **result)
+
+    @mcp.tool(auth=require_scopes("tools/query"))
+    def query(sql: str) -> str: ...
+
+    try:
+        await mcp.run_async(transport="http", port=8080)
+    finally:
+        await result.aclose()
+
+asyncio.run(main())
+```
+
+### Official MCP SDK
+
+```python
+import asyncio
+from authplane_mcp import authplane_mcp_auth, require_scope
+from mcp.server.fastmcp import FastMCP
+
+auth_result = asyncio.run(authplane_mcp_auth(
+    issuer="https://auth.company.com",
+    resource="https://mcp.company.com",
+    scopes=["tools/query"],
+))
+mcp = FastMCP("My Server", json_response=True, **auth_result)
+
+@mcp.tool()
+async def query(sql: str) -> str:
+    require_scope("tools/query")
+    ...
+
+mcp.run(transport="streamable-http")
+# remember to ``await auth_result.aclose()`` on shutdown
+```
+
+The MCP SDK's `mcp.run()` is sync (it owns the loop), so the adapter setup
+runs via `asyncio.run(...)` first. FastMCP exposes `run_async()` so the
+adapter setup and server can share one loop.
+
+## Architectural rules (do not break)
+
+- Protocol primitives belong in reusable modules under `authplane/oauth/*`.
+- Stateful orchestration belongs in `AuthplaneClient`.
+- Framework glue belongs inside the adapter package, not the core SDK.
+
+## Where to look for more
+
+- API surface, errors, DPoP, token operations, PRM, SSRF: package READMEs and
+  user guides in `authplane*/docs/user-guide.md`.
+- Validation, demo flow, env vars, pitfalls: `llm-full.txt`.

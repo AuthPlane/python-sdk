@@ -1,0 +1,126 @@
+name: Publish to PyPI
+
+# Tag-triggered publish. The three packages go to PyPI from this workflow;
+# `release.yml` only pushes the tag and lets this workflow take over.
+#
+# Runs on any `v*.*.*` tag regardless of which branch it points to
+# (release/v* for current-line releases, hotfix/v* for old-minor patches).
+# The tag itself is the authority — OIDC claim ref = refs/tags/vX.Y.Z,
+# matching PyPI's Trusted Publisher expectation and the GitHub environment's
+# tag policy.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: publish-pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/authplane-sdk/
+    permissions:
+      contents: read
+      id-token: write   # required for PyPI OIDC (trusted publishing)
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so hatch-vcs sees the tag ancestry.
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install hatchling hatch-vcs twine build
+
+      - name: Derive version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag ${tag} is not a semantic v<X.Y.Z> version. Refusing to publish."
+            exit 1
+          fi
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build sdist and wheel for all three packages
+        run: |
+          (cd .                 && python -m build --sdist --wheel --outdir dist/)
+          (cd authplane-mcp     && python -m build --sdist --wheel --outdir dist/)
+          (cd authplane-fastmcp && python -m build --sdist --wheel --outdir dist/)
+          echo "=== Root dist/ ==="
+          ls dist/
+          echo "=== authplane-mcp/dist/ ==="
+          ls authplane-mcp/dist/
+          echo "=== authplane-fastmcp/dist/ ==="
+          ls authplane-fastmcp/dist/
+
+      - name: Validate artifacts with twine check
+        run: python -m twine check dist/* authplane-mcp/dist/* authplane-fastmcp/dist/*
+
+      - name: Verify built version matches tag
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for dir in dist authplane-mcp/dist authplane-fastmcp/dist; do
+            if ! ls "$dir" | grep -q "${v//./\\.}"; then
+              echo "::error::Built artifacts in ${dir} do not contain version ${v}. hatch-vcs likely resolved a different version. Refusing to publish."
+              ls "$dir"
+              exit 1
+            fi
+          done
+
+      - name: Upload built artifacts (for manual recovery if publish fails)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-v${{ steps.version.outputs.version }}
+          path: |
+            dist/
+            authplane-mcp/dist/
+            authplane-fastmcp/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish authplane-sdk to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: dist/
+          skip-existing: true
+
+      - name: Publish authplane-mcp to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: authplane-mcp/dist/
+          skip-existing: true
+
+      - name: Publish authplane-fastmcp to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          packages-dir: authplane-fastmcp/dist/
+          skip-existing: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### PyPI publish"
+            echo ""
+            echo "- **Tag**: \`${{ steps.version.outputs.tag }}\`"
+            echo "- **Version**: \`${{ steps.version.outputs.version }}\`"
+            echo "- [authplane-sdk](https://pypi.org/project/authplane-sdk/${{ steps.version.outputs.version }}) · [authplane-mcp](https://pypi.org/project/authplane-mcp/${{ steps.version.outputs.version }}) · [authplane-fastmcp](https://pypi.org/project/authplane-fastmcp/${{ steps.version.outputs.version }})"
+          } >> "$GITHUB_STEP_SUMMARY"

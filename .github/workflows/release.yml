@@ -1,0 +1,289 @@
+name: Release
+
+# Step 2 of the single-branch release: take the stabilized release/v* or
+# hotfix/v* branch, run tests, pin `authplane-sdk==X.Y.Z` in the two
+# adapter pyprojects, commit, tag vX.Y.Z, build sdist+wheel for all three
+# packages (hatch-vcs resolves the tag), validate with twine check,
+# atomic-push branch + tag, create the GitHub Release, and delete the
+# source branch on success.
+#
+# Branch conventions:
+#   - release/v<X.Y.Z>: current-line release off the default branch.
+#   - hotfix/v<X.Y.Z>: patch for an older minor line. The workflow refuses
+#     dispatch unless (branch.major, branch.minor) is strictly older than
+#     the default branch's latest v<X.Y.Z> tag — use release/v* for
+#     current-line patches.
+#
+# PyPI publication is handled separately by `publish-pypi.yml`, triggered
+# by the tag push. This keeps the OIDC identity tied to the tag itself.
+#
+# Versions come from the git tag via hatch-vcs; no pyproject version edits.
+# The only release-time file edit is the adapter->core pin in the adapters'
+# dependencies lists.
+#
+# Trigger: maintainer dispatches from the Actions UI with a release/v* or
+# hotfix/v* branch selected. Branch name is the source of truth for the
+# version that will become the tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: 'Dry run: pin adapter deps, test, build, twine check locally; skip atomic push, PyPI uploads, GitHub Release, and branch deletion.'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse if not dispatched from a release/v* or hotfix/v* branch
+        run: |
+          ref="${{ github.ref_name }}"
+          if [[ ! "$ref" =~ ^(release|hotfix)/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::This workflow must be dispatched from a release/v<X.Y.Z> or hotfix/v<X.Y.Z> branch (got: $ref)"
+            exit 1
+          fi
+          echo "Dispatched from $ref"
+
+      - name: Check out repo with full history and all tags
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      # AuthPlane/conformance is the public sibling repo carrying the shared
+      # oauth-sdk-conformance-catalog.yaml. Without it, conformance-tests
+      # cannot run.
+      - name: Check out shared conformance catalog
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: AuthPlane/conformance
+          path: conformance
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install hatch-vcs, twine, build
+        run: |
+          python -m pip install --upgrade pip
+          pip install hatchling hatch-vcs twine build
+
+      - name: Derive version from branch name
+        id: version
+        run: |
+          ref="${{ github.ref_name }}"
+          version="${ref##*/v}"
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Refuse if tag already exists
+        run: |
+          if git ls-remote --exit-code --tags origin "${{ steps.version.outputs.tag }}" >/dev/null; then
+            echo "::error::Tag ${{ steps.version.outputs.tag }} already exists. Aborting."
+            exit 1
+          fi
+
+      # hotfix/v* is reserved for patches to an older minor line. Refuse
+      # dispatch if the branch's (major, minor) is not strictly less than
+      # the default branch's latest released (major, minor). Current-line
+      # patches should use release/v*, not hotfix/v*.
+      - name: Refuse if hotfix branch is not strictly an older-line patch
+        if: startsWith(github.ref_name, 'hotfix/')
+        run: |
+          default="${{ github.event.repository.default_branch }}"
+          git fetch origin "$default" --tags --no-recurse-submodules
+          if ! main_tag=$(git describe --tags --abbrev=0 "origin/$default" 2>/dev/null); then
+            echo "::error::Cannot determine $default's latest tag — has a release ever shipped? If not, use release/v* for the first release."
+            exit 1
+          fi
+          echo "$default's latest tag: $main_tag"
+
+          if ! [[ "$main_tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::$default's latest tag '$main_tag' does not match vX.Y.Z."
+            exit 1
+          fi
+          main_major="${BASH_REMATCH[1]}"
+          main_minor="${BASH_REMATCH[2]}"
+
+          v="${{ steps.version.outputs.version }}"
+          [[ "$v" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]
+          br_major="${BASH_REMATCH[1]}"
+          br_minor="${BASH_REMATCH[2]}"
+
+          if (( br_major > main_major )) || { (( br_major == main_major )) && (( br_minor >= main_minor )); }; then
+            echo "::error::hotfix/v${v} is on line v${br_major}.${br_minor}, which is not strictly older than $default's line v${main_major}.${main_minor}."
+            echo "::error::Current-line patches must use release/v*, not hotfix/v*."
+            exit 1
+          fi
+          echo "Confirmed older-line patch: v${br_major}.${br_minor} < v${main_major}.${main_minor}"
+
+      - name: Verify CHANGELOG entry exists for this version
+        run: |
+          if ! grep -q "^## \[${{ steps.version.outputs.version }}\]" CHANGELOG.md 2>/dev/null; then
+            echo "::error::CHANGELOG.md has no entry for ## [${{ steps.version.outputs.version }}]"
+            exit 1
+          fi
+
+      - name: Configure git author
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Tests run against the bare "authplane-sdk" adapter dependency with
+      # the core installed as a hatch-vcs dev version. The exact-version pin
+      # would be unsatisfiable until the release tag exists — it is applied
+      # below, as part of the single release commit.
+      - name: Install packages and run tests
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          pip install -e ".[dev]"
+          pip install -e "./authplane-mcp[dev]"
+          pip install -e "./authplane-fastmcp[dev]"
+          pytest tests/ conformance-tests/ authplane-mcp/tests/ authplane-fastmcp/tests/
+
+      # Pin authplane-mcp and authplane-fastmcp to the exact version being
+      # released. Happens directly on the release branch; no merge to the
+      # default branch. Ordered after tests so the pin ships in the release
+      # commit but does not interfere with local install resolution.
+      - name: Pin adapter->core dependency to ==X.Y.Z
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          for pkg in authplane-mcp authplane-fastmcp; do
+            f="$pkg/pyproject.toml"
+            sed -i -E "s/\"authplane-sdk([>=<~!][^\"]*)?\"/\"authplane-sdk==$v\"/" "$f"
+            if ! grep -q "\"authplane-sdk==$v\"" "$f"; then
+              echo "::error::Failed to pin authplane-sdk==$v in $f — no 'authplane-sdk' dependency line was found."
+              exit 1
+            fi
+          done
+
+      # If a maintainer pre-pinned the adapters on the release branch, sed
+      # produces an identical file and there is nothing to commit. Handle
+      # both cases: --allow-empty keeps the shape (always one release commit
+      # per version) and ensures the tag points at a distinct SHA.
+      - name: Commit adapter pins on the release branch
+        run: |
+          git add -A
+          git commit --allow-empty -m "release: v${{ steps.version.outputs.version }}"
+
+      - name: Capture release commit SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create annotated tag locally
+        run: |
+          git tag -a "${{ steps.version.outputs.tag }}" \
+            -m "Release ${{ steps.version.outputs.tag }}"
+
+      - name: Build sdist and wheel for all three packages
+        run: |
+          (cd .                 && python -m build --sdist --wheel --outdir dist/)
+          (cd authplane-mcp     && python -m build --sdist --wheel --outdir dist/)
+          (cd authplane-fastmcp && python -m build --sdist --wheel --outdir dist/)
+          echo "=== Root dist/ ==="
+          ls dist/
+          echo "=== authplane-mcp/dist/ ==="
+          ls authplane-mcp/dist/
+          echo "=== authplane-fastmcp/dist/ ==="
+          ls authplane-fastmcp/dist/
+
+      - name: Validate artifacts with twine check
+        run: |
+          python -m twine check dist/* authplane-mcp/dist/* authplane-fastmcp/dist/*
+
+      - name: Dry run short-circuit notice
+        if: ${{ inputs.dryRun }}
+        run: |
+          echo "::notice::Dry run — skipping atomic push, PyPI publish, GitHub Release, and branch deletion. Release commit SHA (would-be): ${{ steps.sha.outputs.sha }}"
+
+      - name: Atomic push of release branch and tag
+        if: ${{ !inputs.dryRun }}
+        run: |
+          git push --atomic origin "$GITHUB_REF_NAME" "${{ steps.version.outputs.tag }}"
+          echo "::notice::Released commit: ${{ steps.sha.outputs.sha }}"
+
+      - name: Extract CHANGELOG entry for release notes
+        if: ${{ !inputs.dryRun }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          {
+            echo "_Released commit: \`$sha\`_"
+            echo ""
+            awk "/^## \[$version\]/{flag=1;next} /^## \[/{flag=0} flag" CHANGELOG.md
+          } > /tmp/release-notes.md
+          # If CHANGELOG extraction returned nothing beyond the SHA line, add a fallback.
+          if [[ $(wc -l < /tmp/release-notes.md) -le 2 ]]; then
+            echo "See CHANGELOG.md for details." >> /tmp/release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dryRun }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file /tmp/release-notes.md
+
+      # Delete the source branch (release/v* or hotfix/v*) on success. The
+      # branch ruleset must allow the bot to delete. If this fails, warn
+      # loudly but do not fail the workflow — the release is already live.
+      - name: Delete source branch on remote
+        if: ${{ !inputs.dryRun }}
+        continue-on-error: true
+        id: delete
+        run: |
+          git push origin --delete "$GITHUB_REF_NAME"
+
+      - name: Warn if delete failed
+        if: ${{ !inputs.dryRun && steps.delete.outcome == 'failure' }}
+        run: |
+          echo "::warning::Source branch delete failed. Run manually: git push origin --delete $GITHUB_REF_NAME"
+
+      - name: Summary
+        if: always()
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          sha="${{ steps.sha.outputs.sha }}"
+          if [[ "${{ inputs.dryRun }}" == "true" ]]; then
+            {
+              echo "### Dry run complete"
+              echo ""
+              echo "- **Version**: \`$v\` (not published)"
+              echo "- **Would-be released commit**: \`$sha\`"
+              echo "- Pin, tests, build, twine check — all succeeded."
+              echo "- Atomic push, GitHub Release, PyPI publish, and branch delete were skipped."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### Release tag pushed"
+              echo ""
+              echo "- **Version**: \`$v\`"
+              echo "- **Released commit**: \`$sha\`"
+              echo "- **Tag**: \`v$v\` (pushed — triggers \`publish-pypi.yml\`)"
+              echo "- **GitHub Release**: ${{ github.server_url }}/${{ github.repository }}/releases/tag/v$v"
+              echo "- **PyPI (pending)**: [authplane-sdk](https://pypi.org/project/authplane-sdk/$v) · [authplane-mcp](https://pypi.org/project/authplane-mcp/$v) · [authplane-fastmcp](https://pypi.org/project/authplane-fastmcp/$v)"
+              if [[ "${{ steps.delete.outcome }}" != "success" ]]; then
+                echo ""
+                echo "⚠️ **Branch delete failed — run manually:** \`git push origin --delete $GITHUB_REF_NAME\`"
+              fi
+              echo ""
+              echo "**Follow-up:**"
+              echo "- If any commits on this branch should reach the default branch, dispatch **Backport fixes** with \`fromBranch=${{ steps.version.outputs.tag }}\` (the tag, not the branch — the branch is deleted)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

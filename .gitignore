@@ -1,0 +1,68 @@
+# Python
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# Local environment files (demo credentials, etc.)
+.env
+.env.local
+
+# IDEs
+.idea/
+*.swp
+*.swo
+*~
+.vscode
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Worktrees
+.worktrees/
+
+# Project specific
+demo_logs.jsonl
+conformance-report.json
+conformance-report.md
+pytest.log
+memory/MEMORY.md
+AUDIT_REPORT.md
+
+# Local superpowers workspace (plans/specs not part of the repo)
+docs/superpowers/
+
+# Local pre-launch audit — embeds legacy-name strings; stays out of the tree.
+scripts/preflip-audit.sh

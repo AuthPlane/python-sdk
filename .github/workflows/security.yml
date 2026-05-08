@@ -1,0 +1,79 @@
+name: Security Audit
+
+# Runs pip-audit against each published package, checking their resolved
+# dependency trees for known vulnerabilities. Any finding fails the build;
+# accepted risks are pinned via --ignore-vuln with a comment.
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "authplane-mcp/pyproject.toml"
+      - "authplane-fastmcp/pyproject.toml"
+      - ".github/workflows/security.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+      - "authplane-mcp/pyproject.toml"
+      - "authplane-fastmcp/pyproject.toml"
+      - ".github/workflows/security.yml"
+  schedule:
+    # Mondays 06:00 UTC — after dependabot runs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - root
+          - authplane-mcp
+          - authplane-fastmcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: Install package dependencies
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            pip install -e ".[dev]"
+          else
+            pip install -e .
+            pip install -e "${{ matrix.package }}[dev]"
+          fi
+
+      - name: Run pip-audit
+        # --skip-editable: our own packages are installed editable so their
+        # third-party deps are resolvable, but they aren't on PyPI yet. Skip
+        # them; the third-party dep closure is what we want to audit.
+        # Any vulnerability finding still exits non-zero (default behavior).
+        # To accept a known risk, add --ignore-vuln <GHSA-id> with a comment.
+        #
+        # CVE-2026-3219: pip archive-handling issue (tar+ZIP ambiguity,
+        # CVSS 4.6). Affects pip itself (the installer, not a runtime dep),
+        # only exploitable by installing an attacker-crafted archive. Fix is
+        # merged upstream and slated for pip 26.1, but 26.0.1 is still the
+        # latest released version, so `pip install --upgrade pip` can't pull
+        # a patched build. Drop this ignore once pip >= 26.1 is on PyPI.
+        # See https://github.com/pypa/pip/pull/13870.
+        run: >-
+          pip-audit --skip-editable --progress-spinner off
+          --ignore-vuln CVE-2026-3219

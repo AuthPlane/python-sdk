@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        package:
+          - root
+          - authplane-mcp
+          - authplane-fastmcp
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # AuthPlane/conformance is the public sibling repo carrying the shared
+      # oauth-sdk-conformance-catalog.yaml. Without it, conformance-tests
+      # cannot run.
+      - name: Check out shared conformance catalog
+        if: matrix.package == 'root'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: AuthPlane/conformance
+          path: conformance
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Install package dependencies
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            pip install -e ".[dev]"
+          else
+            # Adapters depend on authplane; install local SDK package first.
+            pip install -e .
+            pip install -e "${{ matrix.package }}[dev]"
+          fi
+
+      - name: Ruff check
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            ruff check .
+          else
+            ruff check "${{ matrix.package }}"
+          fi
+
+      - name: Ruff format check
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            ruff format --check .
+          else
+            ruff format --check "${{ matrix.package }}"
+          fi
+
+      - name: Pyright (SDK only)
+        if: matrix.package == 'root'
+        run: pyright
+
+      - name: Test and coverage
+        env:
+          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            coverage run -m pytest tests conformance-tests && coverage report
+          else
+            cd "${{ matrix.package }}"
+            coverage run -m pytest tests && coverage report
+          fi
+
+      - name: Build package artifacts
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            python -m build
+          else
+            cd "${{ matrix.package }}"
+            python -m build
+          fi
+
+      - name: Validate package metadata
+        run: |
+          if [ "${{ matrix.package }}" = "root" ]; then
+            twine check dist/*
+          else
+            twine check "${{ matrix.package }}/dist/*"
+          fi

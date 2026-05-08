@@ -1,0 +1,70 @@
+version: 2
+
+updates:
+  # Python SDK (root)
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      pip-all:
+        patterns:
+          - "*"
+
+  # Python MCP adapter
+  - package-ecosystem: pip
+    directory: /authplane-mcp
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      pip-all:
+        patterns:
+          - "*"
+
+  # Python FastMCP adapter
+  - package-ecosystem: pip
+    directory: /authplane-fastmcp
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "deps"
+    open-pull-requests-limit: 10
+    groups:
+      pip-all:
+        patterns:
+          - "*"
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 5
+    groups:
+      actions-all:
+        patterns:
+          - "*"

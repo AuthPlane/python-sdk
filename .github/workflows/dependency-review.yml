@@ -1,0 +1,26 @@
+name: Dependency Review
+
+on:
+  pull_request:
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Dependency review
+        continue-on-error: true
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          # MPL-2.0 is safe only as a transitive dependency — do not vendor or
+          # fork MPL-licensed source without re-evaluating the obligations.
+          allow-licenses: Apache-2.0, MIT, ISC, BSD-2-Clause, BSD-3-Clause, CC0-1.0, Unlicense, 0BSD, Python-2.0, MPL-2.0
+      - name: Dependency review not supported notice
+        if: ${{ failure() }}
+        run: |
+          echo "Dependency review is not supported for this repository configuration."
+          echo "Proceeding without blocking CI."

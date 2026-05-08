@@ -1,0 +1,387 @@
+# Authplane Python Monorepo — Complete LLM Reference
+
+This file is the full, self-contained context for AI/code agents in this
+repository.
+
+## Purpose
+
+Unified Python repository for:
+
+1. Core SDK (`authplane-sdk`)
+2. FastMCP adapter (`authplane-fastmcp`)
+3. Official MCP Python SDK adapter (`authplane-mcp`)
+4. Shared CI and release validation flows
+
+## Repository Topology
+
+| Path | Package | Purpose |
+| --- | --- | --- |
+| `authplane/` | `authplane-sdk` | Core SDK: verification, issuer discovery, JWKS/metadata cache, OAuth operations, DPoP, SSRF protections |
+| `authplane-fastmcp/` | `authplane-fastmcp` | FastMCP adapter package + tests + demo |
+| `authplane-mcp/` | `authplane-mcp` | MCP SDK adapter package + tests + demo |
+| `.github/workflows/ci.yml` | n/a | Unified CI matrix for root + adapters |
+| `README.md` | n/a | Human-facing repo guide |
+
+## Architectural Guardrails
+
+1. Keep reusable protocol logic in `authplane/`.
+2. Keep stateful orchestration in `AuthplaneClient` and related SDK layers.
+3. Keep framework-specific behavior inside adapter packages.
+4. Avoid coupling adapter internals into core SDK modules.
+
+## Runtime and Tooling
+
+- Python `>=3.11` (3.11, 3.12, 3.13)
+- virtualenv-based local setup
+- Ruff + Pyright + Pytest + Coverage + Build + Twine
+- Pyright runs at the SDK root only; adapters do not type-check in CI today
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+```
+
+## Validation Commands (Root)
+
+```bash
+ruff check .
+pyright
+coverage run -m pytest tests && coverage report
+python -m build
+twine check dist/*
+```
+
+## Validation Commands (Package-Level)
+
+### `authplane-fastmcp`
+
+```bash
+cd authplane-fastmcp
+ruff check .
+coverage run -m pytest tests && coverage report
+python -m build
+twine check dist/*
+```
+
+### `authplane-mcp`
+
+```bash
+cd authplane-mcp
+ruff check .
+coverage run -m pytest tests && coverage report
+python -m build
+twine check dist/*
+```
+
+## Public API Surface
+
+### Core SDK (`authplane`)
+
+- `AuthplaneClient.create(issuer, auth=..., dpop=..., dev_mode=..., ...)` —
+  async factory; bare constructor is private.
+- `client.resource(resource, scopes=..., inbound_dpop=..., revocation_checker=..., fail_closed=...)` —
+  sync; returns an `AuthplaneResource`.
+- `await resource.verify(token, dpop_request=...)` — returns immutable
+  `VerifiedClaims`; with `dpop_request` enables RFC 9449 §7 enforcement.
+- `await client.client_credentials(scopes=[...], resources=[...])`
+- `await client.exchange(TokenExchangeOptions(...))` — RFC 8693
+- `await client.introspect(token)` — RFC 7662
+- `await client.revoke(token)` — RFC 7009
+- `await client.aclose()` — required on shutdown.
+- `resource.prm_response()` — RFC 9728 PRM document.
+
+### Errors (root export)
+
+Verification side: `AuthplaneError`, `TokenMissingError`, `TokenExpiredError`,
+`InvalidSignatureError`, `InvalidClaimsError`, `InsufficientScopeError`,
+`TokenRevokedError`, `JWKSFetchError`, `MetadataFetchError`,
+`MissingMetadataEndpointError`, `ProtocolError`, `VerifierRuntimeError`,
+DPoP family (`DPoPError` and subclasses).
+
+AS-facing: `AuthError`, `InvalidClientError`, `InvalidGrantError`,
+`InvalidScopeError`, `UnauthorizedClientError`, `UnsupportedGrantTypeError`,
+`InvalidRequestError`, `ServerError`, `ConsentRequiredError`,
+`CircuitOpenError`. `client.exchange()` raises `InvalidGrantError` for RFC
+6749 `invalid_grant`, `ConsentRequiredError` for `consent_required` /
+`interaction_required`.
+
+`http_status(error)` maps any `AuthplaneError` to an HTTP status; 403 only
+for `InsufficientScopeError`.
+
+### Adapters
+
+- `await authplane_auth(issuer, base_url, scopes=..., ...)` (FastMCP) →
+  `AuthplaneAuthResult` with `.auth`, `.token_verifier`, `.client`, and
+  `await result.aclose()`.
+- `await authplane_mcp_auth(issuer, resource, scopes=..., enforce_scopes_on_all_requests=False, ...)` (MCP) →
+  `AuthplaneAuthResult` with `.token_verifier`, `.auth`, `.client`, and
+  `await result.aclose()`.
+- Both unpack into `FastMCP(...)` via `**result` (mapping view yields only
+  the framework-required keys).
+- Both wrap `client.exchange()` so `ConsentRequiredError` with a
+  `consent_url` is auto-translated to MCP `UrlElicitationRequiredError`
+  (JSON-RPC `-32042`). Whether the framework forwards that to the wire
+  depends on the framework — see each adapter's user guide.
+
+## Common Snippets
+
+### FastMCP server with auth
+
+```python
+import asyncio
+from authplane_fastmcp import authplane_auth
+from fastmcp import FastMCP
+from fastmcp.server.auth import require_scopes
+
+async def main() -> None:
+    result = await authplane_auth(
+        issuer="https://auth.company.com",
+        base_url="https://mcp.company.com",
+        scopes=["tools/query"],
+    )
+    mcp = FastMCP("My Server", **result)
+
+    @mcp.tool(auth=require_scopes("tools/query"))
+    def query(sql: str) -> str:
+        return run_query(sql)
+
+    try:
+        await mcp.run_async(transport="http", port=8080)
+    finally:
+        await result.aclose()
+
+asyncio.run(main())
+```
+
+### Official MCP SDK server with auth
+
+```python
+import asyncio
+from authplane_mcp import authplane_mcp_auth, require_scope
+from mcp.server.fastmcp import FastMCP
+
+auth_result = asyncio.run(authplane_mcp_auth(
+    issuer="https://auth.company.com",
+    resource="https://mcp.company.com",
+    scopes=["tools/query"],
+))
+mcp = FastMCP("My Server", json_response=True, **auth_result)
+
+@mcp.tool()
+async def query(sql: str) -> str:
+    require_scope("tools/query")
+    return run_query(sql)
+
+mcp.run(transport="streamable-http")
+# Call ``await auth_result.aclose()`` on shutdown — mcp.run() owns the loop,
+# so the cleanest pattern is to install a signal handler or wrap mcp.run()
+# in your own supervisor that runs aclose() after it returns.
+```
+
+### Verify a token directly (framework-agnostic)
+
+```python
+from authplane import ASCredentials, AuthplaneClient
+
+client = await AuthplaneClient.create(
+    issuer="https://auth.example.com",
+    auth=ASCredentials(client_id="my-resource", client_secret="s3cret"),
+)
+res = client.resource(resource="https://api.example.com", scopes=["read"])
+claims = await res.verify(incoming_jwt)
+print(claims.sub, claims.scopes)
+await client.aclose()
+```
+
+### Map errors to HTTP
+
+```python
+from authplane import AuthplaneError, http_status
+
+try:
+    claims = await res.verify(token)
+except AuthplaneError as e:
+    return Response(status=http_status(e))
+```
+
+## Demo Flows
+
+### Python adapter servers (FastMCP + MCP)
+
+The adapter demo `run.sh` scripts read these env vars (all optional except
+`CLIENT_SECRET`, which can also be auto-loaded from `/tmp/authserver-demo.key`):
+
+- `ISSUER_URL` (default `http://localhost:9000`)
+- `RESOURCE_URL` (default `http://localhost:8080/mcp`)
+- `CLIENT_ID` (auto-loaded from `/tmp/authserver-demo.client-id` if unset; the
+  demo `mcpserver.py` falls back to the resource URL as `client_id`)
+- `CLIENT_SECRET` (auto-loaded from `/tmp/authserver-demo.key` if unset)
+
+**FastMCP server startup:**
+
+```bash
+cd <PY_REPO_ROOT>/authplane-fastmcp
+export CLIENT_ID="<CLIENT_ID_FROM_AUTHSERVER>"
+export CLIENT_SECRET="<CLIENT_SECRET_FROM_AUTHSERVER>"
+./demo/run.sh
+```
+
+**MCP SDK server startup:**
+
+```bash
+cd <PY_REPO_ROOT>/authplane-mcp
+export CLIENT_ID="<CLIENT_ID_FROM_AUTHSERVER>"
+export CLIENT_SECRET="<CLIENT_SECRET_FROM_AUTHSERVER>"
+./demo/run.sh
+```
+
+Expected endpoint: `http://localhost:8080/mcp` (override with `RESOURCE_URL`).
+
+### URL elicitation for consent
+
+Both adapters return an `AuthplaneClient` whose `exchange()` is wrapped: a
+`ConsentRequiredError` carrying a `consent_url` is auto-translated to
+`UrlElicitationRequiredError` (MCP JSON-RPC `-32042`) before user tool code
+sees it. Whether the underlying MCP framework forwards that error to the wire
+is framework-dependent — see each adapter's user guide for the current state.
+
+The elicitation message is generated by `ConsentRequiredError.describe()` and
+uses the format `"<message> (<service_id>: <cause_detail>)"`. Adapters call
+`describe()` rather than formatting locally; the format lives next to the
+data in `authplane.errors`.
+
+`to_url_elicitation_required_error(error)` is exported from both adapters as
+an escape-hatch primitive: returns `UrlElicitationRequiredError` if the input
+is a `ConsentRequiredError` with a `consent_url`, otherwise `None`. Use it
+when you produce a consent error outside `client.exchange()` and want to
+raise the MCP-shaped error yourself.
+
+### Manual end-to-end smoke
+
+`scripts/` contains helpers that boot a local authserver and run a smoke
+check end-to-end:
+
+```bash
+# Start local authserver and register client / scopes / user.
+bash scripts/manual-e2e-setup.sh
+
+# Smoke against the MCP adapter (default).
+bash scripts/manual-e2e-smoke.sh --skip-setup
+
+# Smoke against the FastMCP adapter.
+bash scripts/manual-e2e-smoke.sh --adapter fastmcp --skip-setup
+```
+
+Optional overrides: `AUTHSERVER_DIR`, `ISSUER_URL`, `RESOURCE_URL`.
+
+### Python client demo example (DPoP + token exchange)
+
+`AuthplaneClient` is constructed via the async `create()` factory; the bare
+constructor is private. Token operations return `TokenResponse` dataclasses
+(attribute access — not dicts). `client_credentials` takes `scopes: list[str]`;
+RFC 8693 token exchange goes through `client.exchange(TokenExchangeOptions(...))`.
+
+```python
+import asyncio
+import os
+
+from authplane import ASCredentials, AuthplaneClient, DPoPProvider
+from authplane.oauth import TokenExchangeOptions
+
+
+async def main() -> None:
+    issuer = os.getenv("ISSUER_URL", "http://127.0.0.1:9000")
+    client_id = os.environ["CLIENT_ID"]
+    client_secret = os.environ["CLIENT_SECRET"]
+    scope = os.getenv("DEMO_SCOPE", "tools/add")
+    resource = os.getenv("RESOURCE_URL", "http://localhost:8080/mcp")
+
+    client = await AuthplaneClient.create(
+        issuer=issuer,
+        auth=ASCredentials(client_id=client_id, client_secret=client_secret),
+        dpop=DPoPProvider(),
+        dev_mode=True,  # allow http://localhost issuer
+    )
+    try:
+        # 1) client_credentials (subject token)
+        subject = await client.client_credentials(scopes=[scope])
+        print("token_type:", subject.token_type)
+        print("subject access_token length:", len(subject.access_token))
+
+        # 2) token exchange (scope narrowing + audience binding)
+        exchanged = await client.exchange(
+            TokenExchangeOptions(
+                subject_token=subject.access_token,
+                scope=scope,
+                resources=(resource,),
+            )
+        )
+        print("token_type:", exchanged.token_type)
+        print("exchanged access_token length:", len(exchanged.access_token))
+    finally:
+        await client.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it from repo root with the same env vars the adapter demo uses:
+
+```bash
+cd <PY_REPO_ROOT>
+source .venv/bin/activate
+ISSUER_URL="http://127.0.0.1:9000" \
+CLIENT_ID="<CLIENT_ID>" \
+CLIENT_SECRET="<CLIENT_SECRET>" \
+DEMO_SCOPE="tools/add" \
+RESOURCE_URL="http://localhost:8080/mcp" \
+python path/to/demo_client.py
+```
+
+### Local OAuth server requirements for demos
+
+Run the Authplane authserver on `http://127.0.0.1:9000` with these flags enabled:
+
+- `AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true`
+- `AUTHPLANE_TOKEN_EXCHANGE_ENABLED=true`
+- `AUTHPLANE_DPOP_ENABLED=true`
+- `AUTHPLANE_TOKEN_EXCHANGE_ALLOW_SELF_EXCHANGE=true`
+
+Register the demo client with:
+
+- grant types:
+  - `client_credentials`
+  - `urn:ietf:params:oauth:grant-type:token-exchange`
+- scopes:
+  - `tools/add`
+  - `tools/multiply`
+
+## Common Local Demo Pitfalls
+
+- `client_credentials grant is not enabled`
+  - `authserver` missing `AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true`
+- `client is not authorized for this grant type`
+  - client missing `urn:ietf:params:oauth:grant-type:token-exchange`
+- `requested scope is invalid or not allowed`
+  - requested token exchange scope not registered/assigned to client
+- `invalid API key`
+  - admin requests using a key that does not match server startup key
+
+## Typical Agent Tasks
+
+- Add/adjust OAuth behavior in SDK modules
+- Keep adapter wrappers aligned with SDK API updates
+- Improve demo reliability and docs
+- Add tests for protocol/regression behavior
+
+## Editing Expectations
+
+- Preserve strict typing and established error semantics.
+- Keep behavioral changes test-backed.
+- Keep docs in sync with actual package paths and commands.
+
