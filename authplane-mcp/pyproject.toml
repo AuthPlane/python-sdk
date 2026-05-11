@@ -14,7 +14,7 @@ authors = [
 keywords = ["oauth", "jwt", "mcp", "adapter", "authplane"]
 requires-python = ">=3.11"
 dependencies = [
-    "authplane-sdk",
+    "authplane-sdk==0.1.0",
     # mcp 1.23–1.27 use camelCase `elicitationId`; main has reverted
     # to snake_case, so 1.28+ will likely require an adapter update.
     "mcp>=1.23.0,<1.28.0",

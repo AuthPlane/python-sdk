@@ -14,7 +14,7 @@ authors = [
 keywords = ["oauth", "jwt", "fastmcp", "adapter", "authplane"]
 requires-python = ">=3.11"
 dependencies = [
-    "authplane-sdk",
+    "authplane-sdk==0.1.0",
     "fastmcp>=2.0",
     "pydantic>=2.0",
 ]
