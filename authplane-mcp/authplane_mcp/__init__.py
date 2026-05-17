@@ -9,7 +9,13 @@ DPoP types, errors, etc.) are imported from ``authplane`` directly. This package
 exports only the adapter-owned glue.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _version
+
+try:
+    __version__ = _version("authplane-mcp")
+except _PackageNotFoundError:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
 
 from .auth import AuthplaneAuthResult, authplane_mcp_auth, require_scope
 from .url_elicitation import to_url_elicitation_required_error

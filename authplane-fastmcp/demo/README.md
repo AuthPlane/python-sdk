@@ -29,14 +29,14 @@ cd authplane-fastmcp
 ./demo/run.sh
 ```
 
-`run.sh` creates a virtualenv, installs dependencies, and starts the server on port `8090`. All demo credentials are pre-configured — no additional setup needed.
+`run.sh` creates a virtualenv, installs dependencies, and starts the server on port `8080`. All demo credentials are pre-configured — no additional setup needed.
 
 ## How it works
 
 Note that FastMCP filters tools if the scope is not available.
 
 ```
-MCP Client ──Bearer JWT──► mcpserver.py (port 8090)
+MCP Client ──Bearer JWT──► mcpserver.py (port 8080)
                                 │
                                 ├─ authplane_auth()
                                 │    • Discovers JWKS from ISSUER_URL

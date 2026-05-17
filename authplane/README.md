@@ -43,4 +43,4 @@ Call `await client.aclose()` on shutdown to stop background JWKS and metadata re
 
 ## Documentation
 
-Full API reference, configuration options, error hierarchy, DPoP, token operations, introspection, token exchange, and advanced usage: **[User Guide](docs/user-guide.md)**.
+Full API reference, configuration options, error hierarchy, DPoP, token operations, introspection, token exchange, and advanced usage: **[User Guide](https://github.com/AuthPlane/python-sdk/blob/main/authplane/docs/user-guide.md)**.

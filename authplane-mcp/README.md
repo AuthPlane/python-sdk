@@ -43,4 +43,4 @@ mcp.run(transport="streamable-http")
 
 ## Documentation
 
-PRM behavior, dev mode, revocation checking, manual setup, the full `authplane_mcp_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](docs/user-guide.md)**.
+PRM behavior, dev mode, revocation checking, manual setup, the full `authplane_mcp_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](https://github.com/AuthPlane/python-sdk/blob/main/authplane-mcp/docs/user-guide.md)**.

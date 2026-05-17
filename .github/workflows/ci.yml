@@ -22,15 +22,15 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # AuthPlane/conformance is the public sibling repo carrying the shared
-      # oauth-sdk-conformance-catalog.yaml. Without it, conformance-tests
-      # cannot run.
-      - name: Check out shared conformance catalog
+      # oauth-sdk-conformance-catalog.yaml. Cloned to $RUNNER_TEMP — outside
+      # $GITHUB_WORKSPACE — so the catalog stays out of the working tree,
+      # matching release.yml's invariant. Plain git clone is enough:
+      # actions/checkout disallows paths outside the workspace, and we don't
+      # need its auth/persist-credentials features for a public read-only repo.
+      - name: Clone shared conformance catalog (out of tree)
         if: matrix.package == 'root'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: AuthPlane/conformance
-          path: conformance
-          fetch-depth: 1
+        run: |
+          git clone --depth 1 https://github.com/AuthPlane/conformance.git "$RUNNER_TEMP/conformance"
 
       - name: Setup Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -74,7 +74,7 @@ jobs:
 
       - name: Test and coverage
         env:
-          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
           if [ "${{ matrix.package }}" = "root" ]; then
             coverage run -m pytest tests conformance-tests && coverage report

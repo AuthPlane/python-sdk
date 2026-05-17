@@ -265,7 +265,7 @@ async def authplane_auth(
     )
 
     # Wrap in AuthplaneTokenVerifier
-    # Note: FastMCP 3.0.0 uses token_verifier.base_url for PRM generation if provided
+    # Note: FastMCP uses token_verifier.base_url for PRM generation if provided
     token_verifier = AuthplaneTokenVerifier(verifier, base_url=base_url)
 
     # Wrap in RemoteAuthProvider to get PRM routes

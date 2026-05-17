@@ -12,6 +12,17 @@ authors = [
     { name = "Authplane Team" }
 ]
 keywords = ["oauth", "jwt", "mcp", "adapter", "authplane"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 requires-python = ">=3.11"
 dependencies = [
     "authplane-sdk",
@@ -23,7 +34,9 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/AuthPlane/python-sdk/tree/main/authplane-mcp"
+Repository = "https://github.com/AuthPlane/python-sdk"
 Issues = "https://github.com/AuthPlane/python-sdk/issues"
+Changelog = "https://github.com/AuthPlane/python-sdk/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
@@ -89,3 +102,9 @@ indent-style = "space"
 [tool.hatch.version]
 source = "vcs"
 raw-options.root = ".."
+
+# Keep the sdist to this package's source. Hatchling's default would also
+# tarball tests/, demo/, docs/ and dotfiles from this directory.
+# pyproject.toml, README.md and LICENSE are included automatically.
+[tool.hatch.build.targets.sdist]
+only-include = ["authplane_mcp"]

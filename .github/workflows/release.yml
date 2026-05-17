@@ -53,21 +53,46 @@ jobs:
           fi
           echo "Dispatched from $ref"
 
+      # Fail fast if the AuthPlane Release Bot App secrets aren't available
+      # (e.g. a fork or unconfigured clone). The token-mint step would
+      # otherwise fail with a generic actions/create-github-app-token error.
+      - name: Refuse if Release Bot secrets are missing
+        env:
+          APP_ID: ${{ secrets.RELEASE_BOT_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$APP_ID" || -z "$PRIVATE_KEY" ]]; then
+            echo "::error::Release Bot App secrets (RELEASE_BOT_APP_ID / RELEASE_BOT_PRIVATE_KEY) are unavailable in this run. They live as AuthPlane org secrets scoped to the OSS release repo; forks and unconfigured clones cannot run release.yml end-to-end and must follow the manual tagging fallback."
+            exit 1
+          fi
+
+      # Tag/branch rulesets reject GHA bot pushes for v* tags. Mint a
+      # short-lived installation token for the AuthPlane Release Bot App
+      # (bypass actor on the ruleset) and pass it to checkout so the
+      # atomic push and source-branch delete use the App's identity.
+      - name: Mint release-bot token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
       - name: Check out repo with full history and all tags
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
+          token: ${{ steps.app_token.outputs.token }}
 
       # AuthPlane/conformance is the public sibling repo carrying the shared
-      # oauth-sdk-conformance-catalog.yaml. Without it, conformance-tests
-      # cannot run.
-      - name: Check out shared conformance catalog
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          repository: AuthPlane/conformance
-          path: conformance
-          fetch-depth: 1
+      # oauth-sdk-conformance-catalog.yaml. Cloned to $RUNNER_TEMP — outside
+      # $GITHUB_WORKSPACE — so the catalog checkout never pollutes the working
+      # tree of the commit we tag and publish. Plain git clone is enough:
+      # actions/checkout disallows paths outside the workspace, and we don't
+      # need its auth/persist-credentials features for a public read-only repo.
+      - name: Clone shared conformance catalog (out of tree)
+        run: |
+          git clone --depth 1 https://github.com/AuthPlane/conformance.git "$RUNNER_TEMP/conformance"
 
       - name: Set up Python 3.11
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
@@ -148,7 +173,7 @@ jobs:
       # below, as part of the single release commit.
       - name: Install packages and run tests
         env:
-          CONFORMANCE_CATALOG_PATH: ${{ github.workspace }}/conformance/oauth-sdk-conformance-catalog.yaml
+          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
           pip install -e ".[dev]"
           pip install -e "./authplane-mcp[dev]"
@@ -231,6 +256,9 @@ jobs:
             echo "See CHANGELOG.md for details." >> /tmp/release-notes.md
           fi
 
+      # GitHub Release creation goes through the API, not git push, so the
+      # default GITHUB_TOKEN is sufficient — the Release Bot App token is
+      # only needed for the tag/branch push and source-branch delete above.
       - name: Create GitHub Release
         if: ${{ !inputs.dryRun }}
         env:

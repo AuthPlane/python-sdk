@@ -59,7 +59,7 @@ if __name__ == "__main__":
         return a * b
 
     # NOTE: a ``consent_demo`` tool that exercises the URL elicitation path
-    # was intentionally omitted from this demo. fastmcp 3.2.4 does not
+    # was intentionally omitted from this demo. fastmcp 3.2 does not
     # propagate ``UrlElicitationRequiredError`` (an ``McpError`` subclass)
     # raised inside a tool handler — its tool-call dispatch catches only
     # ``FastMCPError`` and wraps everything else as an ``isError: true``
