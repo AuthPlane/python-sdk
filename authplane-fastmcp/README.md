@@ -48,4 +48,4 @@ asyncio.run(main())
 
 ## Documentation
 
-PRM behavior, dev mode, revocation checking, manual setup, scope enforcement semantics, claim access, the full `authplane_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](docs/user-guide.md)**.
+PRM behavior, dev mode, revocation checking, manual setup, scope enforcement semantics, claim access, the full `authplane_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](https://github.com/AuthPlane/python-sdk/blob/main/authplane-fastmcp/docs/user-guide.md)**.

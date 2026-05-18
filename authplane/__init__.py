@@ -1,6 +1,12 @@
 """Authplane Python SDK — OAuth 2.1 JWT validation and token operations for protected resources."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
+from importlib.metadata import version as _version
+
+try:
+    __version__ = _version("authplane-sdk")
+except _PackageNotFoundError:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0+unknown"
 
 # Client
 # Authentication

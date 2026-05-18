@@ -274,7 +274,7 @@ downstream = await result.client.exchange(
 
 When a token exchange needs interactive user consent at the AS (for example, first-time authorization against a third-party service), the AS returns `consent_required` with a `consent_url`. MCP surfaces this through the URL elicitation flow (JSON-RPC error `-32042`). The [`authplane-mcp`](../../authplane-mcp/docs/user-guide.md#url-elicitation-for-consent) adapter wires it up end-to-end.
 
-**fastmcp 3.2.4 does not propagate `McpError` from tool handlers** (its tool dispatch wraps everything except `FastMCPError` as `{"isError": true}`), so `-32042` never reaches the wire. Handle `ConsentRequiredError` in the tool body for now:
+**fastmcp 3.2 does not propagate `McpError` from tool handlers** (its tool dispatch wraps everything except `FastMCPError` as `{"isError": true}`), so `-32042` never reaches the wire. Handle `ConsentRequiredError` in the tool body for now:
 
 ```python
 from authplane import ConsentRequiredError

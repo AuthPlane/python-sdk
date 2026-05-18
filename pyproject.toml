@@ -43,10 +43,23 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/AuthPlane/python-sdk"
+Repository = "https://github.com/AuthPlane/python-sdk"
 Issues = "https://github.com/AuthPlane/python-sdk/issues"
+Changelog = "https://github.com/AuthPlane/python-sdk/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["authplane"]
+# The package README is referenced by ``project.readme`` and ships in the
+# wheel because it lives inside ``authplane/``. The user guide is large,
+# import-irrelevant prose — keep it in the sdist, not the installed wheel.
+exclude = ["authplane/docs"]
+
+# Without this, hatchling's default sdist behaviour ("everything tracked by
+# VCS under the build root") tarballs the whole monorepo into authplane-sdk.
+# Scope it to the package itself; pyproject.toml, authplane/README.md (the
+# ``project.readme``) and LICENSE are always included automatically.
+[tool.hatch.build.targets.sdist]
+only-include = ["authplane", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

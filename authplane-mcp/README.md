@@ -19,7 +19,7 @@ Supported `mcp` range: **`>=1.23.0, <1.28.0`**. MCP 1.28 renamed the elicitation
 
 ```python
 import asyncio
-from authplane_mcp import authplane_mcp_auth
+from authplane_mcp import authplane_mcp_auth, require_scope
 from mcp.server.fastmcp import FastMCP
 
 auth_result = asyncio.run(
@@ -34,6 +34,7 @@ mcp = FastMCP("My MCP Server", json_response=True, **auth_result)
 
 @mcp.tool()
 async def query_database(query: str) -> str:
+    require_scope("tools/query")
     return f"Result for: {query}"
 
 mcp.run(transport="streamable-http")
@@ -43,4 +44,4 @@ mcp.run(transport="streamable-http")
 
 ## Documentation
 
-PRM behavior, dev mode, revocation checking, manual setup, the full `authplane_mcp_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](docs/user-guide.md)**.
+PRM behavior, dev mode, revocation checking, manual setup, the full `authplane_mcp_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](https://github.com/AuthPlane/python-sdk/blob/main/authplane-mcp/docs/user-guide.md)**.
