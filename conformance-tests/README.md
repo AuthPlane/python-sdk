@@ -40,7 +40,7 @@ async def test_...(...):
 
 ### Not-yet-implemented tests
 
-Tests for features that don't exist yet should still be present with the marker and a note explaining the gap:
+Tests for features that don't exist yet should still be present with the marker and a `pytest.xfail(...)` body that documents what is missing:
 
 ```python
 @pytest.mark.conformance(
@@ -48,12 +48,25 @@ Tests for features that don't exist yet should still be present with the marker 
     note="Not implemented: the SDK has no nonce generation, DPoP-Nonce challenge emission, or challenge-retry lifecycle for resource servers.",
 )
 async def test_rfc9449_dpop_inbound_nonce_must_be_validated_when_required(...):
-    ...  # test body exercises the expected API — will fail until implemented
+    pytest.xfail("Not implemented: ...")
 ```
 
-These tests fail intentionally and show up as `failed` with their note in the report.
+These tests show up as `skipped` (with their `note` carried through) in both `conformance-report.json` and `conformance-report.md` — pytest classifies `xfail` outcomes as skips. Keeping the suite green for known gaps means CI never has to be ignored to merge; the gap is still visible in the report's per-case status and coverage notes.
 
 ## Running
+
+The suite needs the shared catalog YAML on disk. By default it looks for
+`../conformance/oauth-sdk-conformance-catalog.yaml` (i.e. `python-sdk` and
+[`conformance`](https://github.com/AuthPlane/conformance) checked out as
+siblings). If your layout differs — e.g. nested inside another monorepo —
+point the suite at the catalog explicitly:
+
+```bash
+export AUTHPLANE_CONFORMANCE_CATALOG=/abs/path/to/oauth-sdk-conformance-catalog.yaml
+```
+
+The suite refuses to start with a clear error if the catalog cannot be
+found.
 
 ```bash
 # Run the conformance suite

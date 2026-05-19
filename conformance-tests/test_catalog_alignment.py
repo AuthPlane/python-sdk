@@ -32,8 +32,8 @@ def test_catalog_case_ids_are_represented_in_conformance_tests() -> None:
     root = Path(__file__).resolve().parents[1]
     default_catalog_path = root.parent / "conformance" / "oauth-sdk-conformance-catalog.yaml"
     catalog_path = (
-        Path(os.environ["CONFORMANCE_CATALOG_PATH"])
-        if "CONFORMANCE_CATALOG_PATH" in os.environ
+        Path(os.environ["AUTHPLANE_CONFORMANCE_CATALOG"])
+        if "AUTHPLANE_CONFORMANCE_CATALOG" in os.environ
         else default_catalog_path
     )
     catalog_text = catalog_path.read_text(encoding="utf-8")

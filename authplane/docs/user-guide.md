@@ -345,7 +345,7 @@ Client-credentials responses are cached in memory by `(scope, resource)`. Cached
 
 ## 7. DPoP for Outbound Calls
 
-Use `DPoPProvider` when your MCP server needs sender-constrained tokens or when the AS/downstream service requires DPoP proofs.
+Use `DPoPProvider` when your MCP server needs to acquire sender-constrained tokens for its own use against downstream services, or when the AS/downstream service requires DPoP proofs on the request itself. (For accepting DPoP-bound tokens from incoming requests, see `inbound_dpop` in §3.)
 
 ```python
 from authplane import DPoPKeyMaterial, DPoPProvider
@@ -567,30 +567,38 @@ The SDK maps OAuth error responses into typed `AuthError` subclasses. The circui
 
 ### HTTP status mapping
 
-Use `http_status()` to map any `AuthplaneError` to an HTTP status code:
+Use `http_status()` to map any `AuthplaneError` to an HTTP status code, `www_authenticate()` to build the matching `WWW-Authenticate` challenge, or `response_headers_for()` to get both in one call:
 
 ```python
-from authplane import AuthplaneError, http_status
+from authplane import AuthplaneError, response_headers_for
 
 try:
     claims = await res.verify(token)
 except AuthplaneError as e:
-    status = http_status(e)
+    status, headers = response_headers_for(
+        e,
+        realm="api.example.com",
+        resource_metadata_url=res.prm_url(),
+    )
+    # status: int, headers: {"WWW-Authenticate": "Bearer error=..."}
 ```
 
 | Exception | HTTP Status |
 |-----------|-------------|
 | `InsufficientScopeError` | 403 |
-| `JWKSFetchError`, `MetadataFetchError` | 503 |
+| `JWKSFetchError`, `MetadataFetchError`, `CircuitOpenError` | 503 |
 | `TokenMissingError`, `TokenExpiredError`, `InvalidSignatureError`, `InvalidClaimsError`, `TokenRevokedError`, `DPoPError` (and subclasses) | 401 |
 | `ProtocolError`, `VerifierRuntimeError`, other | 500 |
+
+`www_authenticate()` selects the scheme (`Bearer` by default, `DPoP` for DPoP-flow errors except `DPoPNotSupportedError`, which stays `Bearer` because the resource is bearer-only). When `scope=` is omitted it auto-populates from `InsufficientScopeError.required_scopes`. Every interpolated value is sanitized against header injection.
 
 ## 12. Protected Resource Metadata
 
 Generate an RFC 9728 protected resource metadata document with:
 
 ```python
-prm = res.prm_response()
+prm = res.prm_response()      # the document body (a dict)
+url = res.prm_url()           # the well-known URL where clients can fetch it
 ```
 
 Example output:
@@ -600,7 +608,6 @@ Example output:
   "resource": "https://api.example.com",
   "authorization_servers": ["https://auth.example.com"],
   "bearer_methods_supported": ["header"],
-  "resource_signing_alg_values_supported": ["RS256", "ES256"],
   "scopes_supported": ["read", "write"]
 }
 ```

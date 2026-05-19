@@ -99,7 +99,7 @@ Then run:
 pytest conformance-tests/
 ```
 
-`conformance-tests/conftest.py` resolves the catalog at `../conformance/oauth-sdk-conformance-catalog.yaml` by default. Set `CONFORMANCE_CATALOG_PATH=/absolute/path/to/oauth-sdk-conformance-catalog.yaml` to override (useful if your checkout layout differs). Without the catalog, `conformance-tests/` fails with a clear error — the rest of the test suite still runs.
+`conformance-tests/conftest.py` resolves the catalog at `../conformance/oauth-sdk-conformance-catalog.yaml` by default. Set `AUTHPLANE_CONFORMANCE_CATALOG=/absolute/path/to/oauth-sdk-conformance-catalog.yaml` to override (useful if your checkout layout differs). Without the catalog, `conformance-tests/` fails with a clear error — the rest of the test suite still runs.
 
 **Coverage (matches CI):**
 

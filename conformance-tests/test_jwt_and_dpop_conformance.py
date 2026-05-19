@@ -25,18 +25,61 @@ from authplane import (
     DPoPReplayDetectedError,
     FetchSettings,
     InboundDPoPOptions,
+    InMemoryDPoPReplayStore,
+    InsufficientScopeError,
     InvalidClaimsError,
     InvalidDPoPProofError,
     InvalidSignatureError,
+    TokenExpiredError,
+    www_authenticate,
 )
 from authplane.dpop_verification import verify_dpop_proof
 from authplane.internal.document_cache import JWKSCache
 from authplane.internal.fetch_result import FetchResult
 from authplane.internal.urls import build_prm_url
 from authplane.net.http import form_post
+from authplane.net.ssrf import HttpResponse
 from authplane.oauth.prm import build_prm
 
 _NO_SSRF = FetchSettings(ssrf_protection=False)
+
+
+def _stub_ssrf_post(
+    responses: list[HttpResponse],
+    *,
+    capture_headers: list[dict[str, str] | None] | None = None,
+) -> Any:
+    """Build an async stub for ``authplane.net.http.ssrf_safe_post`` that
+    returns ``responses`` in order.  ``capture_headers``, when provided,
+    is appended to with each call's ``extra_headers`` so the test can
+    assert on what the SDK sent.
+
+    Replaces three near-identical 9-parameter stubs that were inlined into
+    the DPoP-nonce conformance tests.
+    """
+    index = {"i": 0}
+
+    async def fake_post(
+        url: str,
+        *,
+        form_data: dict[str, str] | None = None,
+        json_data: dict[str, Any] | None = None,
+        extra_headers: dict[str, str] | None = None,
+        allow_http: bool = False,
+        allow_localhost: bool = False,
+        allow_private_networks: bool = False,
+        max_size: int = 65536,
+        timeout: float = 10.0,
+    ) -> HttpResponse:
+        del url, form_data, json_data
+        del allow_http, allow_localhost, allow_private_networks, max_size, timeout
+        if capture_headers is not None:
+            capture_headers.append(extra_headers)
+        i = index["i"]
+        index["i"] = i + 1
+        return responses[i]
+
+    return fake_post
 
 
 @dataclass
@@ -232,9 +275,6 @@ async def test_rfc8725_allowed_jwt_algorithms_must_be_restricted(
     verifier: Any,
     token_factory: Any,
 ) -> None:
-    import base64
-    import json
-
     header = {"alg": "none", "typ": "at+jwt"}
     payload = {
         "iss": "https://auth.example.com",
@@ -255,6 +295,9 @@ async def test_rfc8725_allowed_jwt_algorithms_must_be_restricted(
     with pytest.raises((InvalidClaimsError, InvalidSignatureError)):
         await verifier.verify(token)
 
+    # Reach into the verifier's internal client to assert the SDK rejects
+    # HS-family algorithms even when the caller tries to opt back in via
+    # the public AuthplaneClient.resource() API.
     client = verifier._client  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValueError):
         client.resource(resource="https://api.example.com", allowed_algorithms=["HS256"])
@@ -498,33 +541,21 @@ async def test_rfc9449_dpop_nonce_challenge_must_trigger_single_retry(
         DPoPKeyMaterial.from_pem(jwks_keypair["private_key"], algorithm="ES256")
     )
     calls: list[dict[str, str] | None] = []
-
-    async def fake_post(
-        url: str,
-        *,
-        form_data: dict[str, str] | None = None,
-        json_data: dict[str, Any] | None = None,
-        extra_headers: dict[str, str] | None = None,
-        allow_http: bool = False,
-        allow_localhost: bool = False,
-        allow_private_networks: bool = False,
-        max_size: int = 65536,
-        timeout: float = 10.0,
-    ) -> Any:
-        from authplane.net.ssrf import HttpResponse
-
-        calls.append(extra_headers)
-        if len(calls) == 1:
-            return HttpResponse(
+    fake_post = _stub_ssrf_post(
+        [
+            HttpResponse(
                 body={"error": "use_dpop_nonce"},
                 headers={"DPoP-Nonce": "nonce-123"},
                 status_code=400,
-            )
-        return HttpResponse(
-            body={"access_token": "ok", "token_type": "Bearer"}, headers={}, status_code=200
-        )
-
-    from authplane.net.http import form_post
+            ),
+            HttpResponse(
+                body={"access_token": "ok", "token_type": "Bearer"},
+                headers={},
+                status_code=200,
+            ),
+        ],
+        capture_headers=calls,
+    )
 
     with patch("authplane.net.http.ssrf_safe_post", side_effect=fake_post):
         result = await form_post(
@@ -546,36 +577,15 @@ async def test_rfc9449_dpop_nonce_on_success_response_should_be_stored(
     provider = DPoPProvider(
         DPoPKeyMaterial.from_pem(jwks_keypair["private_key"], algorithm="ES256")
     )
-
-    async def fake_post(
-        url: str,
-        *,
-        form_data: dict[str, str] | None = None,
-        json_data: dict[str, Any] | None = None,
-        extra_headers: dict[str, str] | None = None,
-        allow_http: bool = False,
-        allow_localhost: bool = False,
-        allow_private_networks: bool = False,
-        max_size: int = 65536,
-        timeout: float = 10.0,
-    ) -> Any:
-        from authplane.net.ssrf import HttpResponse
-
-        del (
-            form_data,
-            json_data,
-            extra_headers,
-            allow_http,
-            allow_localhost,
-            allow_private_networks,
-            max_size,
-            timeout,
-        )
-        return HttpResponse(
-            body={"access_token": "ok", "token_type": "Bearer"},
-            headers={"DPoP-Nonce": "nonce-456"},
-            status_code=200,
-        )
+    fake_post = _stub_ssrf_post(
+        [
+            HttpResponse(
+                body={"access_token": "ok", "token_type": "Bearer"},
+                headers={"DPoP-Nonce": "nonce-456"},
+                status_code=200,
+            ),
+        ],
+    )
 
     with patch("authplane.net.http.ssrf_safe_post", side_effect=fake_post):
         result = await form_post(
@@ -597,31 +607,22 @@ async def test_rfc9110_rfc9449_dpop_nonce_header_must_be_treated_case_insensitiv
         DPoPKeyMaterial.from_pem(jwks_keypair["private_key"], algorithm="ES256")
     )
     calls: list[dict[str, str] | None] = []
-
-    async def fake_post(
-        url: str,
-        *,
-        form_data: dict[str, str] | None = None,
-        json_data: dict[str, Any] | None = None,
-        extra_headers: dict[str, str] | None = None,
-        allow_http: bool = False,
-        allow_localhost: bool = False,
-        allow_private_networks: bool = False,
-        max_size: int = 65536,
-        timeout: float = 10.0,
-    ) -> Any:
-        from authplane.net.ssrf import HttpResponse
-
-        calls.append(extra_headers)
-        if len(calls) == 1:
-            return HttpResponse(
+    fake_post = _stub_ssrf_post(
+        [
+            HttpResponse(
                 body={"error": "use_dpop_nonce"},
+                # Mixed-case header — the SDK must treat DPoP-Nonce case-insensitively.
                 headers={"Dpop-Nonce": "nonce-123"},
                 status_code=400,
-            )
-        return HttpResponse(
-            body={"access_token": "ok", "token_type": "Bearer"}, headers={}, status_code=200
-        )
+            ),
+            HttpResponse(
+                body={"access_token": "ok", "token_type": "Bearer"},
+                headers={},
+                status_code=200,
+            ),
+        ],
+        capture_headers=calls,
+    )
 
     with patch("authplane.net.http.ssrf_safe_post", side_effect=fake_post):
         result = await form_post(
@@ -1065,8 +1066,6 @@ async def test_rfc9449_dpop_proof_htm_must_be_case_sensitive(
 async def test_rfc9449_dpop_replay_store_must_evict_expired_entries() -> None:
     """The replay store should evict expired entries so memory does not grow
     unbounded under sustained traffic."""
-    from authplane.dpop import InMemoryDPoPReplayStore
-
     store = InMemoryDPoPReplayStore()
     # Store an entry that has already expired
     await store.check_and_store("proof-1", expires_at=0)
@@ -1155,21 +1154,13 @@ async def test_authplane_agent_id_must_be_exposed_as_first_class_field(
     verifier: Any,
     token_factory: Any,
 ) -> None:
-    """VerifiedClaims.agent_id must surface the agent_id claim as a str."""
-    token = token_factory(agent_id="agent-007")
-    claims = await verifier.verify(token)
-    assert claims.agent_id == "agent-007"
+    """VerifiedClaims.agent_id surfaces the agent_id claim as a str when present,
+    and defaults to '' when absent."""
+    claims_present = await verifier.verify(token_factory(agent_id="agent-007"))
+    assert claims_present.agent_id == "agent-007"
 
-
-@pytest.mark.conformance("authplane-agent-id-must-be-exposed-as-first-class-field")
-async def test_authplane_agent_id_defaults_to_empty_when_absent(
-    verifier: Any,
-    token_factory: Any,
-) -> None:
-    """VerifiedClaims.agent_id defaults to '' when the claim is absent."""
-    token = token_factory()
-    claims = await verifier.verify(token)
-    assert claims.agent_id == ""
+    claims_absent = await verifier.verify(token_factory())
+    assert claims_absent.agent_id == ""
 
 
 @pytest.mark.conformance("authplane-agent-chain-must-be-exposed-as-first-class-field")
@@ -1177,21 +1168,15 @@ async def test_authplane_agent_chain_must_be_exposed_as_first_class_field(
     verifier: Any,
     token_factory: Any,
 ) -> None:
-    """VerifiedClaims.agent_chain must surface the agent_chain claim as a tuple."""
-    token = token_factory(agent_chain=["agent-1", "agent-2", "agent-3"])
-    claims = await verifier.verify(token)
-    assert claims.agent_chain == ("agent-1", "agent-2", "agent-3")
+    """VerifiedClaims.agent_chain surfaces the agent_chain claim as a tuple when
+    present, and defaults to () when absent."""
+    claims_present = await verifier.verify(
+        token_factory(agent_chain=["agent-1", "agent-2", "agent-3"])
+    )
+    assert claims_present.agent_chain == ("agent-1", "agent-2", "agent-3")
 
-
-@pytest.mark.conformance("authplane-agent-chain-must-be-exposed-as-first-class-field")
-async def test_authplane_agent_chain_defaults_to_empty_when_absent(
-    verifier: Any,
-    token_factory: Any,
-) -> None:
-    """VerifiedClaims.agent_chain defaults to () when the claim is absent."""
-    token = token_factory()
-    claims = await verifier.verify(token)
-    assert claims.agent_chain == ()
+    claims_absent = await verifier.verify(token_factory())
+    assert claims_absent.agent_chain == ()
 
 
 @pytest.mark.conformance("authplane-nbf-must-be-exposed-as-typed-field-on-verified-claims")
@@ -1199,22 +1184,14 @@ async def test_authplane_nbf_must_be_exposed_as_typed_field_on_verified_claims(
     verifier: Any,
     token_factory: Any,
 ) -> None:
-    """VerifiedClaims.not_before must surface the nbf claim as an int."""
+    """VerifiedClaims.not_before surfaces the nbf claim as an int when present,
+    and defaults to 0 when absent."""
     now = int(time.time())
-    token = token_factory(nbf=now)
-    claims = await verifier.verify(token)
-    assert claims.not_before == now
+    claims_present = await verifier.verify(token_factory(nbf=now))
+    assert claims_present.not_before == now
 
-
-@pytest.mark.conformance("authplane-nbf-must-be-exposed-as-typed-field-on-verified-claims")
-async def test_authplane_nbf_defaults_to_zero_when_absent(
-    verifier: Any,
-    token_factory: Any,
-) -> None:
-    """VerifiedClaims.not_before defaults to 0 when nbf is absent."""
-    token = token_factory(exclude_claims=["nbf"])
-    claims = await verifier.verify(token)
-    assert claims.not_before == 0
+    claims_absent = await verifier.verify(token_factory(exclude_claims=["nbf"]))
+    assert claims_absent.not_before == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1226,14 +1203,6 @@ async def test_authplane_nbf_defaults_to_zero_when_absent(
 async def test_rfc6750_error_response_must_map_error_codes() -> None:
     """SDK must provide a www_authenticate() helper that maps errors to
     RFC 6750 §3.1 error codes (invalid_token, insufficient_scope)."""
-    from authplane.errors import (
-        InsufficientScopeError,
-        InvalidDPoPProofError,
-        InvalidSignatureError,
-        TokenExpiredError,
-        www_authenticate,
-    )
-
     # Authentication failures → "invalid_token"
     result = www_authenticate(TokenExpiredError("expired"))
     assert result.startswith("Bearer ")
@@ -1257,8 +1226,6 @@ async def test_rfc6750_error_response_must_map_error_codes() -> None:
 @pytest.mark.conformance("rfc6750-error-response-realm-should-be-included")
 async def test_rfc6750_error_response_realm_should_be_included() -> None:
     """When realm is provided, the WWW-Authenticate header must include it."""
-    from authplane.errors import TokenExpiredError, www_authenticate
-
     result = www_authenticate(TokenExpiredError("expired"), realm="https://api.example.com")
     assert 'realm="https://api.example.com"' in result
 

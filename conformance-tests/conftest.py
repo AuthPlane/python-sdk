@@ -18,7 +18,10 @@ Optional coverage metadata can be added::
     async def test_...(...):
         ...
 
-Tests that are not yet implemented should use ``pytest.xfail``::
+Tests that are not yet implemented should use ``pytest.xfail`` — these
+appear as ``skipped`` in the generated report (pytest classifies ``xfail``
+outcomes as skips) so the suite stays green for known gaps while the gap
+itself remains visible in the per-case status and the ``note`` field::
 
     @pytest.mark.conformance("rfc9449-dpop-inbound-nonce-must-be-validated-when-required")
     async def test_...(...):
@@ -33,17 +36,27 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import authplane
 
 _ROOT = Path(__file__).resolve().parents[1]
+# Default layout: python-sdk and conformance cloned as siblings (see README
+# `Catalog path` section). Contributors with a different layout override via
+# AUTHPLANE_CONFORMANCE_CATALOG.
 _DEFAULT_CATALOG_PATH = _ROOT.parent / "conformance" / "oauth-sdk-conformance-catalog.yaml"
 _CATALOG_PATH = (
-    Path(os.environ["CONFORMANCE_CATALOG_PATH"])
-    if "CONFORMANCE_CATALOG_PATH" in os.environ
-    else Path(os.environ["AUTHPLANE_CONFORMANCE_CATALOG"])
+    Path(os.environ["AUTHPLANE_CONFORMANCE_CATALOG"])
     if "AUTHPLANE_CONFORMANCE_CATALOG" in os.environ
     else _DEFAULT_CATALOG_PATH
 )
+if not _CATALOG_PATH.exists():
+    raise RuntimeError(
+        f"OAuth SDK conformance catalog not found at {_CATALOG_PATH}. "
+        "Clone https://github.com/AuthPlane/conformance as a sibling of this repo, "
+        "or set AUTHPLANE_CONFORMANCE_CATALOG to the absolute path of "
+        "oauth-sdk-conformance-catalog.yaml."
+    )
 _REPORT_PATH = _ROOT / "conformance-report.json"
 _REPORT_MD_PATH = _ROOT / "conformance-report.md"
 _SOURCE = _ROOT / "tests" / "conftest.py"
@@ -55,6 +68,9 @@ _SPEC.loader.exec_module(_MODULE)
 
 _catalog_version = ""
 _catalog_ids: list[str] = []
+# One test function ↔ one catalog case_id. Enforced at collection time by
+# pytest_collection_modifyitems below — a duplicate marker fails fast instead
+# of letting a passing sibling silently mask a failing one in the rollup.
 _results: dict[str, dict[str, Any]] = {}
 _uncatalogued_results: dict[str, dict[str, Any]] = {}
 
@@ -234,10 +250,23 @@ def pytest_configure(config: Any) -> None:
 
 
 def pytest_collection_modifyitems(items: list[Any]) -> None:
-    """Build the case-id index from markers after collection."""
+    """Build the case-id index from markers, and enforce that each catalog
+    case_id maps to at most one test function. Duplicates are a structural bug
+    (a passing sibling could mask a failing one in the report)."""
+    seen: dict[str, str] = {}
     for item in items:
         case_id, coverage = _extract_conformance_marker(item)
         _ITEM_CASE_MAP[item.nodeid] = (case_id, coverage)
+        if case_id is None:
+            continue
+        if case_id in seen:
+            raise pytest.UsageError(
+                f"@pytest.mark.conformance({case_id!r}) is declared on multiple "
+                f"test functions ({seen[case_id]} and {item.nodeid}). Each catalog "
+                "case maps to exactly one test — merge the assertions, or split "
+                "the catalog case."
+            )
+        seen[case_id] = item.nodeid
 
 
 def pytest_runtest_logreport(report: Any) -> None:
@@ -268,7 +297,8 @@ def pytest_runtest_logreport(report: Any) -> None:
 def pytest_sessionfinish(session: Any, exitstatus: int) -> None:
     report_cases: list[dict[str, Any]] = []
     for case_id in _catalog_ids:
-        report_cases.append(_results.get(case_id, {"case_id": case_id, "status": "not_run"}))
+        case = _results.get(case_id)
+        report_cases.append(case if case is not None else {"case_id": case_id, "status": "not_run"})
 
     summary = {
         "passed": sum(1 for case in report_cases if case["status"] == "passed"),

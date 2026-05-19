@@ -266,6 +266,117 @@ class TestSSRFSafeFetch:
 
     @patch("authplane.net.ssrf.validate_url")
     @patch("httpx.AsyncClient")
+    async def test_host_header_includes_non_default_port(
+        self, mock_client_class: MagicMock, mock_validate: AsyncMock
+    ) -> None:
+        """Non-default port must appear in the Host header (RFC 7230 §5.4)."""
+        mock_validate.return_value = ValidatedURL(
+            original_url="http://localhost:9000/foo",
+            hostname="localhost",
+            port=9000,
+            path="/foo",
+            resolved_ips=["127.0.0.1"],
+        )
+
+        mock_response = MagicMock()
+        mock_response.headers = {"content-length": "2"}
+
+        async def mock_aiter_bytes() -> AsyncGenerator[bytes, None]:
+            yield b"{}"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        mock_response.status_code = 200
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_cm)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__.return_value = None
+        mock_client_class.return_value = mock_client
+
+        await ssrf_safe_get("http://localhost:9000/foo", allow_http=True, allow_localhost=True)
+
+        assert mock_client.stream.call_args[1]["headers"]["Host"] == "localhost:9000"
+
+    @patch("authplane.net.ssrf.validate_url")
+    @patch("httpx.AsyncClient")
+    async def test_host_header_strips_default_http_port(
+        self, mock_client_class: MagicMock, mock_validate: AsyncMock
+    ) -> None:
+        """Default HTTP port 80 must be omitted from the Host header."""
+        mock_validate.return_value = ValidatedURL(
+            original_url="http://example.com/path",
+            hostname="example.com",
+            port=80,
+            path="/path",
+            resolved_ips=["1.2.3.4"],
+        )
+
+        mock_response = MagicMock()
+        mock_response.headers = {"content-length": "2"}
+
+        async def mock_aiter_bytes() -> AsyncGenerator[bytes, None]:
+            yield b"{}"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        mock_response.status_code = 200
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_cm)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__.return_value = None
+        mock_client_class.return_value = mock_client
+
+        await ssrf_safe_get("http://example.com/path", allow_http=True)
+
+        assert mock_client.stream.call_args[1]["headers"]["Host"] == "example.com"
+
+    @patch("authplane.net.ssrf.validate_url")
+    @patch("httpx.AsyncClient")
+    async def test_host_header_brackets_ipv6_literal(
+        self, mock_client_class: MagicMock, mock_validate: AsyncMock
+    ) -> None:
+        """IPv6 hostnames must be bracketed in the Host header (RFC 3986 §3.2.2)."""
+        mock_validate.return_value = ValidatedURL(
+            original_url="http://[::1]:9000/foo",
+            hostname="::1",
+            port=9000,
+            path="/foo",
+            resolved_ips=["::1"],
+        )
+
+        mock_response = MagicMock()
+        mock_response.headers = {"content-length": "2"}
+
+        async def mock_aiter_bytes() -> AsyncGenerator[bytes, None]:
+            yield b"{}"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        mock_response.status_code = 200
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_cm)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__.return_value = None
+        mock_client_class.return_value = mock_client
+
+        await ssrf_safe_get("http://[::1]:9000/foo", allow_http=True, allow_localhost=True)
+
+        assert mock_client.stream.call_args[1]["headers"]["Host"] == "[::1]:9000"
+
+    @patch("authplane.net.ssrf.validate_url")
+    @patch("httpx.AsyncClient")
     async def test_response_too_large_content_length(
         self, mock_client_class: MagicMock, mock_validate: AsyncMock
     ) -> None:

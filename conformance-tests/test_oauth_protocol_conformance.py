@@ -514,6 +514,21 @@ async def test_rfc8693_empty_resource_and_audience_values_must_be_omitted() -> N
 async def test_rfc8693_success_response_must_use_access_token_issued_token_type_when_present() -> (
     None
 ):
+    # The catalog requires the SDK to (a) accept `access_token` as the issued
+    # type and (b) surface it unchanged to callers. Verifying the accept-and-
+    # preserve contract:
+    response = parse_token_response(
+        {
+            "access_token": "tok",
+            "token_type": "Bearer",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        },
+        allow_issued_token_type=True,
+    )
+    assert response.issued_token_type == "urn:ietf:params:oauth:token-type:access_token"
+
+    # Any other issued_token_type must be rejected (kept from the original
+    # test — exercises the matching reject path).
     with pytest.raises(ProtocolError, match="unsupported issued_token_type"):
         parse_token_response(
             {

@@ -92,7 +92,8 @@ twine check dist/*
 - `await client.introspect(token)` — RFC 7662
 - `await client.revoke(token)` — RFC 7009
 - `await client.aclose()` — required on shutdown.
-- `resource.prm_response()` — RFC 9728 PRM document.
+- `resource.prm_response()` — RFC 9728 PRM document (dict body).
+- `resource.prm_url()` — the well-known URL where clients fetch that document; pass to `response_headers_for(... , resource_metadata_url=...)`.
 
 ### Errors (root export)
 
@@ -109,8 +110,27 @@ AS-facing: `AuthError`, `InvalidClientError`, `InvalidGrantError`,
 6749 `invalid_grant`, `ConsentRequiredError` for `consent_required` /
 `interaction_required`.
 
-`http_status(error)` maps any `AuthplaneError` to an HTTP status; 403 only
-for `InsufficientScopeError`.
+`http_status(error)` maps any `AuthplaneError` to an HTTP status: 403 only
+for `InsufficientScopeError`; 503 for `JWKSFetchError`, `MetadataFetchError`,
+and `CircuitOpenError` (temporary AS unavailability); 401 for token failures;
+500 for `ProtocolError` / `VerifierRuntimeError` / unknown.
+
+`www_authenticate(error, *, realm="", resource_metadata_url=None, scope=None)`
+builds the matching `WWW-Authenticate` header. Scheme: `DPoP` for `DPoPError`
+subclasses except `DPoPNotSupportedError` (which stays `Bearer` because the
+resource is bearer-only); `Bearer` otherwise. When `scope=` is omitted, it
+auto-populates from `InsufficientScopeError.required_scopes`. Every
+interpolated value is sanitized (`\r\n"\\` stripped) so attacker-influenced
+error messages cannot break out of the quoted parameter or inject headers.
+
+`response_headers_for(error, *, realm="", resource_metadata_url=None,
+scope=None)` returns `(status, {"WWW-Authenticate": challenge})` in one call.
+
+Both adapter verifiers log a `logging.DEBUG` event
+`authplane.token_verification_failed` (logger `authplane_mcp.verifier` or
+`authplane_fastmcp.verifier`) with structured `error_class` / `error` fields
+before returning `None`, so operators can distinguish 401 causes in logs even
+though the wire stays uniform.
 
 ### Adapters
 
@@ -119,7 +139,9 @@ for `InsufficientScopeError`.
   `await result.aclose()`.
 - `await authplane_mcp_auth(issuer, resource, scopes=..., enforce_scopes_on_all_requests=False, ...)` (MCP) →
   `AuthplaneAuthResult` with `.token_verifier`, `.auth`, `.client`, and
-  `await result.aclose()`.
+  `await result.aclose()`. PRM advertises `scopes_supported` only when
+  `enforce_scopes_on_all_requests=True` (MCP-SDK limitation: no separate
+  "supported" field). The FastMCP adapter advertises whenever `scopes=` is set.
 - Both unpack into `FastMCP(...)` via `**result` (mapping view yields only
   the framework-required keys).
 - Both wrap `client.exchange()` so `ConsentRequiredError` with a
@@ -147,7 +169,7 @@ async def main() -> None:
 
     @mcp.tool(auth=require_scopes("tools/query"))
     def query(sql: str) -> str:
-        return run_query(sql)
+        return f"Ran: {sql}"  # replace with your real handler
 
     try:
         await mcp.run_async(transport="http", port=8080)
@@ -161,25 +183,31 @@ asyncio.run(main())
 
 ```python
 import asyncio
+
 from authplane_mcp import authplane_mcp_auth, require_scope
 from mcp.server.fastmcp import FastMCP
 
-auth_result = asyncio.run(authplane_mcp_auth(
-    issuer="https://auth.company.com",
-    resource="https://mcp.company.com",
-    scopes=["tools/query"],
-))
-mcp = FastMCP("My Server", json_response=True, **auth_result)
 
-@mcp.tool()
-async def query(sql: str) -> str:
-    require_scope("tools/query")
-    return run_query(sql)
+async def main() -> None:
+    auth_result = await authplane_mcp_auth(
+        issuer="https://auth.company.com",
+        resource="https://mcp.company.com",
+        scopes=["tools/query"],
+    )
+    mcp = FastMCP("My Server", port=8080, json_response=True, **auth_result)
 
-mcp.run(transport="streamable-http")
-# Call ``await auth_result.aclose()`` on shutdown — mcp.run() owns the loop,
-# so the cleanest pattern is to install a signal handler or wrap mcp.run()
-# in your own supervisor that runs aclose() after it returns.
+    @mcp.tool()
+    async def query(sql: str) -> str:
+        require_scope("tools/query")
+        return f"Ran: {sql}"  # replace with your real handler
+
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await auth_result.aclose()
+
+
+asyncio.run(main())
 ```
 
 ### Verify a token directly (framework-agnostic)
@@ -200,12 +228,17 @@ await client.aclose()
 ### Map errors to HTTP
 
 ```python
-from authplane import AuthplaneError, http_status
+from authplane import AuthplaneError, response_headers_for
 
 try:
     claims = await res.verify(token)
 except AuthplaneError as e:
-    return Response(status=http_status(e))
+    status, headers = response_headers_for(
+        e,
+        realm="api.example.com",
+        resource_metadata_url=res.prm_url(),
+    )
+    return Response(status_code=status, headers=headers)
 ```
 
 ## Demo Flows
@@ -289,8 +322,10 @@ RFC 8693 token exchange goes through `client.exchange(TokenExchangeOptions(...))
 import asyncio
 import os
 
-from authplane import ASCredentials, AuthplaneClient, DPoPProvider
+from authplane import ASCredentials, AuthplaneClient, DPoPKeyMaterial, DPoPProvider
 from authplane.oauth import TokenExchangeOptions
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 
 async def main() -> None:
@@ -300,10 +335,17 @@ async def main() -> None:
     scope = os.getenv("DEMO_SCOPE", "tools/add")
     resource = os.getenv("RESOURCE_URL", "http://localhost:8080/mcp")
 
+    # Ephemeral EC key for DPoP proof-of-possession on outbound AS calls.
+    dpop_pem = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+
     client = await AuthplaneClient.create(
         issuer=issuer,
         auth=ASCredentials(client_id=client_id, client_secret=client_secret),
-        dpop=DPoPProvider(),
+        dpop=DPoPProvider(DPoPKeyMaterial.from_pem(dpop_pem)),
         dev_mode=True,  # allow http://localhost issuer
     )
     try:
