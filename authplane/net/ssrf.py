@@ -112,6 +112,8 @@ async def _execute_pinned_request(
     *,
     method: str,
     hostname: str,
+    scheme: str,
+    port: int,
     form_data: dict[str, str] | list[tuple[str, str]] | None = None,
     json_data: dict[str, Any] | None = None,
     extra_headers: dict[str, str] | None = None,
@@ -127,7 +129,14 @@ async def _execute_pinned_request(
         headers: dict[str, str] = {}
         if extra_headers:
             headers.update(extra_headers)
-        headers["Host"] = hostname
+        # Host header must mirror the URI authority (RFC 7230 §5.4 / RFC 9110 §7.2):
+        # include the port when it isn't the scheme's default. Required for RFC 9449
+        # DPoP htu validation, which compares the proof's htu against the server's
+        # reconstruction of the request URI from Host + path. IPv6 literals are
+        # bracketed per RFC 3986 §3.2.2.
+        default_port = 443 if scheme == "https" else 80
+        host_literal = f"[{hostname}]" if ":" in hostname else hostname
+        headers["Host"] = host_literal if port == default_port else f"{host_literal}:{port}"
         headers["Accept"] = "application/json"
 
         stream_kwargs: dict[str, Any] = {
@@ -244,6 +253,8 @@ async def _ssrf_safe_request(
                 pinned_url,
                 method=method,
                 hostname=validated.hostname,
+                scheme=scheme,
+                port=validated.port,
                 form_data=form_data,
                 json_data=json_data,
                 extra_headers=extra_headers,

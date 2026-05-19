@@ -56,7 +56,8 @@ class VerifiedClaims:
         """Raise InsufficientScopeError when the validated token lacks the scope."""
         if not self.has_scope(scope):
             raise InsufficientScopeError(
-                f"Token missing required scope '{scope}'. Token has scopes: {list(self.scopes)}"
+                f"Token missing required scope '{scope}'. Token has scopes: {list(self.scopes)}",
+                required_scopes=(scope,),
             )
 
     def has_claim(self, key: str, value: Any = _MISSING) -> bool:

@@ -57,6 +57,7 @@ from .errors import (
     UnsupportedGrantTypeError,
     VerifierRuntimeError,
     http_status,
+    response_headers_for,
     www_authenticate,
 )
 
@@ -118,5 +119,6 @@ __all__ = [
     "VerifierRuntimeError",
     "__version__",
     "http_status",
+    "response_headers_for",
     "www_authenticate",
 ]

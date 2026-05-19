@@ -32,27 +32,33 @@ Requires Python 3.11+.
 ## Quick Start
 
 ```python
+import asyncio
+
 from mcp.server.fastmcp import FastMCP
 from authplane_mcp import authplane_mcp_auth, require_scope
 
-mcp = FastMCP(
-    "My Server",
-    port=8080,
-    json_response=True,
-    **await authplane_mcp_auth(
+
+async def main() -> None:
+    auth_result = await authplane_mcp_auth(
         issuer="https://auth.company.com",
         resource="https://mcp.company.com",
         scopes=["tools/query", "tools/write"],
-    ),
-)
+    )
+    mcp = FastMCP("My Server", port=8080, json_response=True, **auth_result)
 
-@mcp.tool()
-async def query(sql: str) -> str:
-    """Execute a query."""
-    require_scope("tools/query")
-    return run_query(sql)
+    @mcp.tool()
+    async def query(sql: str) -> str:
+        """Execute a query."""
+        require_scope("tools/query")
+        return f"Ran: {sql}"  # replace with your real handler
 
-mcp.run(transport="streamable-http")
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await auth_result.aclose()
+
+
+asyncio.run(main())
 ```
 
 `authplane_mcp_auth()` performs RFC 8414 metadata discovery, fetches the JWKS, and returns a dict with `token_verifier` and `auth` keys that unpack directly into `FastMCP()`.
@@ -99,7 +105,7 @@ from authplane_mcp import require_scope
 async def query(sql: str) -> str:
     """Requires the tools/query scope."""
     require_scope("tools/query")
-    return run_query(sql)
+    return f"Ran: {sql}"  # replace with your real handler
 
 @mcp.tool()
 async def delete_all() -> str:
@@ -398,11 +404,29 @@ asyncio.run(main())
 
 ### Verification path
 
-`AuthplaneTokenVerifier.verify_token` catches every `AuthplaneError` raised by `AuthplaneResource.verify()` (missing/expired/invalid/revoked token, DPoP failure, etc.) and returns `None`. The MCP server turns that into a uniform **401 Unauthorized** for the request — the adapter does not differentiate by error type.
+`AuthplaneTokenVerifier.verify_token` catches every `AuthplaneError` raised by `AuthplaneResource.verify()` (missing/expired/invalid/revoked token, DPoP failure, etc.) and returns `None`. The MCP server turns that into a uniform **401 Unauthorized** on the wire — the *wire* does not differentiate by error type, but the verifier emits a `logging.DEBUG` event `authplane.token_verification_failed` (logger `authplane_mcp.verifier`) with structured `error_class` and `error` fields so operators can distinguish expired tokens from JWKS outages from DPoP replays in logs.
 
 ### Scope enforcement
 
-Scope checks happen *after* token validation succeeds and are a separate enforcement layer — see [Scope Enforcement](#scope-enforcement) above for the `require_scope()` helper. Inside a handler, `claims.require_scope("…")` raises `InsufficientScopeError` (which `http_status()` maps to 403 if you call it).
+Scope checks happen *after* token validation succeeds and are a separate enforcement layer — see [Scope Enforcement](#scope-enforcement) above for the `require_scope()` helper. Inside a handler, `claims.require_scope("…")` raises `InsufficientScopeError`. The error carries `required_scopes` so the SDK can emit RFC 6750's `scope=` challenge automatically.
+
+### Building a `WWW-Authenticate` challenge in custom middleware
+
+When you handle an `AuthplaneError` outside the verifier — typically because you are wrapping the adapter in your own middleware or calling `AuthplaneResource.verify()` directly — use `response_headers_for(error, …)` to map the error to `(status, {"WWW-Authenticate": challenge})` in one call. It forwards `realm`, `resource_metadata_url`, and `scope` into the underlying `www_authenticate()` helper, which sanitizes every interpolated value against header injection.
+
+```python
+from authplane import AuthplaneError, response_headers_for
+
+try:
+    claims = await resource.verify(token, dpop_request=ctx)
+except AuthplaneError as error:
+    status, headers = response_headers_for(
+        error,
+        realm="api.example.com",
+        resource_metadata_url=resource.prm_url(),
+    )
+    return Response(status_code=status, headers=headers)
+```
 
 ### Catching SDK errors directly
 

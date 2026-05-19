@@ -4,6 +4,18 @@ All exceptions inherit from AuthplaneError for easy catching.
 InsufficientScope is distinguishable for 403 HTTP status mapping.
 """
 
+import re
+
+_HEADER_VALUE_UNSAFE = re.compile(r'[\r\n"\\]+')
+
+
+def _sanitize_header_value(value: str) -> str:
+    """Replace CR, LF, double-quote, and backslash with a single space so the
+    value cannot break out of a quoted ``WWW-Authenticate`` parameter or inject
+    additional header fields. Leading/trailing whitespace is stripped.
+    """
+    return _HEADER_VALUE_UNSAFE.sub(" ", value).strip()
+
 
 class AuthplaneError(Exception):
     """Base exception for all Authplane SDK errors."""
@@ -38,11 +50,16 @@ class InvalidClaimsError(AuthplaneError):
 class InsufficientScopeError(AuthplaneError):
     """Raised when the token lacks required scopes.
 
-    This exception maps to HTTP 403 Forbidden, while other AuthplaneError
-    exceptions typically map to HTTP 401 Unauthorized.
+    Maps to HTTP 403 Forbidden, while other AuthplaneError exceptions
+    typically map to HTTP 401 Unauthorized. The optional ``required_scopes``
+    attribute carries the scopes the caller required so
+    :func:`www_authenticate` can emit the RFC 6750 ``scope=`` challenge
+    parameter automatically.
     """
 
-    pass
+    def __init__(self, message: str, *, required_scopes: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.required_scopes = required_scopes
 
 
 class JWKSFetchError(AuthplaneError):
@@ -225,13 +242,30 @@ class CircuitOpenError(AuthError):
     pass
 
 
-def www_authenticate(error: AuthplaneError, *, realm: str = "") -> str:
+def www_authenticate(
+    error: AuthplaneError,
+    *,
+    realm: str = "",
+    resource_metadata_url: str | None = None,
+    scope: list[str] | None = None,
+) -> str:
     """Build an RFC 6750 §3 ``WWW-Authenticate`` header value.
 
     Maps SDK errors to the correct error code and authentication scheme:
     - ``InsufficientScopeError`` → ``insufficient_scope``
-    - ``DPoPError`` subclasses → ``DPoP`` scheme with ``invalid_token``
+    - ``DPoPError`` subclasses (except ``DPoPNotSupportedError``) → ``DPoP``
+      scheme with ``invalid_token``
     - All other ``AuthplaneError`` → ``Bearer`` scheme with ``invalid_token``
+
+    If ``scope`` is provided (or the error is an :class:`InsufficientScopeError`
+    carrying ``required_scopes``), an RFC 6750 §3 ``scope="…"`` challenge
+    parameter is included. An explicit ``scope`` argument takes precedence.
+
+    If ``resource_metadata_url`` is provided, the RFC 9728 §5.1
+    ``resource_metadata`` challenge parameter is included so clients can
+    discover the Protected Resource Metadata document.
+
+    Every interpolated value is sanitized to prevent header injection.
 
     Returns:
         A header value like ``Bearer error="invalid_token", error_description="..."``
@@ -241,13 +275,24 @@ def www_authenticate(error: AuthplaneError, *, realm: str = "") -> str:
     else:
         error_code = "invalid_token"
 
-    scheme = "DPoP" if isinstance(error, DPoPError) else "Bearer"
+    scheme = (
+        "DPoP"
+        if isinstance(error, DPoPError) and not isinstance(error, DPoPNotSupportedError)
+        else "Bearer"
+    )
+
+    if scope is None and isinstance(error, InsufficientScopeError) and error.required_scopes:
+        scope = list(error.required_scopes)
 
     parts: list[str] = []
     if realm:
-        parts.append(f'realm="{realm}"')
+        parts.append(f'realm="{_sanitize_header_value(realm)}"')
     parts.append(f'error="{error_code}"')
-    parts.append(f'error_description="{error}"')
+    parts.append(f'error_description="{_sanitize_header_value(str(error))}"')
+    if scope:
+        parts.append(f'scope="{_sanitize_header_value(" ".join(scope))}"')
+    if resource_metadata_url:
+        parts.append(f'resource_metadata="{_sanitize_header_value(resource_metadata_url)}"')
     return f"{scheme} " + ", ".join(parts)
 
 
@@ -256,15 +301,15 @@ def http_status(error: AuthplaneError) -> int:
 
     Returns:
         403 for InsufficientScopeError.
-        503 for JWKSFetchError and MetadataFetchError (service temporarily
-            unable to validate tokens).
+        503 for JWKSFetchError, MetadataFetchError, and CircuitOpenError
+            (the AS is temporarily unable to participate in validation).
         401 for all authentication failures (missing/expired/invalid tokens,
             DPoP errors, revoked tokens).
         500 for internal errors (SSRF, protocol, runtime).
     """
     if isinstance(error, InsufficientScopeError):
         return 403
-    if isinstance(error, (JWKSFetchError, MetadataFetchError)):
+    if isinstance(error, (JWKSFetchError, MetadataFetchError, CircuitOpenError)):
         return 503
     if isinstance(
         error,
@@ -281,6 +326,33 @@ def http_status(error: AuthplaneError) -> int:
     if isinstance(error, (ProtocolError, VerifierRuntimeError)):
         return 500
     return 500
+
+
+def response_headers_for(
+    error: AuthplaneError,
+    *,
+    realm: str = "",
+    resource_metadata_url: str | None = None,
+    scope: list[str] | None = None,
+) -> tuple[int, dict[str, str]]:
+    """Return ``(status, {"WWW-Authenticate": challenge})`` for an Authplane error.
+
+    One call replaces the parallel use of :func:`http_status` and
+    :func:`www_authenticate`. Forwards keyword arguments to
+    :func:`www_authenticate` so callers can include ``realm``,
+    ``resource_metadata_url``, and ``scope`` without re-deriving the mapping.
+    """
+    return (
+        http_status(error),
+        {
+            "WWW-Authenticate": www_authenticate(
+                error,
+                realm=realm,
+                resource_metadata_url=resource_metadata_url,
+                scope=scope,
+            )
+        },
+    )
 
 
 def map_oauth_error(

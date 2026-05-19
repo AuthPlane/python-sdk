@@ -5,8 +5,12 @@ Bridges the Authplane core SDK with the official MCP Python SDK's
 ``AuthplaneResource`` and mapping results to MCP's ``AccessToken``.
 """
 
+import logging
+
 from authplane import AuthplaneError, AuthplaneResource
 from mcp.server.auth.provider import AccessToken, TokenVerifier
+
+logger = logging.getLogger(__name__)
 
 
 class AuthplaneTokenVerifier(TokenVerifier):
@@ -55,7 +59,11 @@ class AuthplaneTokenVerifier(TokenVerifier):
         """
         try:
             claims = await self._verifier.verify(token)
-        except AuthplaneError:
+        except AuthplaneError as error:
+            logger.debug(
+                "authplane.token_verification_failed",
+                extra={"error_class": type(error).__name__, "error": str(error)},
+            )
             return None
 
         # AccessToken.resource must be a string. Since audience is a list,

@@ -5,10 +5,13 @@ delegating all JWT validation to ``AuthplaneResource`` and mapping results
 to FastMCP's ``AccessToken`` with the full JWT payload in ``claims``.
 """
 
+import logging
 from typing import Any, cast
 
 from authplane import AuthplaneError, AuthplaneResource
 from fastmcp.server.auth import AccessToken, TokenVerifier
+
+logger = logging.getLogger(__name__)
 
 
 class AuthplaneTokenVerifier(TokenVerifier):
@@ -83,7 +86,11 @@ class AuthplaneTokenVerifier(TokenVerifier):
         """
         try:
             claims = await self._verifier.verify(token)
-        except AuthplaneError:
+        except AuthplaneError as error:
+            logger.debug(
+                "authplane.token_verification_failed",
+                extra={"error_class": type(error).__name__, "error": str(error)},
+            )
             return None
 
         return AccessToken(

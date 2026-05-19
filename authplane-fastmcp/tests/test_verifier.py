@@ -1,9 +1,10 @@
 """Unit tests for AuthplaneTokenVerifier."""
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
-from authplane import VerifiedClaims
+from authplane import AuthplaneError, TokenExpiredError, VerifiedClaims
 
 from authplane_fastmcp import AuthplaneTokenVerifier
 
@@ -103,3 +104,43 @@ def test_verifier_property(
 ) -> None:
     """verifier property exposes the underlying AuthplaneResource."""
     assert token_verifier.verifier is mock_verifier
+
+
+@pytest.mark.asyncio
+async def test_verify_token_failure_logs_typed_error_at_debug(
+    mock_verifier: AsyncMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Regression: contract-required None return must still
+    # produce an operator-side signal carrying the typed error class and
+    # message. Debug-level so steady-state invalid tokens stay quiet.
+    mock_verifier.verify.side_effect = TokenExpiredError("expired at 2026")
+
+    verifier = AuthplaneTokenVerifier(mock_verifier)
+
+    with caplog.at_level(logging.DEBUG, logger="authplane_fastmcp.verifier"):
+        result = await verifier.verify_token("expired_jwt")
+
+    assert result is None
+    matching = [r for r in caplog.records if r.name == "authplane_fastmcp.verifier"]
+    assert len(matching) == 1
+    record = matching[0]
+    assert record.levelno == logging.DEBUG
+    assert record.message == "authplane.token_verification_failed"
+    assert record.error_class == "TokenExpiredError"  # type: ignore[attr-defined]
+    assert record.error == "expired at 2026"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_verify_token_failure_silent_above_debug(
+    mock_verifier: AsyncMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Default INFO level must not surface the event.
+    mock_verifier.verify.side_effect = AuthplaneError("bad token")
+
+    verifier = AuthplaneTokenVerifier(mock_verifier)
+
+    with caplog.at_level(logging.INFO, logger="authplane_fastmcp.verifier"):
+        result = await verifier.verify_token("bad")
+
+    assert result is None
+    assert not [r for r in caplog.records if r.name == "authplane_fastmcp.verifier"]

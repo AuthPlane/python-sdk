@@ -74,7 +74,7 @@ jobs:
 
       - name: Test and coverage
         env:
-          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+          AUTHPLANE_CONFORMANCE_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
           if [ "${{ matrix.package }}" = "root" ]; then
             coverage run -m pytest tests conformance-tests && coverage report

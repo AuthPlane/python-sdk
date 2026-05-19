@@ -36,6 +36,7 @@ from ..errors import (
     VerifierRuntimeError,
 )
 from ..internal.jwt import decode_jwt_header
+from ..internal.urls import build_prm_url
 from ..oauth.prm import build_prm
 from ..oauth.types import IntrospectionRevocation
 from .claims import VerifiedClaims, freeze_value
@@ -411,3 +412,13 @@ class AuthplaneResource:
             else None,
             dpop_required=self._dpop_required,
         )
+
+    def prm_url(self) -> str:
+        """Return the RFC 9728 well-known PRM discovery URL for this resource.
+
+        Symmetric with :meth:`prm_response`: this is the URL clients can fetch
+        to retrieve that document, suitable for the ``resource_metadata``
+        challenge parameter (:func:`authplane.www_authenticate`,
+        :func:`authplane.response_headers_for`).
+        """
+        return build_prm_url(self._resource)

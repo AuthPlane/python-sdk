@@ -19,28 +19,34 @@ Supported `mcp` range: **`>=1.23.0, <1.28.0`**. MCP 1.28 renamed the elicitation
 
 ```python
 import asyncio
+
 from authplane_mcp import authplane_mcp_auth, require_scope
 from mcp.server.fastmcp import FastMCP
 
-auth_result = asyncio.run(
-    authplane_mcp_auth(
+
+async def main() -> None:
+    auth_result = await authplane_mcp_auth(
         issuer="https://auth.company.com",
         resource="https://mcp.company.com",
         scopes=["tools/query", "tools/write"],
     )
-)
+    mcp = FastMCP("My MCP Server", port=8080, json_response=True, **auth_result)
 
-mcp = FastMCP("My MCP Server", json_response=True, **auth_result)
+    @mcp.tool()
+    async def query_database(query: str) -> str:
+        require_scope("tools/query")
+        return f"Result for: {query}"
 
-@mcp.tool()
-async def query_database(query: str) -> str:
-    require_scope("tools/query")
-    return f"Result for: {query}"
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await auth_result.aclose()
 
-mcp.run(transport="streamable-http")
+
+asyncio.run(main())
 ```
 
-`mcp.run()` starts its own event loop, so the auth setup runs synchronously via `asyncio.run(...)` first. `auth_result` holds background JWKS and metadata refresh tasks — call `await auth_result.aclose()` during server shutdown.
+`auth_result` holds background JWKS and metadata refresh tasks bound to the running event loop. Keep the setup, server, and `aclose()` inside a single `asyncio.run(main())` so those tasks stay alive for the server's lifetime.
 
 ## Documentation
 

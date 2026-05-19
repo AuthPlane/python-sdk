@@ -32,24 +32,30 @@ Requires Python 3.11+.
 ## Quick Start
 
 ```python
+import asyncio
+
 from fastmcp import FastMCP
 from authplane_fastmcp import authplane_auth
 
-mcp = FastMCP(
-    "My Server",
-    **await authplane_auth(
+async def main() -> None:
+    result = await authplane_auth(
         issuer="https://auth.company.com",
         base_url="https://mcp.company.com",
         scopes=["tools/query", "tools/write"],
-    ),
-)
+    )
+    mcp = FastMCP("My Server", **result)
 
-@mcp.tool()
-def query(sql: str) -> str:
-    """Execute a query."""
-    return run_query(sql)
+    @mcp.tool()
+    def query(sql: str) -> str:
+        """Execute a query."""
+        return f"Ran: {sql}"  # replace with your real handler
 
-mcp.run(transport="http", port=8080)
+    try:
+        await mcp.run_async(transport="http", port=8080)
+    finally:
+        await result.aclose()
+
+asyncio.run(main())
 ```
 
 `authplane_auth()` performs RFC 8414 metadata discovery, fetches the JWKS, and wires up all authentication components. The result unpacks directly into `FastMCP()`.
@@ -95,7 +101,7 @@ from fastmcp.server.auth import require_scopes
 @mcp.tool(auth=require_scopes("tools/query"))
 def query(sql: str) -> str:
     """Requires the tools/query scope."""
-    return run_query(sql)
+    return f"Ran: {sql}"  # replace with your real handler
 
 @mcp.tool(auth=require_scopes("tools/admin", "tools/delete"))
 def delete_all() -> str:
@@ -103,7 +109,7 @@ def delete_all() -> str:
     return clear_database()
 ```
 
-FastMCP enforces scopes **before** the handler runs. If the token is missing a required scope, FastMCP returns a 403 response and the handler is never called.
+FastMCP enforces scopes **before** the handler runs by **filtering tools the caller cannot use out of the catalog**. If the token is missing a required scope, the tool is hidden from `tools/list`, and a `tools/call` for that tool returns HTTP 200 with `{"isError": true, "content": [{"text": "Unknown tool: '<name>'"}]}` — **not** a 403. UX layers expecting a 403 to prompt for re-auth will not see one; key off `isError` + the tool-not-found content text instead.
 
 ## Accessing Token Claims
 
@@ -274,11 +280,12 @@ downstream = await result.client.exchange(
 
 When a token exchange needs interactive user consent at the AS (for example, first-time authorization against a third-party service), the AS returns `consent_required` with a `consent_url`. MCP surfaces this through the URL elicitation flow (JSON-RPC error `-32042`). The [`authplane-mcp`](../../authplane-mcp/docs/user-guide.md#url-elicitation-for-consent) adapter wires it up end-to-end.
 
-**fastmcp 3.2 does not propagate `McpError` from tool handlers** (its tool dispatch wraps everything except `FastMCPError` as `{"isError": true}`), so `-32042` never reaches the wire. Handle `ConsentRequiredError` in the tool body for now:
+**fastmcp 3.2 does not propagate `McpError` from tool handlers** (its tool dispatch wraps everything except `FastMCPError` as `{"isError": true}`), so `-32042` never reaches the wire. The wrapped `client.exchange()` raises `UrlElicitationRequiredError` (the MCP-shaped form of the consent error) — catch it in the tool body and render the consent URL into the response yourself:
 
 ```python
 from authplane import ConsentRequiredError
 from authplane.oauth import TokenExchangeOptions
+from mcp.shared.exceptions import UrlElicitationRequiredError
 
 @mcp.tool(auth=require_scopes("tools/call_downstream"))
 async def call_downstream(payload: str) -> str:
@@ -286,8 +293,14 @@ async def call_downstream(payload: str) -> str:
         downstream = await auth_result.client.exchange(
             TokenExchangeOptions(subject_token=..., scope="downstream/write")
         )
+    except UrlElicitationRequiredError as error:
+        urls = [e.url for e in error.elicitations] if error.elicitations else []
+        return f"Consent required: {urls[0] if urls else '<no url>'}"
     except ConsentRequiredError as error:
-        return f"Consent required: {error.consent_url}"
+        # The wrapper only translates to UrlElicitationRequiredError when the
+        # AS supplied a consent_url. Without one, the bare error reaches us —
+        # surface its formatted description (no URL to render).
+        return f"Consent required: {error.describe()}"
     return await downstream_api_call(downstream.access_token, payload)
 ```
 
@@ -364,12 +377,17 @@ When `fetch_settings` is provided, `dev_mode` is ignored for both metadata and J
 `authplane_auth()` returns an `AuthplaneAuthResult` that holds background JWKS / metadata refresh tasks and an HTTP connection pool. Call `aclose()` on shutdown:
 
 ```python
-result = await authplane_auth(...)
-try:
-    mcp = FastMCP("My Server", **result)
-    await mcp.run_async(transport="http", port=8080)
-finally:
-    await result.aclose()
+import asyncio
+
+async def main() -> None:
+    result = await authplane_auth(...)
+    try:
+        mcp = FastMCP("My Server", **result)
+        await mcp.run_async(transport="http", port=8080)
+    finally:
+        await result.aclose()
+
+asyncio.run(main())
 ```
 
 `result.aclose()` closes the underlying `AuthplaneClient`, cancels its background tasks, and releases connections. Skipping it surfaces as leaked tasks, open sockets, and `ResourceWarning` in tests.
@@ -378,11 +396,29 @@ finally:
 
 ### Verification path
 
-`AuthplaneTokenVerifier.verify_token` catches every `AuthplaneError` raised by `AuthplaneResource.verify()` (missing/expired/invalid/revoked token, DPoP failure, etc.) and returns `None`. FastMCP turns that into a uniform **401 Unauthorized** for the request — the adapter does not differentiate by error type.
+`AuthplaneTokenVerifier.verify_token` catches every `AuthplaneError` raised by `AuthplaneResource.verify()` (missing/expired/invalid/revoked token, DPoP failure, etc.) and returns `None`. FastMCP turns that into a uniform **401 Unauthorized** on the wire — the *wire* does not differentiate by error type, but the verifier emits a `logging.DEBUG` event `authplane.token_verification_failed` (logger `authplane_fastmcp.verifier`) with structured `error_class` and `error` fields so operators can distinguish expired tokens from JWKS outages from DPoP replays in logs.
 
 ### Scope enforcement
 
-Scope checks happen *after* token validation succeeds and are a separate enforcement layer — see [Scope Enforcement](#scope-enforcement) above for `@mcp.tool(auth=require_scopes(...))`. Inside a handler, `claims.require_scope("…")` raises `InsufficientScopeError` (which `http_status()` maps to 403 if you call it).
+Scope checks happen *after* token validation succeeds and are a separate enforcement layer — see [Scope Enforcement](#scope-enforcement) above for `@mcp.tool(auth=require_scopes(...))`. Inside a handler, `claims.require_scope("…")` raises `InsufficientScopeError`. The error carries `required_scopes` so the SDK can emit RFC 6750's `scope=` challenge automatically.
+
+### Building a `WWW-Authenticate` challenge in custom middleware
+
+When you handle an `AuthplaneError` outside the verifier — typically because you are wrapping the adapter in your own middleware or calling `AuthplaneResource.verify()` directly — use `response_headers_for(error, …)` to map the error to `(status, {"WWW-Authenticate": challenge})` in one call. It forwards `realm`, `resource_metadata_url`, and `scope` into the underlying `www_authenticate()` helper, which sanitizes every interpolated value against header injection.
+
+```python
+from authplane import AuthplaneError, response_headers_for
+
+try:
+    claims = await resource.verify(token, dpop_request=ctx)
+except AuthplaneError as error:
+    status, headers = response_headers_for(
+        error,
+        realm="api.example.com",
+        resource_metadata_url=resource.prm_url(),
+    )
+    return Response(status_code=status, headers=headers)
+```
 
 ### Catching SDK errors directly
 

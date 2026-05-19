@@ -1,8 +1,9 @@
+import logging
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import pytest
-from authplane import AuthplaneError, VerifiedClaims
+from authplane import AuthplaneError, TokenExpiredError, VerifiedClaims
 from mcp.server.auth.provider import AccessToken
 
 from authplane_mcp.verifier import AuthplaneTokenVerifier
@@ -76,3 +77,47 @@ def test_verifier_property() -> None:
     mock_verifier = AsyncMock()
     adapter = AuthplaneTokenVerifier(mock_verifier)
     assert adapter.verifier is mock_verifier
+
+
+@pytest.mark.asyncio
+async def test_verify_token_failure_logs_typed_error_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Regression: returning None still has to happen (the MCP
+    # contract requires it), but operators must see *which* typed error caused
+    # the 401 in their logs. Debug-level because invalid tokens are expected
+    # steady-state and shouldn't page on-call.
+    mock_verifier = AsyncMock()
+    mock_verifier.verify.side_effect = TokenExpiredError("expired at 2026")
+
+    adapter = AuthplaneTokenVerifier(mock_verifier)
+
+    with caplog.at_level(logging.DEBUG, logger="authplane_mcp.verifier"):
+        result = await adapter.verify_token("expired_jwt")
+
+    assert result is None
+    matching = [r for r in caplog.records if r.name == "authplane_mcp.verifier"]
+    assert len(matching) == 1
+    record = matching[0]
+    assert record.levelno == logging.DEBUG
+    assert record.message == "authplane.token_verification_failed"
+    assert record.error_class == "TokenExpiredError"  # type: ignore[attr-defined]
+    assert record.error == "expired at 2026"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_verify_token_failure_silent_above_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # At default (INFO) level the structured event must not surface — invalid
+    # tokens are too common in steady state to log at info.
+    mock_verifier = AsyncMock()
+    mock_verifier.verify.side_effect = AuthplaneError("bad token")
+
+    adapter = AuthplaneTokenVerifier(mock_verifier)
+
+    with caplog.at_level(logging.INFO, logger="authplane_mcp.verifier"):
+        result = await adapter.verify_token("bad")
+
+    assert result is None
+    assert not [r for r in caplog.records if r.name == "authplane_mcp.verifier"]

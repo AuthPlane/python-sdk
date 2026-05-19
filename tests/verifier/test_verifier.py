@@ -424,6 +424,18 @@ async def test_prm_response(verifier: AuthplaneResource) -> None:
     assert prm["bearer_methods_supported"] == ["header"]
 
 
+async def test_prm_url_for_root_resource(verifier: AuthplaneResource) -> None:
+    # RFC 9728 §3: well-known suffix is appended directly when the resource
+    # has no path component.
+    assert verifier.prm_url() == "https://api.example.com/.well-known/oauth-protected-resource"
+
+
+async def test_prm_url_for_path_resource(client: AuthplaneClient) -> None:
+    # RFC 9728 §3: the path component shifts behind the well-known segment.
+    resource = client.resource(resource="https://api.example.com/mcp", scopes=["read:data"])
+    assert resource.prm_url() == "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+
+
 async def test_prm_omits_dpop_fields_when_inbound_dpop_not_configured(
     client: AuthplaneClient,
 ) -> None:

@@ -30,7 +30,7 @@ async def main() -> None:
 
     @mcp.tool(auth=require_scopes("tools/query"))
     def query(sql: str) -> str:
-        return run_query(sql)
+        return f"Ran: {sql}"  # replace with your real handler
 
     try:
         await mcp.run_async(transport="http", port=8080)

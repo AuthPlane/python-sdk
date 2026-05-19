@@ -7,6 +7,8 @@ import respx
 
 from authplane import AuthplaneClient, FetchSettings
 from authplane.errors import MetadataFetchError, MissingMetadataEndpointError
+from authplane.internal.fetch_result import FetchResult
+from authplane.internal.metadata import MetadataCache
 from authplane.internal.urls import build_metadata_url
 
 _NO_SSRF = FetchSettings(ssrf_protection=False)
@@ -39,9 +41,6 @@ async def test_rfc8414_metadata_issuer_must_match_configured_issuer(
 
 @pytest.mark.conformance("rfc8414-jwks-uri-required-for-jwt-validation")
 async def test_rfc8414_jwks_uri_required_for_jwt_validation() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(document={"issuer": "https://auth.example.com"})
 
@@ -52,9 +51,6 @@ async def test_rfc8414_jwks_uri_required_for_jwt_validation() -> None:
 
 @pytest.mark.conformance("rfc8414-metadata-must-contain-issuer")
 async def test_rfc8414_metadata_must_contain_issuer() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(document={"jwks_uri": "https://auth.example.com/.well-known/jwks.json"})
 
@@ -65,9 +61,6 @@ async def test_rfc8414_metadata_must_contain_issuer() -> None:
 
 @pytest.mark.conformance("rfc8414-jwks-uri-must-be-absolute-https-url")
 async def test_rfc8414_jwks_uri_must_be_absolute_https_url() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -112,9 +105,6 @@ async def test_rfc8414_introspection_endpoint_required_when_introspection_is_use
 
 @pytest.mark.conformance("rfc8414-token-endpoint-required-when-token-operation-is-used")
 async def test_rfc8414_token_endpoint_required_when_token_operation_is_used() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -130,9 +120,6 @@ async def test_rfc8414_token_endpoint_required_when_token_operation_is_used() ->
 
 @pytest.mark.conformance("rfc8414-revocation-endpoint-required-when-revocation-is-used")
 async def test_rfc8414_revocation_endpoint_required_when_revocation_is_used() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -148,9 +135,6 @@ async def test_rfc8414_revocation_endpoint_required_when_revocation_is_used() ->
 
 @pytest.mark.conformance("rfc8414-token-endpoint-must-be-absolute-https-url")
 async def test_rfc8414_token_endpoint_must_be_absolute_https_url() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -167,9 +151,6 @@ async def test_rfc8414_token_endpoint_must_be_absolute_https_url() -> None:
 
 @pytest.mark.conformance("rfc8414-introspection-endpoint-must-be-absolute-https-url")
 async def test_rfc8414_introspection_endpoint_must_be_absolute_https_url() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -186,9 +167,6 @@ async def test_rfc8414_introspection_endpoint_must_be_absolute_https_url() -> No
 
 @pytest.mark.conformance("rfc8414-revocation-endpoint-must-be-absolute-https-url")
 async def test_rfc8414_revocation_endpoint_must_be_absolute_https_url() -> None:
-    from authplane.internal.fetch_result import FetchResult
-    from authplane.internal.metadata import MetadataCache
-
     async def fetcher() -> FetchResult:
         return FetchResult(
             document={
@@ -270,6 +248,11 @@ async def test_rfc8414_jwks_uri_rotation_must_reconfigure_jwks_cache(
                 "jwks_uri": "https://auth.example.com/jwks-v2.json",
             }
 
+            # Drive the rotation directly via the internal hook. A full end-to-
+            # end test would simulate a metadata-refresh tick, but the SDK
+            # exposes no public seam for that yet; using the private hook here
+            # is a deliberate trade-off. Follow-up: lift this to a public
+            # test seam when the metadata-cache lifecycle is refactored.
             await client._on_metadata_changed(old_metadata, new_metadata)  # pyright: ignore[reportPrivateUsage]
             assert client._jwks_uri == "https://auth.example.com/jwks-v2.json"  # pyright: ignore[reportPrivateUsage]
         finally:

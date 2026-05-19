@@ -173,7 +173,7 @@ jobs:
       # below, as part of the single release commit.
       - name: Install packages and run tests
         env:
-          CONFORMANCE_CATALOG_PATH: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+          AUTHPLANE_CONFORMANCE_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
           pip install -e ".[dev]"
           pip install -e "./authplane-mcp[dev]"
