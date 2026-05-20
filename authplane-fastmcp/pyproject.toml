@@ -25,7 +25,7 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "authplane-sdk",
+    "authplane-sdk==0.2.0",
     # Upper bound on 4.x is anticipatory — when fastmcp 4 ships we need to
     # re-verify the `FastMCP` constructor + `fastmcp.server.auth.require_scopes`
     # surface the adapter consumes.
