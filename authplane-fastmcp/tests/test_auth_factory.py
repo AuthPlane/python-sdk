@@ -18,7 +18,9 @@ async def test_authplane_auth_parameter_propagation():
     dpop_provider = MagicMock(spec=DPoPProvider)
 
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -32,6 +34,7 @@ async def test_authplane_auth_parameter_propagation():
             metadata_refresh_seconds=7200,
             cache_ttl_buffer_seconds=15.0,
             default_ttl_seconds=900.0,
+            cache_max_entries=500,
             circuit_breaker_threshold=7,
             circuit_breaker_cooldown_seconds=45.0,
             clock_skew_seconds=60,
@@ -49,6 +52,7 @@ async def test_authplane_auth_parameter_propagation():
         assert client_kwargs["metadata_refresh_seconds"] == 7200
         assert client_kwargs["cache_ttl_buffer_seconds"] == 15.0
         assert client_kwargs["default_ttl_seconds"] == 900.0
+        assert client_kwargs["cache_max_entries"] == 500
         assert client_kwargs["circuit_breaker_threshold"] == 7
         assert client_kwargs["circuit_breaker_cooldown_seconds"] == 45.0
         assert client_kwargs["fetch_settings"] is custom_fetch_settings
@@ -66,7 +70,9 @@ async def test_authplane_auth_parameter_propagation():
 async def test_authplane_auth_none_filtering():
     """Verify that None values are NOT passed to AuthplaneClient.create or client.resource."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -87,6 +93,7 @@ async def test_authplane_auth_none_filtering():
         assert "metadata_refresh_seconds" not in client_kwargs
         assert "cache_ttl_buffer_seconds" not in client_kwargs
         assert "default_ttl_seconds" not in client_kwargs
+        assert "cache_max_entries" not in client_kwargs
         assert "circuit_breaker_threshold" not in client_kwargs
         assert "circuit_breaker_cooldown_seconds" not in client_kwargs
 
@@ -100,7 +107,9 @@ async def test_authplane_auth_none_filtering():
 async def test_authplane_auth_revocation_checker_default_is_none():
     """When revocation_checker is not passed, None is forwarded (no revocation checking)."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -122,7 +131,9 @@ async def test_authplane_auth_revocation_checker_custom_callable():
         return False
 
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -140,7 +151,9 @@ async def test_authplane_auth_revocation_checker_custom_callable():
 async def test_authplane_auth_resource_derivation():
     """Verify resource URL construction from base_url and mcp_path."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -179,7 +192,9 @@ async def test_authplane_auth_as_credentials_passthrough():
 
     creds = ASCredentials(client_id="client_id", client_secret="secret")
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -197,7 +212,9 @@ async def test_authplane_auth_as_credentials_passthrough():
 async def test_authplane_auth_returns_auth_result():
     """authplane_auth() returns an AuthplaneAuthResult with auth, token_verifier, and client."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with (
         patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls,
@@ -282,7 +299,9 @@ async def test_authplane_auth_result_aclose_idempotent():
 async def test_authplane_auth_resource_matches_default_mcp_path():
     """Resource passed to verifier must equal base_url + default mcp_path (/mcp)."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
 
     with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -305,6 +324,7 @@ async def test_verify_token_non_authplane_error_propagates():
     from authplane_fastmcp import AuthplaneTokenVerifier
 
     mock_verifier = AsyncMock()
+    mock_verifier.resource = "https://api.example.com/mcp"
     mock_verifier.verify.side_effect = RuntimeError("unexpected")
 
     tv = AuthplaneTokenVerifier(mock_verifier)

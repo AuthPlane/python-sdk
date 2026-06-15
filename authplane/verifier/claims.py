@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
@@ -55,10 +55,44 @@ class VerifiedClaims:
     def require_scope(self, scope: str) -> None:
         """Raise InsufficientScopeError when the validated token lacks the scope."""
         if not self.has_scope(scope):
+            available = list(self.scopes) if self.scopes else "(none)"
             raise InsufficientScopeError(
-                f"Token missing required scope '{scope}'. Token has scopes: {list(self.scopes)}",
+                f"Token missing required scope '{scope}'. Token has scopes: {available}",
                 required_scopes=(scope,),
             )
+
+    def require_scopes(self, scopes: Iterable[str]) -> None:
+        """Raise InsufficientScopeError unless the token carries every scope in ``scopes``.
+
+        Empty input is a no-op — no required scopes ⇒ always satisfied. A
+        handler that calls ``claims.require_scopes(required)`` doesn't have to
+        special-case empty iterables.
+
+        On failure the raised :class:`InsufficientScopeError` carries the full
+        requested tuple on ``required_scopes`` (not just the missing ones, so
+        adapters that surface ``scope="…"`` in the WWW-Authenticate challenge
+        keep emitting the complete required set), and its message names every
+        missing scope plus the scopes the token carries — rendered verbatim
+        into the RFC 6750 ``error_description``.
+        """
+        # Materialise once: the caller may pass any iterable (generator, set,
+        # frozenset, etc.). We need to iterate twice — once to find missing
+        # entries and once to populate the error's ``required_scopes`` — and
+        # the raised error embeds the requested tuple in its public field,
+        # so the snapshot has to be ordered + indexable.
+        required = tuple(scopes)
+        if not required:
+            return
+        missing = [s for s in required if not self.has_scope(s)]
+        if not missing:
+            return
+        scope_word = "scopes" if len(missing) > 1 else "scope"
+        missing_quoted = ", ".join(repr(s) for s in missing)
+        available = list(self.scopes) if self.scopes else "(none)"
+        raise InsufficientScopeError(
+            f"Token missing required {scope_word} {missing_quoted}. Token has scopes: {available}",
+            required_scopes=required,
+        )
 
     def has_claim(self, key: str, value: Any = _MISSING) -> bool:
         """Check whether a claim exists and optionally matches an expected value."""

@@ -63,8 +63,12 @@ def mock_verifier(valid_claims: VerifiedClaims) -> AsyncMock:
 
     mock = AsyncMock(spec=AuthplaneResource)
     type(mock).scopes = PropertyMock(return_value=["tools/query", "tools/write"])
+    type(mock).resource = PropertyMock(return_value="https://api.example.com/mcp")
 
-    async def verify_side_effect(token: str) -> VerifiedClaims:
+    async def verify_side_effect(
+        token: str, *, dpop_request: object | None = None
+    ) -> VerifiedClaims:
+        _ = dpop_request  # accept but ignore — covered by dedicated DPoP tests
         if token == "valid_token":
             return valid_claims
         raise AuthplaneError("Invalid token")

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `TokenCache` is now bounded by a configurable `max_entries` cap (default `10_000`, exposed as `TokenCache.DEFAULT_MAX_ENTRIES` and a read-only `cache.max_entries` property) and evicts the least-recently-used entry on overflow; both `get` and `set` bump the touched key to MRU. Plumbed through `AuthplaneClient.create(cache_max_entries=...)`. Token-exchange cache keys are high-cardinality (the subject token is part of the key), so the cap keeps long-lived clients bounded.
+- `VerifiedClaims.require_scopes(scopes: Iterable[str])` — plural AND-style helper that requires all listed scopes. Empty input is a no-op; on failure the raised `InsufficientScopeError` carries the full requested tuple on `required_scopes` and names every missing scope plus the token's available scopes in the message.
+- `authplane-mcp`: new public surface — `AuthplaneRequestContextMiddleware`, `get_current_request()`, `install_request_context(mcp)` — an ASGI middleware that publishes the active request on a `ContextVar` so the verifier can build a `DPoPRequestContext`.
+- `authplane-fastmcp`, `authplane-mcp`: `AuthplaneTokenVerifier` caches the in-flight verify task per request (keyed by access token on `request.state`), so a repeat `verify_token` within the same HTTP request awaits the same task rather than re-entering the inbound DPoP replay store. Cross-request replay protection is unaffected (distinct requests get distinct caches).
+
+### Fixed
+- `authplane-fastmcp`, `authplane-mcp`: inbound DPoP proof-of-possession is now enforced end-to-end. `AuthplaneTokenVerifier.verify_token` forwards a `DPoPRequestContext` (method + reconstructed `htu` + proof header) to `AuthplaneResource.verify`, so `inbound_dpop=InboundDPoPOptions(required=True)` checks the proof on every request. The `htu` origin is always the operator-configured resource URI, never the inbound `Host` / `X-Forwarded-Proto` headers. Operators using `required=True` with `authplane-mcp` should call `install_request_context(mcp)` after constructing `FastMCP` so the verifier can read the per-request context; if it is not installed the request fails closed (401) rather than skipping the check.
+- `authplane-fastmcp`, `authplane-mcp`: DPoP `htu` reconstruction reads `scope["raw_path"]` to preserve percent-encoding (e.g. `%2F`) on the wire under ASGI, falling back to `request.url.path` when the server omits `raw_path`.
+- `authplane-mcp`: `install_request_context(mcp)` is idempotent — repeated calls on the same `FastMCP` instance are no-ops.
+- `require_scope` (singular) now renders an empty token scope set as `(none)` instead of `[]`, matching the plural helper's output. Logging pipelines keyed on the old `Token has scopes: []` string should be updated.
+- Docs and demos now run adapter setup, the async server entry point (`run_streamable_http_async` / `run_async`), and `aclose()` in a single `asyncio.run(main())`, keeping the client's locks, HTTP pool, and background JWKS/metadata refresh tasks on one event loop.
+
 ## [0.2.0] - 2026-05-20
 
 ### Security

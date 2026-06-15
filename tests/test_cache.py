@@ -79,3 +79,120 @@ def test_cache_key_with_resource():
 def test_cache_key_resource_only():
     key = TokenCache.cache_key("", "https://api.example.com")
     assert key == "|https://api.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Bounded LRU
+# ---------------------------------------------------------------------------
+
+
+def test_default_max_entries_matches_cross_sdk_reference():
+    """The default cap is 10_000 entries.
+
+    Matches the Java SDK reference (``TokenCacheConfig.DEFAULT_MAX_ENTRIES``)
+    so the same workload hits the same eviction watermark across SDKs.
+    Verified against the Java source at
+    ``core/src/main/java/ai/authplane/sdk/core/TokenCacheConfig.java`` —
+    ``public static final int DEFAULT_MAX_ENTRIES = 10_000;``. If either
+    side moves, this test catches the drift before a workload notices
+    it the hard way.
+    """
+    assert TokenCache.DEFAULT_MAX_ENTRIES == 10_000
+
+
+def test_rejects_non_positive_max_entries():
+    """A non-positive cap is a programmer-supplied bug, not a runtime
+    condition — fail fast at construction so the misconfiguration surfaces
+    immediately rather than when the cache happens to overflow."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=0)
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=-1)
+
+
+def test_rejects_bool_max_entries():
+    """``bool`` is a subclass of ``int`` in Python, so a stray ``True``
+    would otherwise silently produce a cap-1 cache. Reject at construction."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=False)  # type: ignore[arg-type]
+
+
+def test_rejects_float_max_entries():
+    """A fractional cap is a programmer bug — reject at construction even
+    when the value is integer-valued (e.g. ``10_000.0``) for symmetry with
+    the bool rejection."""
+    import pytest
+
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        TokenCache(max_entries=10_000.0)  # type: ignore[arg-type]
+
+
+def test_max_entries_property_exposes_configured_cap():
+    """Operators can read the cap back without re-threading the constructor
+    argument through their own config layer."""
+    assert TokenCache().max_entries == TokenCache.DEFAULT_MAX_ENTRIES
+    assert TokenCache(max_entries=42).max_entries == 42
+
+
+def test_evicts_lru_when_cap_exceeded():
+    """Inserting a third entry into a cap-2 cache must evict the
+    least-recently-used entry."""
+    cache = TokenCache(ttl_buffer_seconds=0, max_entries=2)
+    cache.set("k1", "v1", "Bearer", expires_in=3600)
+    cache.set("k2", "v2", "Bearer", expires_in=3600)
+    assert len(cache) == 2
+    cache.set("k3", "v3", "Bearer", expires_in=3600)
+    assert len(cache) == 2
+    assert cache.get("k1") is None
+    assert cache.get("k2") is not None
+    assert cache.get("k3") is not None
+
+
+def test_get_bumps_entry_to_mru():
+    """A ``get`` hit must promote the entry to MRU so the next overflow
+    eviction targets a colder key — pins the touch-on-read behavior."""
+    cache = TokenCache(ttl_buffer_seconds=0, max_entries=2)
+    cache.set("k1", "v1", "Bearer", expires_in=3600)
+    cache.set("k2", "v2", "Bearer", expires_in=3600)
+    # Touch k1 — k2 is now the LRU victim.
+    assert cache.get("k1") is not None
+    cache.set("k3", "v3", "Bearer", expires_in=3600)
+    assert cache.get("k1") is not None
+    assert cache.get("k2") is None
+    assert cache.get("k3") is not None
+
+
+def test_reset_does_not_grow_size():
+    """Re-setting an existing key must not grow the cache."""
+    cache = TokenCache(ttl_buffer_seconds=0, max_entries=2)
+    cache.set("k1", "v1", "Bearer", expires_in=3600)
+    cache.set("k1", "v1-updated", "Bearer", expires_in=3600)
+    assert len(cache) == 1
+    entry = cache.get("k1")
+    assert entry is not None
+    assert entry.access_token == "v1-updated"
+
+
+def test_reset_bumps_entry_to_mru():
+    """Touch-on-write: re-setting an existing key bumps it to MRU.
+
+    Without this, the entry stays LRU and gets evicted when a new entry
+    lands — which would surprise callers who treat ``set`` as a
+    "I care about this entry" signal.
+    """
+    cache = TokenCache(ttl_buffer_seconds=0, max_entries=2)
+    cache.set("k1", "v1", "Bearer", expires_in=3600)
+    cache.set("k2", "v2", "Bearer", expires_in=3600)
+    cache.set("k1", "v1-updated", "Bearer", expires_in=3600)  # bump k1 to MRU
+    cache.set("k3", "v3", "Bearer", expires_in=3600)
+    assert cache.get("k1") is not None
+    assert cache.get("k2") is None
+    assert cache.get("k3") is not None

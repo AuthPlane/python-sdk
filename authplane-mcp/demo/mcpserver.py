@@ -16,15 +16,13 @@ from dotenv import load_dotenv
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
-from authplane_mcp import authplane_mcp_auth, require_scope
+from authplane_mcp import authplane_mcp_auth, install_request_context, require_scope
 
-if __name__ == "__main__":
-    import logging
+GOOGLE_CALENDAR_RESOURCE_URI = "https://www.googleapis.com/calendar/v3"
+GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
 
-    logging.basicConfig(
-        level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s %(message)s"
-    )
 
+async def main() -> None:
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
     resource = os.environ.get("RESOURCE_URL", "http://localhost:8080/mcp")
@@ -38,32 +36,37 @@ if __name__ == "__main__":
     dpop_pem = dpop_key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
     dpop_provider = DPoPProvider(DPoPKeyMaterial.from_pem(dpop_pem))
 
-    auth_result = asyncio.run(
-        authplane_mcp_auth(
-            issuer=os.environ.get("ISSUER_URL", "http://localhost:9000"),
-            resource=resource,
-            scopes=["tools/add", "tools/multiply", "tools/consent_demo"],
-            # Advertise scopes in the PRM so OAuth-discovery clients (Claude
-            # Code, Inspector, etc.) request them on token mint.  Side effect:
-            # every request must carry all three scopes.  See the docstring
-            # on ``enforce_scopes_on_all_requests`` for why this exists, and
-            # the demo README for what users see in the consent prompt.  The
-            # per-tool ``require_scope()`` calls below intentionally stay —
-            # they are the granular pattern, become no-ops under request-level
-            # enforcement, and remain correct once the upstream SDK gains a
-            # separate "supported" field and this flag goes away.
-            enforce_scopes_on_all_requests=True,
-            dev_mode=True,  # Enables local testing
-            dpop=dpop_provider,
-            as_credentials=ASCredentials(
-                client_id=client_id,
-                client_secret=os.environ["CLIENT_SECRET"],
-            ),
-            revocation_checker=IntrospectionRevocation(),
-        )
+    auth_result = await authplane_mcp_auth(
+        issuer=os.environ.get("ISSUER_URL", "http://localhost:9000"),
+        resource=resource,
+        scopes=["tools/add", "tools/multiply", "tools/consent_demo"],
+        # Advertise scopes in the PRM so OAuth-discovery clients (Claude
+        # Code, Inspector, etc.) request them on token mint.  Side effect:
+        # every request must carry all three scopes.  See the docstring
+        # on ``enforce_scopes_on_all_requests`` for why this exists, and
+        # the demo README for what users see in the consent prompt.  The
+        # per-tool ``require_scope()`` calls below intentionally stay —
+        # they are the granular pattern, become no-ops under request-level
+        # enforcement, and remain correct once the upstream SDK gains a
+        # separate "supported" field and this flag goes away.
+        enforce_scopes_on_all_requests=True,
+        dev_mode=True,  # Enables local testing
+        dpop=dpop_provider,
+        as_credentials=ASCredentials(
+            client_id=client_id,
+            client_secret=os.environ["CLIENT_SECRET"],
+        ),
+        revocation_checker=IntrospectionRevocation(),
     )
 
     mcp = FastMCP("Calculator Service", port=port, json_response=True, **auth_result)
+
+    # Required for inbound DPoP enforcement: publishes the active HTTP request
+    # on a ContextVar so the verifier can build a DPoPRequestContext and
+    # forward it to AuthplaneResource.verify. Without this call DPoP-bound
+    # requests fail closed (DPoPBindingMismatchError) — the misconfiguration
+    # surfaces as a 401, not as a silent bypass.
+    install_request_context(mcp)
 
     @mcp.tool()
     async def add(a: float, b: float) -> float:
@@ -76,9 +79,6 @@ if __name__ == "__main__":
         """Multiply two numbers"""
         require_scope("tools/multiply")
         return a * b
-
-    GOOGLE_CALENDAR_RESOURCE_URI = "https://www.googleapis.com/calendar/v3"
-    GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
 
     @mcp.tool()
     async def consent_demo() -> dict[str, str]:
@@ -113,5 +113,21 @@ if __name__ == "__main__":
             "scope": downstream.scope or "",
         }
 
-    # mcp.run() starts its own event loop, so don't wrap it in asyncio.run()
-    mcp.run(transport="streamable-http")
+    # The adapter setup, server, and aclose() must share one event loop —
+    # auth_result holds async resources (locks, httpx pool, background JWKS
+    # refresh tasks) bound to the running loop. Using the async server entry
+    # point keeps everything on the same loop.
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await auth_result.aclose()
+
+
+if __name__ == "__main__":
+    import logging
+
+    logging.basicConfig(
+        level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+
+    asyncio.run(main())
