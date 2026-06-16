@@ -92,12 +92,46 @@ class AuthplaneClient:
         metadata_refresh_seconds: int = 3600,
         cache_ttl_buffer_seconds: float = 30.0,
         default_ttl_seconds: float = 3600.0,
+        cache_max_entries: int = TokenCache.DEFAULT_MAX_ENTRIES,
         circuit_breaker_threshold: int = 5,
         circuit_breaker_cooldown_seconds: float = 30.0,
     ) -> Self:
         """Create and initialize the client.
 
         Discovers AS metadata and starts JWKS background refresh.
+
+        Args:
+            issuer: Authorization-server issuer URL (the prefix RFC 8414 metadata
+                is fetched from). Trailing slash is stripped.
+            auth: Client authentication for OAuth endpoints. Accepts either a raw
+                :class:`AuthProvider` or an :class:`ASCredentials` shorthand (which
+                is materialised as :class:`ClientCredentialsProvider`).
+            dpop: Optional :class:`DPoPProvider` for sender-constrained outbound
+                requests against the AS (token / introspection / revocation).
+            dev_mode: When True, relaxes SSRF and HTTPS-only fetch policies for
+                local development. Falls back to the ``AUTHPLANE_DEV_MODE``
+                environment variable when omitted.
+            fetch_settings: Explicit :class:`FetchSettings` override. When None,
+                derived from ``dev_mode``.
+            jwks_refresh_seconds: Background JWKS refresh interval (must be > 0).
+            metadata_refresh_seconds: Background metadata refresh interval
+                (must be > 0).
+            cache_ttl_buffer_seconds: Safety margin subtracted from each token's
+                lifetime before the entry is considered expired. Same shape as
+                java-sdk ``TokenCacheConfig.ttlBufferSeconds`` and ts-sdk
+                ``TokenCache`` ctor. Default 30s.
+            default_ttl_seconds: Fallback lifetime applied when the AS response
+                omits ``expires_in``. Cross-SDK parity with java-sdk
+                ``TokenCacheConfig.defaultTtlSeconds``. Default 3600s.
+            cache_max_entries: Maximum number of cached tokens before
+                least-recently-used eviction kicks in. Default
+                :attr:`TokenCache.DEFAULT_MAX_ENTRIES` (10_000). Must be a
+                positive integer (``bool``/``float`` rejected — see
+                :class:`TokenCache`).
+            circuit_breaker_threshold: Consecutive AS failures before the
+                circuit opens. Default 5.
+            circuit_breaker_cooldown_seconds: Half-open probe interval after the
+                circuit trips. Default 30s.
         """
         client = cls()
         client._issuer = issuer.rstrip("/")
@@ -135,7 +169,11 @@ class AuthplaneClient:
             )
 
         # Resilience
-        client._token_cache = TokenCache(cache_ttl_buffer_seconds, default_ttl_seconds)
+        client._token_cache = TokenCache(
+            cache_ttl_buffer_seconds,
+            default_ttl_seconds,
+            cache_max_entries,
+        )
         client._circuit_breaker = CircuitBreaker(
             circuit_breaker_threshold,
             circuit_breaker_cooldown_seconds,

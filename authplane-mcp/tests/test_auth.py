@@ -68,7 +68,7 @@ def test_require_scope_raises_when_scopes_empty():
 async def test_authplane_mcp_auth_returns_auth_result():
     """Verify return type and AuthSettings fields."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -104,7 +104,7 @@ async def test_authplane_mcp_auth_parameter_propagation():
     dpop_provider = MagicMock(spec=DPoPProvider)
 
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -118,6 +118,7 @@ async def test_authplane_mcp_auth_parameter_propagation():
             metadata_refresh_seconds=7200,
             cache_ttl_buffer_seconds=15.0,
             default_ttl_seconds=900.0,
+            cache_max_entries=500,
             circuit_breaker_threshold=7,
             circuit_breaker_cooldown_seconds=45.0,
             clock_skew_seconds=60,
@@ -135,6 +136,7 @@ async def test_authplane_mcp_auth_parameter_propagation():
         assert client_kwargs["metadata_refresh_seconds"] == 7200
         assert client_kwargs["cache_ttl_buffer_seconds"] == 15.0
         assert client_kwargs["default_ttl_seconds"] == 900.0
+        assert client_kwargs["cache_max_entries"] == 500
         assert client_kwargs["circuit_breaker_threshold"] == 7
         assert client_kwargs["circuit_breaker_cooldown_seconds"] == 45.0
         assert client_kwargs["fetch_settings"] is custom_fetch_settings
@@ -152,7 +154,7 @@ async def test_authplane_mcp_auth_parameter_propagation():
 async def test_authplane_mcp_auth_none_filtering():
     """Verify that None values are NOT passed to AuthplaneClient.create or client.resource."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -173,6 +175,7 @@ async def test_authplane_mcp_auth_none_filtering():
         assert "metadata_refresh_seconds" not in client_kwargs
         assert "cache_ttl_buffer_seconds" not in client_kwargs
         assert "default_ttl_seconds" not in client_kwargs
+        assert "cache_max_entries" not in client_kwargs
         assert "circuit_breaker_threshold" not in client_kwargs
         assert "circuit_breaker_cooldown_seconds" not in client_kwargs
 
@@ -186,7 +189,7 @@ async def test_authplane_mcp_auth_none_filtering():
 async def test_authplane_mcp_auth_revocation_checker_default_is_none():
     """When revocation_checker is not passed, None is forwarded (no revocation checking)."""
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -208,7 +211,7 @@ async def test_authplane_mcp_auth_revocation_checker_custom_callable():
         return False
 
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -229,7 +232,7 @@ async def test_authplane_mcp_auth_as_credentials_passthrough():
 
     creds = ASCredentials(client_id="client_id", client_secret="secret")
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -298,7 +301,7 @@ async def test_authplane_mcp_auth_scopes_not_enforced_globally():
     per-tool enforcement via require_scope().
     """
     mock_client = MagicMock()
-    mock_client.resource = MagicMock(return_value=MagicMock())
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
 
     with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
         mock_client_cls.create = AsyncMock(return_value=mock_client)
@@ -324,7 +327,12 @@ async def test_authplane_mcp_auth_scopes_not_enforced_globally():
 @pytest.mark.asyncio
 async def test_verify_token_non_authplane_error_propagates():
     """Unexpected exceptions from AuthplaneResource.verify() propagate (HTTP 500)."""
-    mock_verifier = AsyncMock()
+    from unittest.mock import PropertyMock
+
+    from authplane import AuthplaneResource
+
+    mock_verifier = AsyncMock(spec=AuthplaneResource)
+    type(mock_verifier).resource = PropertyMock(return_value="https://api.example.com")
     mock_verifier.verify.side_effect = RuntimeError("unexpected")
 
     tv = AuthplaneTokenVerifier(mock_verifier)

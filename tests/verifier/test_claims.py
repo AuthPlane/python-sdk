@@ -1,5 +1,6 @@
 """Tests for VerifiedClaims dataclass."""
 
+from collections.abc import Iterator
 from types import MappingProxyType
 
 import pytest
@@ -63,6 +64,120 @@ def test_require_scope_failure(sample_claims: VerifiedClaims) -> None:
 
     assert "admin" in str(exc_info.value)
     assert "read:data" in str(exc_info.value)  # Shows granted scopes
+
+
+def test_require_scopes_empty_is_noop(sample_claims: VerifiedClaims) -> None:
+    """Empty input must not raise — callers need not special-case empty iterables."""
+    sample_claims.require_scopes([])
+    sample_claims.require_scopes(())
+    # Generator input also counts as empty.
+    empty_gen: list[str] = []
+    sample_claims.require_scopes(s for s in empty_gen)
+
+
+def test_require_scopes_all_present(sample_claims: VerifiedClaims) -> None:
+    """All-present input must not raise."""
+    sample_claims.require_scopes(["read:data", "write:data"])
+
+
+def test_require_scopes_consumes_non_empty_generator(
+    sample_claims: VerifiedClaims,
+) -> None:
+    """A non-empty single-use generator must be materialised once and used in
+    both the cardinality check and the failure-path ``required_scopes`` field.
+
+    Pins the ``tuple(scopes)`` snapshot in the implementation — without it,
+    iterating the generator twice (once to find missing, once to populate the
+    error) would silently exhaust the second pass.
+    """
+
+    def gen() -> Iterator[str]:
+        yield "read:data"
+        yield "admin"
+
+    with pytest.raises(InsufficientScopeError) as exc_info:
+        sample_claims.require_scopes(gen())
+
+    # The generator's `admin` value must surface in both the message and the
+    # structured ``required_scopes`` tuple — proves materialisation happened
+    # before the second iteration.
+    assert "'admin'" in str(exc_info.value)
+    assert exc_info.value.required_scopes == ("read:data", "admin")
+
+
+def test_require_scopes_single_missing(sample_claims: VerifiedClaims) -> None:
+    """A single missing scope renders as ``required scope '<name>'``."""
+    with pytest.raises(InsufficientScopeError) as exc_info:
+        sample_claims.require_scopes(["read:data", "admin"])
+
+    msg = str(exc_info.value)
+    assert "'admin'" in msg
+    # Singular "scope" form for one missing entry.
+    assert "required scope " in msg
+    assert "required scopes " not in msg
+    # Surfaces the token's available scopes for the operator.
+    assert "read:data" in msg
+    # ``required_scopes`` carries the FULL requested tuple, not just missing.
+    assert exc_info.value.required_scopes == ("read:data", "admin")
+
+
+def test_require_scopes_multiple_missing(sample_claims: VerifiedClaims) -> None:
+    """Multiple missing scopes render as ``required scopes 'a', 'b'`` (plural)."""
+    with pytest.raises(InsufficientScopeError) as exc_info:
+        sample_claims.require_scopes(["delete:data", "admin"])
+
+    msg = str(exc_info.value)
+    assert "'delete:data'" in msg
+    assert "'admin'" in msg
+    # Plural form.
+    assert "required scopes " in msg
+    assert exc_info.value.required_scopes == ("delete:data", "admin")
+
+
+def test_require_scopes_no_scopes_token() -> None:
+    """A token without scopes renders ``Token has scopes: (none)`` so an operator can tell
+    the difference between 'wrong scope' and 'no scopes at all'."""
+    no_scope_claims = VerifiedClaims(
+        sub="user123",
+        client_id="client456",
+        scopes=(),
+        issuer="https://auth.example.com",
+        audience=("https://api.example.com",),
+        expires_at=1234567890,
+        issued_at=1234567800,
+        jti="token-id-123",
+        kid="test-key-1",
+        raw=freeze_value({"sub": "user123"}),
+    )
+    with pytest.raises(InsufficientScopeError) as exc_info:
+        no_scope_claims.require_scopes(["read:data"])
+
+    assert "(none)" in str(exc_info.value)
+
+
+def test_require_scope_no_scopes_token_matches_plural_rendering() -> None:
+    """``require_scope`` (singular) renders an empty scope set the same way the
+    plural helper does — ``(none)`` rather than ``[]`` — so the two errors are
+    indistinguishable to an operator reading the WWW-Authenticate text."""
+    no_scope_claims = VerifiedClaims(
+        sub="user123",
+        client_id="client456",
+        scopes=(),
+        issuer="https://auth.example.com",
+        audience=("https://api.example.com",),
+        expires_at=1234567890,
+        issued_at=1234567800,
+        jti="token-id-123",
+        kid="test-key-1",
+        raw=freeze_value({"sub": "user123"}),
+    )
+    with pytest.raises(InsufficientScopeError) as exc_info:
+        no_scope_claims.require_scope("read:data")
+
+    msg = str(exc_info.value)
+    assert "(none)" in msg
+    # Negative pin: must not regress to the old `[]` rendering.
+    assert "Token has scopes: []" not in msg
 
 
 def test_has_claim_key_only(sample_claims: VerifiedClaims) -> None:

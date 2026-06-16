@@ -11,6 +11,7 @@ except _PackageNotFoundError:  # pragma: no cover - source tree without an insta
 # Client
 # Authentication
 from .auth_provider import AuthProvider, ClientCredentialsProvider
+from .cache import TokenCache
 from .client import AuthplaneClient
 from .credentials import ASCredentials
 from .dpop import (
@@ -109,6 +110,7 @@ __all__ = [
     "ProtocolError",
     "RevocationChecker",
     "ServerError",
+    "TokenCache",
     "TokenExpiredError",
     "TokenMissingError",
     "TokenRevokedError",

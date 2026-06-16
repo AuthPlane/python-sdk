@@ -59,7 +59,8 @@ async def test_verify_token_expired_returns_none(
     """verify_token() with expired token returns None."""
     from authplane.errors import TokenExpiredError
 
-    async def verify_expired(token: str) -> VerifiedClaims:
+    async def verify_expired(token: str, *, dpop_request: object | None = None) -> VerifiedClaims:
+        _ = dpop_request
         raise TokenExpiredError("Token has expired")
 
     mock_verifier.verify.side_effect = verify_expired

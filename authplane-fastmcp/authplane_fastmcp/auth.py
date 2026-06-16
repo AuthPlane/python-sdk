@@ -112,6 +112,7 @@ async def authplane_auth(
     metadata_refresh_seconds: int | None = None,
     cache_ttl_buffer_seconds: float | None = None,
     default_ttl_seconds: float | None = None,
+    cache_max_entries: int | None = None,
     circuit_breaker_threshold: int | None = None,
     circuit_breaker_cooldown_seconds: float | None = None,
     clock_skew_seconds: int | None = None,
@@ -158,6 +159,11 @@ async def authplane_auth(
             before cache expiry (default ``30.0``).
         default_ttl_seconds: Fallback token cache TTL used when token
             responses do not include expiry metadata (default ``3600.0``).
+        cache_max_entries: Maximum number of tokens kept in the LRU cache
+            before the least-recently-used entry is evicted (default
+            :attr:`TokenCache.DEFAULT_MAX_ENTRIES` = 10 000). Token-exchange
+            keys are high-cardinality; raise this cap for long-lived servers
+            with many distinct subjects.
         circuit_breaker_threshold: Number of transient failures before
             opening the AS circuit breaker (default ``5``).
         circuit_breaker_cooldown_seconds: Cooldown before allowing a
@@ -228,6 +234,7 @@ async def authplane_auth(
         "metadata_refresh_seconds": metadata_refresh_seconds,
         "cache_ttl_buffer_seconds": cache_ttl_buffer_seconds,
         "default_ttl_seconds": default_ttl_seconds,
+        "cache_max_entries": cache_max_entries,
         "circuit_breaker_threshold": circuit_breaker_threshold,
         "circuit_breaker_cooldown_seconds": circuit_breaker_cooldown_seconds,
     }

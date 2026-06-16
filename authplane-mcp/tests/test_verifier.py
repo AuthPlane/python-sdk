@@ -1,12 +1,25 @@
 import logging
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, PropertyMock
 
 import pytest
-from authplane import AuthplaneError, TokenExpiredError, VerifiedClaims
+from authplane import AuthplaneError, AuthplaneResource, TokenExpiredError, VerifiedClaims
 from mcp.server.auth.provider import AccessToken
 
 from authplane_mcp.verifier import AuthplaneTokenVerifier
+
+
+def _make_resource_mock(resource: str = "https://api.example.com") -> AsyncMock:
+    """Build an ``AuthplaneResource`` mock with the resource URI pinned.
+
+    The verifier's ``__init__`` now reads ``verifier.resource`` (a string
+    URI) to reconstruct the DPoP ``htu`` origin, so bare ``AsyncMock()``
+    is no longer enough — the ``resource`` property must be a real
+    string.
+    """
+    mock = AsyncMock(spec=AuthplaneResource)
+    type(mock).resource = PropertyMock(return_value=resource)
+    return mock
 
 
 @pytest.fixture
@@ -27,7 +40,7 @@ def valid_claims() -> VerifiedClaims:
 
 @pytest.mark.asyncio
 async def test_verify_token_success(valid_claims: VerifiedClaims) -> None:
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     mock_verifier.verify.return_value = valid_claims
 
     adapter = AuthplaneTokenVerifier(mock_verifier)
@@ -40,24 +53,26 @@ async def test_verify_token_success(valid_claims: VerifiedClaims) -> None:
     assert result.expires_at == 1700000000
     assert result.resource == "https://api.example.com"
 
-    mock_verifier.verify.assert_awaited_once_with("valid_jwt")
+    # ``verify`` now receives ``dpop_request=None`` outside of a request context
+    # (no active ASGI middleware running), but is still called exactly once.
+    mock_verifier.verify.assert_awaited_once_with("valid_jwt", dpop_request=None)
 
 
 @pytest.mark.asyncio
 async def test_verify_token_failure() -> None:
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     mock_verifier.verify.side_effect = AuthplaneError("Invalid token")
 
     adapter = AuthplaneTokenVerifier(mock_verifier)
     result = await adapter.verify_token("invalid_jwt")
 
     assert result is None
-    mock_verifier.verify.assert_awaited_once_with("invalid_jwt")
+    mock_verifier.verify.assert_awaited_once_with("invalid_jwt", dpop_request=None)
 
 
 @pytest.mark.asyncio
 async def test_verify_token_with_list_audience(valid_claims: VerifiedClaims) -> None:
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     # Simulate audience being a list from a mocked verifier.
     claims_with_list_aud: VerifiedClaims = replace(
         valid_claims, audience=["https://api.example.com"]
@@ -74,7 +89,7 @@ async def test_verify_token_with_list_audience(valid_claims: VerifiedClaims) -> 
 
 def test_verifier_property() -> None:
     """verifier property exposes the underlying AuthplaneResource."""
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     adapter = AuthplaneTokenVerifier(mock_verifier)
     assert adapter.verifier is mock_verifier
 
@@ -87,7 +102,7 @@ async def test_verify_token_failure_logs_typed_error_at_debug(
     # contract requires it), but operators must see *which* typed error caused
     # the 401 in their logs. Debug-level because invalid tokens are expected
     # steady-state and shouldn't page on-call.
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     mock_verifier.verify.side_effect = TokenExpiredError("expired at 2026")
 
     adapter = AuthplaneTokenVerifier(mock_verifier)
@@ -111,7 +126,7 @@ async def test_verify_token_failure_silent_above_debug(
 ) -> None:
     # At default (INFO) level the structured event must not surface — invalid
     # tokens are too common in steady state to log at info.
-    mock_verifier = AsyncMock()
+    mock_verifier = _make_resource_mock()
     mock_verifier.verify.side_effect = AuthplaneError("bad token")
 
     adapter = AuthplaneTokenVerifier(mock_verifier)

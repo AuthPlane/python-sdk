@@ -16,11 +16,8 @@ from fastmcp.server.auth import require_scopes
 
 from authplane_fastmcp import authplane_auth
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s %(message)s"
-    )
 
+async def main() -> None:
     load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
     resource = os.environ.get("RESOURCE_URL", "http://localhost:8080/mcp")
@@ -32,18 +29,16 @@ if __name__ == "__main__":
     client_id = os.environ.get("CLIENT_ID", resource)
     client_secret = os.environ["CLIENT_SECRET"]
 
-    auth_result = asyncio.run(
-        authplane_auth(
-            issuer=issuer,
-            base_url=base_url,
-            scopes=["tools/add", "tools/multiply"],
-            dev_mode=True,  # Enables local testing
-            as_credentials=ASCredentials(
-                client_id=client_id,
-                client_secret=client_secret,
-            ),
-            revocation_checker=IntrospectionRevocation(),
-        )
+    auth_result = await authplane_auth(
+        issuer=issuer,
+        base_url=base_url,
+        scopes=["tools/add", "tools/multiply"],
+        dev_mode=True,  # Enables local testing
+        as_credentials=ASCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+        ),
+        revocation_checker=IntrospectionRevocation(),
     )
 
     mcp = FastMCP("Calculator Service", **auth_result)
@@ -67,4 +62,19 @@ if __name__ == "__main__":
     # equivalent demo in ``authplane-mcp/demo/mcpserver.py``, which uses the
     # low-level MCP server and surfaces the elicitation correctly.
 
-    mcp.run(transport="http", port=port, log_level="DEBUG")
+    # The adapter setup, server, and aclose() must share one event loop —
+    # auth_result holds async resources (locks, httpx pool, background JWKS
+    # refresh tasks) bound to the running loop. ``run_async`` is FastMCP's
+    # async entry point and keeps everything on the same loop.
+    try:
+        await mcp.run_async(transport="http", port=port, log_level="DEBUG")
+    finally:
+        await auth_result.aclose()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.DEBUG, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
+
+    asyncio.run(main())

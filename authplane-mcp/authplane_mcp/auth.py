@@ -20,10 +20,15 @@ from authplane import (
 from authplane.oauth import TokenExchangeOptions, TokenResponse
 from mcp.server.auth.middleware.auth_context import get_access_token as _get_access_token
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl
+from starlette.applications import Starlette
 
+from ._request_context import AuthplaneRequestContextMiddleware
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
+
+_INSTALLED_FLAG = "_authplane_request_context_installed"
 
 
 def _wrap_client_for_elicitation(client: AuthplaneClient) -> AuthplaneClient:
@@ -69,6 +74,78 @@ def require_scope(scope: str) -> None:
     token = _get_access_token()
     if token is None or scope not in token.scopes:
         raise PermissionError(f"Missing required scope: {scope}")
+
+
+def install_request_context(mcp: FastMCP) -> None:
+    """Install :class:`AuthplaneRequestContextMiddleware` on a ``FastMCP`` server.
+
+    Wraps ``mcp.streamable_http_app`` so the Starlette app it returns
+    runs :class:`AuthplaneRequestContextMiddleware` before MCP's
+    ``AuthenticationMiddleware``. That middleware publishes the active
+    :class:`starlette.requests.Request` on a ContextVar, which
+    :meth:`AuthplaneTokenVerifier.verify_token` reads to forward a
+    :class:`~authplane.DPoPRequestContext` to
+    :meth:`AuthplaneResource.verify`.
+
+    The MCP SDK's ``FastMCP`` wires its middleware list internally with
+    no public hook for user middleware, so this is the least-invasive way
+    to slot ours in without subclassing or monkeypatching the SDK.
+
+    Without this call, the verifier still works for non-DPoP flows, but
+    DPoP-bound requests fail closed: :func:`get_current_request` raises,
+    the verifier passes ``dpop_request=None``, and the core rejects bound
+    tokens with ``DPoPBindingMismatchError`` (and rejects bearer-only
+    tokens under ``inbound_dpop=InboundDPoPOptions(required=True)``).
+    The misconfiguration surfaces as a 401 on the first request rather
+    than as a silent bypass, so an operator who skips this call will
+    notice immediately.
+
+    Args:
+        mcp: A ``FastMCP`` instance (typically
+            ``FastMCP("...", **authplane_mcp_auth_result)``). Safe to
+            call before tools are registered.
+
+    Example::
+
+        async def main() -> None:
+            result = await authplane_mcp_auth(issuer=..., resource=..., ...)
+            mcp = FastMCP("My Server", **result)
+            install_request_context(mcp)  # required for inbound DPoP
+            async with result:
+                await mcp.run_streamable_http_async()
+
+        asyncio.run(main())
+
+    Idempotent: a second call on the same ``FastMCP`` instance is a no-op.
+    Without this guard, repeated installs would chain wrappers and the
+    inner middleware's ``ContextVar.reset`` would fire against a token
+    created by the outer wrapper, raising
+    ``RuntimeError: <Token> was created in a different Context`` at
+    request time.
+    """
+    if getattr(mcp, _INSTALLED_FLAG, False):
+        return
+
+    original_streamable_http_app = mcp.streamable_http_app
+
+    def streamable_http_app() -> Starlette:
+        app = original_streamable_http_app()
+        # ``Starlette.add_middleware`` rejects calls after the app has built
+        # its middleware stack (first request). ``streamable_http_app`` is
+        # invoked once at startup before serving begins, so wrapping is safe
+        # here and runs before MCP's AuthenticationMiddleware on every call.
+        app.add_middleware(AuthplaneRequestContextMiddleware)
+        return app
+
+    # Fragility: instance-attribute assignment works only because FastMCP
+    # exposes ``streamable_http_app`` as a plain method, not a ``@property``
+    # or ``@cached_property``. If a future MCP SDK release changes that, the
+    # assignment will silently no-op (or raise AttributeError) and DPoP
+    # enforcement will fall back to ``dpop_request=None`` on every request.
+    # Track https://github.com/modelcontextprotocol/python-sdk for a public
+    # subclassing hook or per-app middleware API and migrate to it when available.
+    mcp.streamable_http_app = streamable_http_app
+    setattr(mcp, _INSTALLED_FLAG, True)
 
 
 class AuthplaneAuthResult:
@@ -137,6 +214,7 @@ async def authplane_mcp_auth(
     metadata_refresh_seconds: int | None = None,
     cache_ttl_buffer_seconds: float | None = None,
     default_ttl_seconds: float | None = None,
+    cache_max_entries: int | None = None,
     circuit_breaker_threshold: int | None = None,
     circuit_breaker_cooldown_seconds: float | None = None,
     clock_skew_seconds: int | None = None,
@@ -207,6 +285,11 @@ async def authplane_mcp_auth(
             before cache expiry (default ``30.0``).
         default_ttl_seconds: Fallback token cache TTL used when token
             responses do not include expiry metadata (default ``3600.0``).
+        cache_max_entries: Maximum number of tokens kept in the LRU cache
+            before the least-recently-used entry is evicted (default
+            :attr:`TokenCache.DEFAULT_MAX_ENTRIES` = 10 000). Token-exchange
+            keys are high-cardinality; raise this cap for long-lived servers
+            with many distinct subjects.
         circuit_breaker_threshold: Number of transient failures before
             opening the AS circuit breaker (default ``5``).
         circuit_breaker_cooldown_seconds: Cooldown before allowing a
@@ -267,6 +350,7 @@ async def authplane_mcp_auth(
         "metadata_refresh_seconds": metadata_refresh_seconds,
         "cache_ttl_buffer_seconds": cache_ttl_buffer_seconds,
         "default_ttl_seconds": default_ttl_seconds,
+        "cache_max_entries": cache_max_entries,
         "circuit_breaker_threshold": circuit_breaker_threshold,
         "circuit_breaker_cooldown_seconds": circuit_breaker_cooldown_seconds,
     }

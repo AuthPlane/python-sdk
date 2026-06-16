@@ -17,15 +17,19 @@ try:
 except _PackageNotFoundError:  # pragma: no cover - source tree without an install
     __version__ = "0.0.0+unknown"
 
-from .auth import AuthplaneAuthResult, authplane_mcp_auth, require_scope
+from ._request_context import AuthplaneRequestContextMiddleware, get_current_request
+from .auth import AuthplaneAuthResult, authplane_mcp_auth, install_request_context, require_scope
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
 
 __all__ = [
     "AuthplaneAuthResult",
+    "AuthplaneRequestContextMiddleware",
     "AuthplaneTokenVerifier",
     "__version__",
     "authplane_mcp_auth",
+    "get_current_request",
+    "install_request_context",
     "require_scope",
     "to_url_elicitation_required_error",
 ]

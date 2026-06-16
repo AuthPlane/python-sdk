@@ -374,15 +374,7 @@ When `fetch_settings` is provided, `dev_mode` is ignored for both metadata and J
 
 ## Resource Cleanup
 
-`authplane_mcp_auth()` returns an `AuthplaneAuthResult` that holds background JWKS / metadata refresh tasks and an HTTP connection pool. For a long-running server that exits with the process, the README quickstart shape is sufficient — the OS reaps everything on exit:
-
-```python
-auth_result = asyncio.run(authplane_mcp_auth(...))
-mcp = FastMCP("My Server", **auth_result)
-mcp.run(transport="streamable-http")  # starts its own event loop and blocks
-```
-
-`mcp.run()` starts its own event loop internally, so it cannot share a loop with `await auth_result.aclose()`. If you need explicit teardown (tests, or an embedded server that should release resources without exiting the process), drive the MCP SDK's async server entry point so the auth setup, server, and `aclose()` share one loop:
+`authplane_mcp_auth()` returns an `AuthplaneAuthResult` that holds an HTTP connection pool and, once requests start flowing, background JWKS / metadata refresh tasks. All of these are bound to the event loop that ran `authplane_mcp_auth()` — `asyncio.Lock`, the `httpx.AsyncClient`, and any tasks spawned by the caches. The adapter setup, the MCP server, and `aclose()` must share one loop. That means driving the MCP SDK's async server entry point from inside `asyncio.run(main())`:
 
 ```python
 import asyncio
@@ -398,7 +390,9 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`auth_result.aclose()` closes the underlying `AuthplaneClient`, cancels its background tasks, and releases connections. In test code, skipping it surfaces as leaked tasks, open sockets, and `ResourceWarning`. Each transport has an async equivalent: `run_streamable_http_async`, `run_sse_async`, `run_stdio_async`.
+Each transport has an async equivalent: `run_streamable_http_async`, `run_sse_async`, `run_stdio_async`. Do not wrap only the setup in `asyncio.run(authplane_mcp_auth(...))` and then call the sync `mcp.run()` — `mcp.run()` starts a fresh event loop, the auth resources stay bound to the loop that was closed when the setup `asyncio.run()` returned, and the first request fails with cross-loop errors.
+
+`auth_result.aclose()` closes the underlying `AuthplaneClient`, cancels its background tasks, and releases connections. Skipping it on a long-running server that exits with the process is harmless (the OS reaps everything on exit); skipping it in tests or embedded servers surfaces as leaked tasks, open sockets, and `ResourceWarning`.
 
 ## Error Handling
 

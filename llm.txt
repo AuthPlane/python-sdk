@@ -53,25 +53,34 @@ import asyncio
 from authplane_mcp import authplane_mcp_auth, require_scope
 from mcp.server.fastmcp import FastMCP
 
-auth_result = asyncio.run(authplane_mcp_auth(
-    issuer="https://auth.company.com",
-    resource="https://mcp.company.com",
-    scopes=["tools/query"],
-))
-mcp = FastMCP("My Server", json_response=True, **auth_result)
+async def main() -> None:
+    auth_result = await authplane_mcp_auth(
+        issuer="https://auth.company.com",
+        resource="https://mcp.company.com",
+        scopes=["tools/query"],
+    )
+    mcp = FastMCP("My Server", json_response=True, **auth_result)
 
-@mcp.tool()
-async def query(sql: str) -> str:
-    require_scope("tools/query")
-    ...
+    @mcp.tool()
+    async def query(sql: str) -> str:
+        require_scope("tools/query")
+        ...
 
-mcp.run(transport="streamable-http")
-# remember to ``await auth_result.aclose()`` on shutdown
+    try:
+        await mcp.run_streamable_http_async()
+    finally:
+        await auth_result.aclose()
+
+asyncio.run(main())
 ```
 
-The MCP SDK's `mcp.run()` is sync (it owns the loop), so the adapter setup
-runs via `asyncio.run(...)` first. FastMCP exposes `run_async()` so the
-adapter setup and server can share one loop.
+`authplane_mcp_auth()` creates async resources (locks, HTTP client, background
+JWKS/metadata caches) bound to the running loop. The adapter setup, server,
+and `aclose()` must share one loop — call `mcp.run_streamable_http_async()`
+(or `run_sse_async` / `run_stdio_async`) from inside `asyncio.run(main())`.
+Wrapping only the setup in `asyncio.run(...)` and then calling the sync
+`mcp.run()` strands those resources on a closed loop and the first request
+will fail.
 
 ## Architectural rules (do not break)
 
