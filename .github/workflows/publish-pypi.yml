@@ -18,6 +18,10 @@ concurrency:
   group: publish-pypi-${{ github.ref }}
   cancel-in-progress: false
 
+# Least-privilege default; the job re-grants the scopes it needs (OIDC).
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -78,7 +82,7 @@ jobs:
         run: |
           v="${{ steps.version.outputs.version }}"
           for dir in dist authplane-mcp/dist authplane-fastmcp/dist; do
-            if ! ls "$dir" | grep -q "${v//./\\.}"; then
+            if ! compgen -G "$dir/*$v*" > /dev/null; then
               echo "::error::Built artifacts in ${dir} do not contain version ${v}. hatch-vcs likely resolved a different version. Refusing to publish."
               ls "$dir"
               exit 1
