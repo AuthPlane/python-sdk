@@ -31,6 +31,10 @@ concurrency:
   group: backport-${{ inputs.fromBranch }}-to-${{ inputs.toBranch }}
   cancel-in-progress: false
 
+# Least-privilege default; the job re-grants the write scopes it needs.
+permissions:
+  contents: read
+
 jobs:
   backport:
     runs-on: ubuntu-latest

@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+# Least-privilege default; this workflow only reads the repo.
+permissions:
+  contents: read
+
 jobs:
   quality:
     runs-on: ubuntu-latest

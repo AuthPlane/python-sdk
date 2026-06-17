@@ -1,0 +1,64 @@
+name: Lint workflows
+
+# Catches workflow YAML / shell-in-`run:` regressions at PR time so a
+# typo can't reach a release tag and surface only when a publish run
+# fails. Scoped to changes under `.github/workflows/**` to keep CI
+# overhead off unrelated PRs.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # Pulls the matching actionlint binary release from GitHub Releases
+      # via the upstream download script. The script is fetched by commit
+      # SHA (not a mutable tag) and sha256-verified before it runs — this
+      # closes Scorecard's "downloadThenRun not pinned by hash" gap. The
+      # script then checksum-verifies the actionlint binary it pulls from
+      # the matching release.
+      #
+      # To bump: change ACTIONLINT_VERSION, set ACTIONLINT_SCRIPT_SHA to the
+      # commit the new tag points at (`gh api repos/rhysd/actionlint/commits/vX.Y.Z -q .sha`),
+      # and update ACTIONLINT_SCRIPT_SHA256 to that file's sha256.
+      #
+      # Install dir is passed explicitly as the script's second positional
+      # arg so the workflow doesn't couple to the script's internal default
+      # of $PWD (which happens to be $GITHUB_WORKSPACE after checkout —
+      # a coincidence, not a contract).
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.7"
+          ACTIONLINT_SCRIPT_SHA: "03d0035246f3e81f36aed592ffb4bebf33a03106"
+          ACTIONLINT_SCRIPT_SHA256: "221d1d16c03e4e4fcd867de34104e8d479bdce20ccdfa553b9a5c0dc29bf6af2"
+          ACTIONLINT_INSTALL_DIR: ${{ runner.temp }}/actionlint
+        run: |
+          mkdir -p "${ACTIONLINT_INSTALL_DIR}"
+          script="${ACTIONLINT_INSTALL_DIR}/download-actionlint.bash"
+          curl -fsSL -o "${script}" \
+            "https://raw.githubusercontent.com/rhysd/actionlint/${ACTIONLINT_SCRIPT_SHA}/scripts/download-actionlint.bash"
+          echo "${ACTIONLINT_SCRIPT_SHA256}  ${script}" | sha256sum -c -
+          bash "${script}" "${ACTIONLINT_VERSION}" "${ACTIONLINT_INSTALL_DIR}"
+          echo "${ACTIONLINT_INSTALL_DIR}" >> "${GITHUB_PATH}"
+          "${ACTIONLINT_INSTALL_DIR}/actionlint" -version
+
+      # `-shellcheck=shellcheck` makes the shellcheck dependency explicit
+      # rather than relying on actionlint's implicit lookup against the
+      # runner image's $PATH; if the Ubuntu image ever drops shellcheck the
+      # job fails loudly instead of silently degrading.
+      - name: Run actionlint
+        run: actionlint -color -shellcheck=shellcheck

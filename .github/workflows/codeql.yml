@@ -1,0 +1,57 @@
+name: CodeQL
+
+# Static application security testing (SAST) for the Python sources across
+# all workspace packages. Runs CodeQL's security-extended query suite on
+# pull requests, pushes to main, and a weekly schedule, uploading results
+# to the GitHub Security tab.
+#
+# Closes the OpenSSF Scorecard "SAST" gap: CodeQL statically analyzes the
+# first-party source, complementing the dependency-vulnerability scanning
+# (pip-audit) that runs separately.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Wednesdays 06:00 UTC
+    - cron: "0 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (python)
+    # Code scanning (SARIF upload) requires GitHub Code Security, which is
+    # only available on public repos. Gate on visibility so the job only
+    # runs when the repo is public.
+    if: ${{ github.event.repository.visibility == 'public' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for CodeQL to upload its SARIF results to code scanning.
+      security-events: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # build-mode: none — CodeQL analyzes Python sources directly, no
+      # compilation step required.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        with:
+          languages: python
+          build-mode: none
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4.35.2
+        with:
+          category: "/language:python"
