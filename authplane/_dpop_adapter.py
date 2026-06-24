@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
+from .errors import DPoPMultipleProofsError
+
 if TYPE_CHECKING:
     import asyncio
 
@@ -60,6 +62,8 @@ class _HeadersLike(Protocol):
     """Minimal slice of ``starlette.datastructures.Headers``."""
 
     def get(self, key: str, default: str | None = ...) -> str | None: ...
+
+    def getlist(self, key: str) -> list[str]: ...
 
 
 class _URLLike(Protocol):
@@ -109,15 +113,44 @@ class BuiltDPoPRequestContext:
 
 
 def read_dpop_header(request: _RequestLike) -> str | None:
-    """Read the ``DPoP`` request header (case-insensitive, first value).
+    """Read the ``DPoP`` request header, enforcing RFC 9449 §4.3 #1.
 
-    Starlette's ``Headers.get`` already does case-insensitive lookup
-    and returns the first occurrence when a header is repeated. Strict
-    rejection of repeated ``DPoP`` headers (RFC 9449 §4.3 #1) is
-    tracked separately and is intentionally not enforced here so this
-    layer does not overlap with that work.
+    Returns the single proof JWT when exactly one non-empty ``DPoP``
+    header value is present, or ``None`` when no ``DPoP`` header is
+    present. Raises :class:`DPoPMultipleProofsError` when the request
+    carries more than one ``DPoP`` header value.
+
+    Two on-wire shapes are rejected:
+
+    1. Multiple ``DPoP`` headers on the request (``headers.getlist``
+       returns ≥ 2 non-empty entries).
+    2. A single ``DPoP`` header value pre-joined with ``,`` by an
+       upstream proxy or framework — RFC 9110 §5.3 permits combining
+       repeated headers this way. JWS compact serialization never
+       contains a literal comma, so split-on-comma is sound.
+
+    Trimming and empty-piece filtering mirror the cross-language
+    cardinality boundary so a request carrying ``"DPoP: "`` (whitespace
+    only) is treated as header-absent rather than as one value.
     """
-    return request.headers.get("dpop")
+    raw_values = request.headers.getlist("dpop")
+    filtered: list[str] = []
+    for raw in raw_values:
+        trimmed = raw.strip()
+        if not trimmed:
+            continue
+        # ``split(",", 2)`` caps the allocation on an attacker-controlled
+        # header: we only need 0 / 1 / ≥ 2 non-blank pieces, and a third
+        # entry already trips the cardinality guard below.
+        for part in trimmed.split(",", 2):
+            piece = part.strip()
+            if piece:
+                filtered.append(piece)
+    if len(filtered) > 1:
+        raise DPoPMultipleProofsError(
+            f"request carries {len(filtered)} DPoP proofs (RFC 9449 §4.3 forbids it)"
+        )
+    return filtered[0] if filtered else None
 
 
 def raw_request_path(request: _RequestLike) -> str:

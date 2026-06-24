@@ -57,7 +57,12 @@ class TokenResponse:
 
     access_token: str
     token_type: str
-    expires_in: int
+    # ``expires_in`` is tri-state so the wire shape ``expires_in: 0``
+    # (RFC 6749 §5.1 — a deliberately-expired one-shot token) is
+    # distinguishable from the field being absent. Cache callers honor
+    # the AS's intent: ``None`` ⇒ apply the default TTL; ``0`` ⇒ refuse
+    # to store.
+    expires_in: int | None
     scope: str
     refresh_token: str = ""
     issued_token_type: str = ""

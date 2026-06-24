@@ -207,6 +207,56 @@ async def test_dpop_context_header_lookup_is_case_insensitive() -> None:
 
 
 @pytest.mark.asyncio
+async def test_duplicate_dpop_headers_fail_auth() -> None:
+    """Two ``DPoP`` headers on one request violate RFC 9449 §4.3 #1.
+
+    The adapter must fail authentication (``verify_token`` returns
+    ``None``) without ever invoking the underlying ``verify`` — the
+    cardinality guard runs before the resource verifier sees the proof.
+    """
+    mock = _mock_verifier()
+    # Bypass _make_request to inject two DPoP headers; the helper's dict
+    # shape cannot represent the duplicate.
+    scope: dict[str, Any] = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [
+            (b"dpop", b"proof.one.x"),
+            (b"dpop", b"proof.two.y"),
+        ],
+        "scheme": "http",
+        "server": ("testserver", 80),
+        "client": None,
+        "root_path": "",
+        "http_version": "1.1",
+    }
+    request = Request(scope)
+    verifier = _make_token_verifier(mock, request)
+
+    result = await verifier.verify_token("valid_token")
+    assert result is None
+    mock.verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_comma_joined_dpop_value_fails_auth() -> None:
+    """A single comma-joined ``DPoP`` value (the proxy-collapsed shape
+    permitted by RFC 9110 §5.3) is unambiguously two proofs — JWS compact
+    has no literal comma — and must trip the same §4.3 guard.
+    """
+    mock = _mock_verifier()
+    request = _make_request(headers={"DPoP": "a.b.c, x.y.z"})
+    verifier = _make_token_verifier(mock, request)
+
+    result = await verifier.verify_token("valid_token")
+    assert result is None
+    mock.verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_htu_origin_from_configured_resource_not_host_header() -> None:
     """htu's origin comes from the configured resource, never from Host.
 

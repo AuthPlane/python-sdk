@@ -11,9 +11,17 @@ class CacheEntry:
 
     access_token: str
     token_type: str
-    expires_in: int
+    # Mirrors the wire field's tri-state (``None`` = AS omitted it,
+    # positive int = AS-issued lifetime). ``0`` never reaches the cache —
+    # :meth:`TokenCache.set` refuses it — so callers reading from cache
+    # see a sentinel that round-trips to the AS-issued shape.
+    expires_in: int | None
     scope: str
     expires_at: float  # monotonic time
+    # DPoP key thumbprint (RFC 9449 §6.1). Persisted so a sender-constrained
+    # token retrieved from cache reports its binding to downstream callers
+    # instead of silently degrading to a bearer-only shape.
+    cnf_jkt: str = ""
 
 
 class TokenCache:
@@ -90,11 +98,30 @@ class TokenCache:
         key: str,
         access_token: str,
         token_type: str,
-        expires_in: int = 0,
+        expires_in: int | None = None,
         scope: str = "",
+        cnf_jkt: str = "",
     ) -> None:
-        """Cache a token. Skips caching if effective TTL <= 0."""
-        ttl = (expires_in if expires_in > 0 else self._default_ttl) - self._ttl_buffer
+        """Cache a token.
+
+        ``expires_in`` is tri-state:
+
+        * ``None`` ⇒ the AS omitted ``expires_in``; apply ``default_ttl``.
+        * ``0`` ⇒ RFC 6749 §5.1 explicit zero (one-shot, born-expired);
+          refuse to store so the next ``get`` is a miss instead of a
+          stale hit.
+        * positive ``n`` ⇒ honor ``n`` seconds.
+
+        The effective TTL (chosen value minus ``ttl_buffer_seconds``) must
+        be > 0; otherwise the entry is not stored.
+        """
+        if expires_in is None:
+            base_ttl = self._default_ttl
+        elif expires_in == 0:
+            return
+        else:
+            base_ttl = expires_in
+        ttl = base_ttl - self._ttl_buffer
         if ttl <= 0:
             return
         # `move_to_end` after insertion in case the key already exists —
@@ -106,6 +133,7 @@ class TokenCache:
             expires_in=expires_in,
             scope=scope,
             expires_at=time.monotonic() + ttl,
+            cnf_jkt=cnf_jkt,
         )
         self._entries.move_to_end(key)
         # Evict the LRU victim(s) until we're at-or-under the cap. The

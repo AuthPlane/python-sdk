@@ -41,10 +41,25 @@ def test_skip_cache_when_ttl_too_short():
     assert cache.get("key1") is None
 
 
-def test_default_ttl_used_when_expires_in_zero():
+def test_default_ttl_used_when_expires_in_is_none():
+    """``None`` means the AS omitted ``expires_in``; honor ``default_ttl``."""
+    cache = TokenCache(ttl_buffer_seconds=0, default_ttl_seconds=100)
+    cache.set("key1", "token", "Bearer", expires_in=None)
+    entry = cache.get("key1")
+    assert entry is not None
+    # ``None`` must round-trip — callers downstream rely on it to
+    # distinguish AS-omitted from AS-issued zero.
+    assert entry.expires_in is None
+
+
+def test_zero_expires_in_refuses_to_store():
+    """RFC 6749 §5.1: ``expires_in: 0`` is a deliberately-expired one-shot
+    token; the cache must refuse to store it so the next ``get`` is a miss
+    instead of a default-TTL stale hit.
+    """
     cache = TokenCache(ttl_buffer_seconds=0, default_ttl_seconds=100)
     cache.set("key1", "token", "Bearer", expires_in=0)
-    assert cache.get("key1") is not None
+    assert cache.get("key1") is None
 
 
 def test_delete():
@@ -196,3 +211,36 @@ def test_reset_bumps_entry_to_mru():
     assert cache.get("k1") is not None
     assert cache.get("k2") is None
     assert cache.get("k3") is not None
+
+
+# ---------------------------------------------------------------------------
+# DPoP cnf binding round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_dpop_binding_survives_cache_round_trip():
+    # A DPoP-bound token must report its binding when served from cache, not
+    # degrade to a bearer-only shape that hides the sender-constrained
+    # property (RFC 9449 §6.1).
+    cache = TokenCache(ttl_buffer_seconds=0)
+    cache.set(
+        "key1",
+        "dpop-bound-token",
+        "DPoP",
+        expires_in=3600,
+        scope="tools/echo",
+        cnf_jkt="thumbprint-abc",
+    )
+    entry = cache.get("key1")
+    assert entry is not None
+    assert entry.cnf_jkt == "thumbprint-abc"
+
+
+def test_set_without_cnf_jkt_defaults_to_empty():
+    # Bearer-only tokens (no DPoP binding) keep the empty default so
+    # downstream code reading `cnf_jkt` cannot mistake them for bound.
+    cache = TokenCache(ttl_buffer_seconds=0)
+    cache.set("key1", "bearer-token", "Bearer", expires_in=3600)
+    entry = cache.get("key1")
+    assert entry is not None
+    assert entry.cnf_jkt == ""

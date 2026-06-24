@@ -63,6 +63,37 @@ async def test_client_credentials_caches_token():
 
 
 @pytest.mark.asyncio
+async def test_client_credentials_preserves_cnf_jkt_on_cache_hit():
+    # The cache-hit branch must rebuild the TokenResponse with its DPoP
+    # binding intact; otherwise a sender-constrained token degrades to a
+    # bearer-only shape on every subsequent hit (RFC 9449 §6.1).
+    client = await make_client()
+    mock_response = TokenResponse(
+        access_token="tok1",
+        token_type="DPoP",
+        expires_in=3600,
+        scope="read",
+        cnf_jkt="thumbprint-abc",
+    )
+
+    with patch(
+        "authplane.client.client_credentials_grant",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ) as mock_grant:
+        # First call populates the cache via the grant path.
+        first = await client.client_credentials(scopes=["read"])
+        assert first.cnf_jkt == "thumbprint-abc"
+
+        # Second call must take the cache-hit branch (no extra grant call)
+        # and still surface the binding.
+        second = await client.client_credentials(scopes=["read"])
+        assert mock_grant.await_count == 1
+        assert second.token_type == "DPoP"
+        assert second.cnf_jkt == "thumbprint-abc"
+
+
+@pytest.mark.asyncio
 async def test_circuit_breaker_opens_on_server_errors():
     client = await make_client(circuit_breaker_threshold=2)
 

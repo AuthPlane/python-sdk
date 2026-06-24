@@ -122,6 +122,19 @@ class InvalidDPoPProofError(DPoPError):
     pass
 
 
+class DPoPMultipleProofsError(InvalidDPoPProofError):
+    """Raised when the inbound request carries more than one ``DPoP`` header
+    value (RFC 9449 §4.3 #1).
+
+    Surfaces with WWW-Authenticate ``error="invalid_dpop_proof"`` per
+    RFC 9449 §7.1. The other ``DPoPError`` subclasses keep the SDK's
+    historical ``invalid_token`` mapping; only this §4.3 cardinality
+    violation gets the proof-specific error code.
+    """
+
+    pass
+
+
 class DPoPReplayDetectedError(DPoPError):
     """Raised when a DPoP proof `jti` has already been seen."""
 
@@ -253,8 +266,11 @@ def www_authenticate(
 
     Maps SDK errors to the correct error code and authentication scheme:
     - ``InsufficientScopeError`` → ``insufficient_scope``
-    - ``DPoPError`` subclasses (except ``DPoPNotSupportedError``) → ``DPoP``
-      scheme with ``invalid_token``
+    - ``DPoPMultipleProofsError`` → ``DPoP`` scheme with
+      ``invalid_dpop_proof`` (RFC 9449 §7.1 prescribes this code for §4.3
+      cardinality rejections).
+    - Other ``DPoPError`` subclasses (except ``DPoPNotSupportedError``) →
+      ``DPoP`` scheme with ``invalid_token``
     - All other ``AuthplaneError`` → ``Bearer`` scheme with ``invalid_token``
 
     If ``scope`` is provided (or the error is an :class:`InsufficientScopeError`
@@ -272,6 +288,12 @@ def www_authenticate(
     """
     if isinstance(error, InsufficientScopeError):
         error_code = "insufficient_scope"
+    elif isinstance(error, DPoPMultipleProofsError):
+        # RFC 9449 §7.1 prescribes `invalid_dpop_proof` for §4.3
+        # cardinality rejections, not the SDK's historical `invalid_token`
+        # used by the other `DPoPError` shapes. Scoped to this error;
+        # a broader sweep is a separate change.
+        error_code = "invalid_dpop_proof"
     else:
         error_code = "invalid_token"
 
