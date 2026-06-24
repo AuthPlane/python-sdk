@@ -308,6 +308,7 @@ class AuthplaneClient:
                 token_type=cached.token_type,
                 expires_in=cached.expires_in,
                 scope=cached.scope,
+                cnf_jkt=cached.cnf_jkt,
             )
 
         token_endpoint = await self._get_token_endpoint()
@@ -327,6 +328,7 @@ class AuthplaneClient:
                 result.token_type,
                 result.expires_in,
                 result.scope,
+                cnf_jkt=result.cnf_jkt,
             )
             return result
         except Exception as exc:

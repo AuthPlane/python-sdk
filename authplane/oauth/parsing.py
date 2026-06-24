@@ -13,9 +13,14 @@ def _required_string(data: dict[str, Any], key: str) -> str:
     return value
 
 
-def _optional_int(data: dict[str, Any], key: str, *, default: int = 0) -> int:
-    value = data.get(key, default)
-    if value in ("", None):
+def _optional_int(data: dict[str, Any], key: str, *, default: int | None = 0) -> int | None:
+    """Parse an optional integer field. ``default`` is returned for absent
+    or empty-string values; ``None`` is a valid default so callers can
+    distinguish "field omitted on the wire" from "field present and zero".
+    """
+    sentinel = object()
+    value = data.get(key, sentinel)
+    if value is sentinel or value in ("", None):
         return default
     try:
         parsed = int(value)
@@ -74,7 +79,7 @@ def parse_token_response(
     return TokenResponse(
         access_token=access_token,
         token_type=token_type,
-        expires_in=_optional_int(data, "expires_in", default=0),
+        expires_in=_optional_int(data, "expires_in", default=None),
         scope=str(data.get("scope", "")),
         refresh_token=str(data.get("refresh_token", "")),
         issued_token_type=issued_token_type,

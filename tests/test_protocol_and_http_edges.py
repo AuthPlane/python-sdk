@@ -42,6 +42,35 @@ def test_parse_token_response_rejects_negative_expires_in() -> None:
         )
 
 
+def test_parse_token_response_absent_expires_in_is_none() -> None:
+    # An AS that omits expires_in must parse to None, not 0, so the cache
+    # can later apply default_ttl rather than treat the token as one-shot.
+    result = parse_token_response(
+        {"access_token": "tok", "token_type": "Bearer"},
+        allow_issued_token_type=False,
+    )
+    assert result.expires_in is None
+
+
+def test_parse_token_response_explicit_zero_expires_in_preserved() -> None:
+    # An AS that issues a deliberately one-shot token (RFC 6749 §5.1 permits
+    # expires_in: 0) must parse to 0, not None. Downstream the cache treats
+    # 0 as "already expired, refuse to store" — it is *not* an absent value.
+    result = parse_token_response(
+        {"access_token": "tok", "token_type": "Bearer", "expires_in": 0},
+        allow_issued_token_type=False,
+    )
+    assert result.expires_in == 0
+
+
+def test_parse_token_response_positive_expires_in_preserved() -> None:
+    result = parse_token_response(
+        {"access_token": "tok", "token_type": "Bearer", "expires_in": 3600},
+        allow_issued_token_type=False,
+    )
+    assert result.expires_in == 3600
+
+
 def test_parse_token_response_rejects_invalid_issued_token_type() -> None:
     with pytest.raises(ProtocolError, match="unsupported issued_token_type"):
         parse_token_response(
