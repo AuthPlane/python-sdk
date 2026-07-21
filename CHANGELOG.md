@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-21
+
 ### Added
 - `TokenCache` is now bounded by a configurable `max_entries` cap (default `10_000`, exposed as `TokenCache.DEFAULT_MAX_ENTRIES` and a read-only `cache.max_entries` property) and evicts the least-recently-used entry on overflow; both `get` and `set` bump the touched key to MRU. Plumbed through `AuthplaneClient.create(cache_max_entries=...)`. Token-exchange cache keys are high-cardinality (the subject token is part of the key), so the cap keeps long-lived clients bounded.
 - `VerifiedClaims.require_scopes(scopes: Iterable[str])` — plural AND-style helper that requires all listed scopes. Empty input is a no-op; on failure the raised `InsufficientScopeError` carries the full requested tuple on `required_scopes` and names every missing scope plus the token's available scopes in the message.
