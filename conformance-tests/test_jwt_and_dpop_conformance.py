@@ -166,9 +166,41 @@ async def test_rfc9068_typ_must_be_at_jwt(verifier: Any, token_factory: Any) -> 
 
 
 @pytest.mark.conformance("rfc9068-issuer-must-match")
-async def test_rfc9068_issuer_must_match(verifier: Any, token_factory: Any) -> None:
+async def test_rfc9068_issuer_must_match(
+    verifier: Any, token_factory: Any, jwks_keypair: dict[str, Any]
+) -> None:
     with pytest.raises(InvalidClaimsError):
         await verifier.verify(token_factory(iss="https://wrong-issuer.com"))
+
+    # Variant: a token whose iss is identical to a configured trailing-slash
+    # issuer must verify — the issuer is never rewritten, end to end:
+    # discovery resolves the trailing-slash well-known URL (RFC 8414 §3), the
+    # advertised issuer matches exactly (§3.3), and the token's iss matches
+    # exactly (RFC 9068 §4).
+    slash_issuer = "https://auth.example.com/"
+    with respx.mock:
+        respx.get("https://auth.example.com/.well-known/oauth-authorization-server/").mock(
+            return_value=respx.MockResponse(
+                200,
+                json={
+                    "issuer": slash_issuer,
+                    "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
+                },
+            )
+        )
+        respx.get("https://auth.example.com/.well-known/jwks.json").mock(
+            return_value=respx.MockResponse(200, json=jwks_keypair["jwks"])
+        )
+
+        client = await AuthplaneClient.create(issuer=slash_issuer, fetch_settings=_NO_SSRF)
+        try:
+            slash_verifier = client.resource(
+                resource="https://api.example.com", scopes=["read:data"]
+            )
+            claims = await slash_verifier.verify(token_factory(iss=slash_issuer))
+            assert claims.issuer == slash_issuer
+        finally:
+            await client.aclose()
 
 
 @pytest.mark.conformance("rfc9068-audience-must-match-resource")
@@ -1112,6 +1144,11 @@ async def test_rfc9728_well_known_path_must_derive_from_resource_uri() -> None:
     assert (
         build_prm_url("https://api.example.com/v2/mcp")
         == "https://api.example.com/.well-known/oauth-protected-resource/v2/mcp"
+    )
+    # RFC 9728 §3 insertion preserves the path exactly, including a trailing slash.
+    assert (
+        build_prm_url("https://api.example.com/mcp/")
+        == "https://api.example.com/.well-known/oauth-protected-resource/mcp/"
     )
 
 

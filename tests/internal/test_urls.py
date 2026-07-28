@@ -24,14 +24,14 @@ class TestBuildMetadataUrl:
         )
 
     def test_issuer_with_trailing_slash(self) -> None:
-        """Trailing slash on issuer is normalized away."""
+        """RFC 8414 §3 insertion preserves the issuer's path (here "/") verbatim."""
         result = build_metadata_url("https://auth.example.com/")
-        assert result == "https://auth.example.com/.well-known/oauth-authorization-server"
+        assert result == "https://auth.example.com/.well-known/oauth-authorization-server/"
 
     def test_issuer_with_path_and_trailing_slash(self) -> None:
-        """Trailing slash on path issuer is normalized."""
+        """A trailing slash on the issuer path is preserved, not normalized."""
         result = build_metadata_url("https://auth.example.com/tenant1/")
-        assert result == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1"
+        assert result == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1/"
 
     def test_issuer_with_port(self) -> None:
         """Issuer with explicit port is preserved."""

@@ -17,6 +17,7 @@ from .internal import (
     JWKSCache,
     MetadataCache,
     build_metadata_url,
+    validate_identifier,
 )
 from .net import FetchSettings
 from .net.ssrf import SSRFError
@@ -134,7 +135,10 @@ class AuthplaneClient:
                 circuit trips. Default 30s.
         """
         client = cls()
-        client._issuer = issuer.rstrip("/")
+        # RFC 8414 Section 3.3 — the issuer is an opaque identifier compared
+        # with simple string equality (against metadata and token iss); it is
+        # validated but never rewritten.
+        client._issuer = validate_identifier(issuer, "issuer")
 
         # Dev mode
         resolved_dev_mode = (

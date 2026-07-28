@@ -35,6 +35,7 @@ from ..errors import (
     TokenRevokedError,
     VerifierRuntimeError,
 )
+from ..internal.identifiers import validate_identifier
 from ..internal.jwt import decode_jwt_header
 from ..internal.urls import build_prm_url
 from ..oauth.prm import build_prm
@@ -71,7 +72,10 @@ class AuthplaneResource:
             )
 
         self._client = client
-        self._resource = resource
+        # RFC 8707 Section 2 — the resource identifier is opaque; validated for
+        # structure, never rewritten (it is compared verbatim against aud and
+        # advertised verbatim in PRM).
+        self._resource = validate_identifier(resource, "resource")
         self._scopes = tuple(scopes)
         self._allowed_algorithms = allowed_algorithms
         self._clock_skew_seconds = clock_skew_seconds

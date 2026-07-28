@@ -12,6 +12,9 @@ def build_prm_url(resource: str) -> str:
     RFC 9728 Section 3:
         https://{host}/.well-known/oauth-protected-resource/{path}
 
+    The insertion is a pure string operation: the resource's path is preserved
+    exactly, including any trailing slash.
+
     Examples:
         >>> build_prm_url("https://api.example.com")
         'https://api.example.com/.well-known/oauth-protected-resource'
@@ -22,6 +25,9 @@ def build_prm_url(resource: str) -> str:
         >>> build_prm_url("https://api.example.com/v2/mcp")
         'https://api.example.com/.well-known/oauth-protected-resource/v2/mcp'
 
+        >>> build_prm_url("https://api.example.com/mcp/")
+        'https://api.example.com/.well-known/oauth-protected-resource/mcp/'
+
     Args:
         resource: The resource server URI.
 
@@ -29,12 +35,7 @@ def build_prm_url(resource: str) -> str:
         The fully constructed PRM discovery URL.
     """
     parsed = urlparse(resource)
-    path = parsed.path.strip("/")
-
-    if path:
-        well_known_path = f"/.well-known/oauth-protected-resource/{path}"
-    else:
-        well_known_path = "/.well-known/oauth-protected-resource"
+    well_known_path = "/.well-known/oauth-protected-resource" + parsed.path
 
     return urlunparse(
         (
@@ -57,6 +58,9 @@ def build_metadata_url(issuer: str) -> str:
     RFC 8414 Section 3:
         https://{host}/.well-known/oauth-authorization-server/{path}
 
+    The insertion is a pure string operation: the issuer's path is preserved
+    exactly, including any trailing slash.
+
     Examples:
         >>> build_metadata_url("https://auth.example.com")
         'https://auth.example.com/.well-known/oauth-authorization-server'
@@ -67,6 +71,9 @@ def build_metadata_url(issuer: str) -> str:
         >>> build_metadata_url("https://auth.example.com/org/tenant1")
         'https://auth.example.com/.well-known/oauth-authorization-server/org/tenant1'
 
+        >>> build_metadata_url("https://auth.example.com/tenant1/")
+        'https://auth.example.com/.well-known/oauth-authorization-server/tenant1/'
+
     Args:
         issuer: The OAuth 2.1 authorization server issuer URL.
 
@@ -74,14 +81,7 @@ def build_metadata_url(issuer: str) -> str:
         The fully constructed metadata discovery URL.
     """
     parsed = urlparse(issuer)
-
-    # Strip leading/trailing slashes from the path to normalize
-    path = parsed.path.strip("/")
-
-    if path:
-        well_known_path = f"/.well-known/oauth-authorization-server/{path}"
-    else:
-        well_known_path = "/.well-known/oauth-authorization-server"
+    well_known_path = "/.well-known/oauth-authorization-server" + parsed.path
 
     return urlunparse(
         (

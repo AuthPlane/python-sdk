@@ -30,7 +30,7 @@ class MetadataCache(DocumentCache):
             on_change=on_change,
             error_factory=lambda msg: MetadataFetchError(msg),
         )
-        self._expected_issuer = expected_issuer.rstrip("/")
+        self._expected_issuer = expected_issuer
         self._allow_http = allow_http
 
     def _validate_endpoint_url(self, field: str, value: str) -> None:
@@ -50,9 +50,11 @@ class MetadataCache(DocumentCache):
             )
 
     def _validate_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        issuer = str(metadata.get("issuer", "")).rstrip("/")
+        issuer = str(metadata.get("issuer", ""))
         if not issuer:
             raise MetadataFetchError("AS metadata missing required 'issuer' field")
+        # RFC 8414 Section 3.3 — the returned issuer MUST be identical to the
+        # configured one; simple string comparison, no normalisation.
         if self._expected_issuer and issuer != self._expected_issuer:
             raise MetadataFetchError(
                 f"AS metadata issuer mismatch: expected {self._expected_issuer!r}, got {issuer!r}"

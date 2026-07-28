@@ -38,6 +38,29 @@ async def test_rfc8414_metadata_issuer_must_match_configured_issuer(
                 fetch_settings=_NO_SSRF,
             )
 
+    # Variant: a trailing-slash difference is equivalent per RFC 3986 §6.2.3
+    # but not identical — RFC 8414 §3.3 requires identity, so it must be
+    # rejected.
+    with respx.mock:
+        respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+            return_value=respx.MockResponse(
+                200,
+                json={
+                    "issuer": "https://auth.example.com/",
+                    "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
+                },
+            )
+        )
+        respx.get("https://auth.example.com/.well-known/jwks.json").mock(
+            return_value=respx.MockResponse(200, json=jwks_keypair["jwks"])
+        )
+
+        with pytest.raises(MetadataFetchError, match="issuer mismatch"):
+            await AuthplaneClient.create(
+                issuer="https://auth.example.com",
+                fetch_settings=_NO_SSRF,
+            )
+
 
 @pytest.mark.conformance("rfc8414-jwks-uri-required-for-jwt-validation")
 async def test_rfc8414_jwks_uri_required_for_jwt_validation() -> None:
