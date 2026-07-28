@@ -20,6 +20,7 @@ from authplane_fastmcp import authplane_auth
 from fastmcp import FastMCP
 from fastmcp.server.auth import require_scopes
 
+
 async def main() -> None:
     result = await authplane_auth(
         issuer="https://auth.company.com",
@@ -36,6 +37,7 @@ async def main() -> None:
         await mcp.run_async(transport="http", port=8080)
     finally:
         await result.aclose()
+
 
 asyncio.run(main())
 ```

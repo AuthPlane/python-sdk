@@ -102,11 +102,13 @@ Use the `require_scope()` helper at the top of tool handlers to enforce per-tool
 ```python
 from authplane_mcp import require_scope
 
+
 @mcp.tool()
 async def query(sql: str) -> str:
     """Requires the tools/query scope."""
     require_scope("tools/query")
     return f"Ran: {sql}"  # replace with your real handler
+
 
 @mcp.tool()
 async def delete_all() -> str:
@@ -128,14 +130,15 @@ Use the MCP SDK's `get_access_token()` to access the validated token in tool han
 ```python
 from mcp.server.auth.middleware.auth_context import get_access_token
 
+
 @mcp.tool()
 async def my_tool(data: str) -> str:
     token = get_access_token()
     if token:
-        client_id = token.client_id       # Client ID
-        scopes = token.scopes             # List of granted scopes
-        expires_at = token.expires_at     # Expiration (Unix timestamp)
-        resource = token.resource         # Resource (audience) URL
+        client_id = token.client_id  # Client ID
+        scopes = token.scopes  # List of granted scopes
+        expires_at = token.expires_at  # Expiration (Unix timestamp)
+        resource = token.resource  # Resource (audience) URL
     return f"Processing {data}"
 ```
 
@@ -238,9 +241,11 @@ Implement your own revocation logic with an async callable:
 ```python
 from authplane import VerifiedClaims
 
+
 async def check_blocklist(claims: VerifiedClaims, raw_token: str) -> bool:
     """Return True to reject the token (it is revoked)."""
     return await redis_client.sismember("revoked_tokens", claims.jti)
+
 
 await authplane_mcp_auth(
     issuer="https://auth.company.com",
@@ -271,8 +276,8 @@ result = await authplane_mcp_auth(
 downstream = await result.client.exchange(
     TokenExchangeOptions(
         subject_token=inbound_token,
-        scope="tools/add",                           # narrow to the minimum
-        resources=("https://downstream.example",),   # RFC 8707 audience binding
+        scope="tools/add",  # narrow to the minimum
+        resources=("https://downstream.example",),  # RFC 8707 audience binding
     )
 )
 
@@ -304,6 +309,7 @@ The adapter handles this for you. The `client` returned by `authplane_mcp_auth(.
 
 ```python
 from authplane.oauth import TokenExchangeOptions
+
 
 @mcp.tool()
 async def call_downstream(user_token: str, payload: str) -> str:
@@ -406,6 +412,7 @@ When `fetch_settings` is provided, `dev_mode` is ignored for both metadata and J
 ```python
 import asyncio
 
+
 async def main() -> None:
     auth_result = await authplane_mcp_auth(...)
     try:
@@ -413,6 +420,7 @@ async def main() -> None:
         await mcp.run_streamable_http_async()
     finally:
         await auth_result.aclose()
+
 
 asyncio.run(main())
 ```
