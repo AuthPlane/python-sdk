@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `authplane-fastmcp`, `authplane-mcp`: `authplane_auth()` and `authplane_mcp_auth()` accept `fail_closed: bool = False` and forward it to `AuthplaneClient.resource(...)`, so factory users can opt into rejecting tokens (`TokenRevokedError`) when the configured `revocation_checker` itself fails — e.g. an unreachable introspection endpoint — instead of the default fail-open acceptance. The flag is only consulted when a `revocation_checker` is configured. Both user guides document the availability/security trade-off, the authenticated-introspection credential requirement, and the circuit-breaker interaction.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added

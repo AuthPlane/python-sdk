@@ -161,6 +161,33 @@ async def test_custom_revocation_checker_error_fails_open(
         await c.aclose()
 
 
+async def test_custom_revocation_checker_error_fail_closed_rejects(
+    mock_jwks: Route,
+    token_factory: Any,
+) -> None:
+    """fail_closed=True -> a crashing revocation checker rejects the token."""
+
+    async def crashing_checker(claims: Any, raw_token: str) -> bool:
+        raise RuntimeError("revocation backend unavailable")
+
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    v = c.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=crashing_checker,
+        fail_closed=True,
+    )
+    try:
+        token = token_factory()
+        with pytest.raises(TokenRevokedError):
+            await v.verify(token)
+    finally:
+        await c.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Built-in introspection tests
 # ---------------------------------------------------------------------------
@@ -202,6 +229,25 @@ async def test_introspection_http_error_fails_open(
     # Should not raise - fail-open policy
     claims = await verifier_with_introspection.verify(token)
     assert claims.sub == "user123"
+
+
+async def test_introspection_http_error_fail_closed_rejects(
+    client_with_introspection: AuthplaneClient,
+    token_factory: Any,
+) -> None:
+    """fail_closed=True -> introspection endpoint outage (HTTP 500) rejects the token."""
+    v = client_with_introspection.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=IntrospectionRevocation(),
+        fail_closed=True,
+    )
+    respx.post(INTROSPECTION_URL).mock(
+        return_value=respx.MockResponse(500, json={"error": "server_error"})
+    )
+    token = token_factory()
+    with pytest.raises(TokenRevokedError):
+        await v.verify(token)
 
 
 async def test_introspection_no_endpoint_in_metadata_skips(

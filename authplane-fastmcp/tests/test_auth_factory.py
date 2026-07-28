@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from authplane import DPoPProvider, FetchSettings, VerifiedClaims
+from authplane import DPoPProvider, FetchSettings, IntrospectionRevocation, VerifiedClaims
 
 from authplane_fastmcp import authplane_auth
 from authplane_fastmcp.auth import AuthplaneAuthResult
@@ -145,6 +145,46 @@ async def test_authplane_auth_revocation_checker_custom_callable():
 
         verifier_kwargs = mock_client.resource.call_args.kwargs
         assert verifier_kwargs["revocation_checker"] is my_checker
+
+
+@pytest.mark.asyncio
+async def test_authplane_auth_fail_closed_default_is_false():
+    """When fail_closed is not passed, False is forwarded (fail-open behavior)."""
+    mock_client = MagicMock()
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
+
+    with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        await authplane_auth(
+            issuer="https://auth.example.com",
+            base_url="https://api.example.com",
+        )
+
+        verifier_kwargs = mock_client.resource.call_args.kwargs
+        assert verifier_kwargs["fail_closed"] is False
+
+
+@pytest.mark.asyncio
+async def test_authplane_auth_fail_closed_forwarded():
+    """fail_closed=True is forwarded to client.resource()."""
+    mock_client = MagicMock()
+    _mock_resource = MagicMock()
+    _mock_resource.resource = "https://api.example.com/mcp"
+    mock_client.resource = MagicMock(return_value=_mock_resource)
+
+    with patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        await authplane_auth(
+            issuer="https://auth.example.com",
+            base_url="https://api.example.com",
+            revocation_checker=IntrospectionRevocation(),
+            fail_closed=True,
+        )
+
+        verifier_kwargs = mock_client.resource.call_args.kwargs
+        assert verifier_kwargs["fail_closed"] is True
 
 
 @pytest.mark.asyncio

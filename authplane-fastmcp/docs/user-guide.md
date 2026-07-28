@@ -82,6 +82,7 @@ All parameters of `authplane_auth()`:
 | `clock_skew_seconds` | `int` | `30` | Leeway for `exp`/`nbf`/`iat` validation |
 | `dev_mode` | `bool` | `False` | Relaxes SSRF checks for local development |
 | `revocation_checker` | see [below](#token-revocation-checking) | `None` | Token revocation strategy |
+| `fail_closed` | `bool` | `False` | Reject tokens when the revocation check itself fails, instead of accepting them (see [below](#failure-policy-fail-open-vs-fail-closed)) |
 | `fetch_settings` | `FetchSettings` | `None` | Full SSRF / fetch settings applied to both metadata and JWKS fetches (overrides `dev_mode`) |
 | `inbound_dpop` | `InboundDPoPOptions` | `None` | Per-resource inbound DPoP policy (replay store, max proof age, clock skew, accepted proof algorithms, `required`). When set, the resource advertises DPoP support in PRM (RFC 9728 §2). See **Inbound DPoP through the FastMCP adapter** below for current limitations. |
 
@@ -210,8 +211,34 @@ await authplane_auth(
 
 - The introspection endpoint is automatically discovered from AS metadata.
 - If the endpoint returns `active=false`, the token is rejected with `TokenRevokedError`.
-- **Fails open**: if the introspection endpoint is unavailable, the token is accepted (offline validation still applies).
+- **Fails open by default**: if the introspection endpoint is unavailable, the token is accepted (offline validation still applies). Pass `fail_closed=True` to reject instead (see [below](#failure-policy-fail-open-vs-fail-closed)).
 - `as_credentials` enables authenticated introspection (recommended for production).
+
+### Failure Policy: Fail-Open vs Fail-Closed
+
+`fail_closed` controls what happens when the revocation check itself fails — the introspection endpoint is unreachable, returns an error, or a custom checker raises:
+
+```python
+await authplane_auth(
+    issuer="https://auth.company.com",
+    base_url="https://mcp.company.com",
+    revocation_checker=IntrospectionRevocation(),
+    as_credentials=ASCredentials(
+        client_id="my_resource_server",
+        client_secret="secret",
+    ),
+    fail_closed=True,
+)
+```
+
+- `False` (default) accepts the token and logs a warning. Signature and claims validation still apply, so this only skips the *revocation* freshness check — it never admits an otherwise-invalid token.
+- `True` rejects the token with `TokenRevokedError`. Choose this for servers exposing mutation-capable or otherwise high-impact tools, where serving a revoked-but-unverifiable token is worse than downtime.
+
+Trade-offs to understand before enabling `fail_closed=True`:
+
+- **Availability**: an authorization server or introspection outage makes every request fail with 401 until the outage resolves. Once the client's circuit breaker opens, checks fail fast and all tokens are rejected until the cooldown elapses.
+- **Credentials**: authorization servers commonly require authenticated introspection; without valid `as_credentials` the introspection call fails, which under `fail_closed=True` means every token is rejected. Verify credentials as part of deployment, not just at rollout.
+- `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs.
 
 ### Custom Revocation Checker
 
@@ -474,6 +501,7 @@ async def authplane_auth(
     fetch_settings: FetchSettings | None = None,
     inbound_dpop: InboundDPoPOptions | None = None,
     revocation_checker: IntrospectionRevocation | RevocationChecker | None = None,
+    fail_closed: bool = False,
 ) -> AuthplaneAuthResult
 ```
 
