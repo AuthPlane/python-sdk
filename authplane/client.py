@@ -422,6 +422,16 @@ class AuthplaneClient:
         """
         from .verifier import AuthplaneResource
 
+        # fail_closed is only consulted when a revocation check runs; setting
+        # it without a checker means no revocation check happens at all, which
+        # is the opposite of what the operator asked for — make it observable.
+        if fail_closed and revocation_checker is None:
+            logger.warning(
+                "fail_closed=True has no effect without a revocation_checker: "
+                "no revocation check will run",
+                extra={"resource": resource},
+            )
+
         return AuthplaneResource(
             client=self,
             resource=resource,
