@@ -26,9 +26,11 @@ classifiers = [
 requires-python = ">=3.11"
 dependencies = [
     "authplane-sdk",
-    # mcp 1.23–1.27 use camelCase `elicitationId`; main has reverted
-    # to snake_case, so 1.28+ will likely require an adapter update.
-    "mcp>=1.23.0,<1.29.0",
+    # mcp 1.23–1.27 use camelCase `elicitationId`; 1.28 renamed it to
+    # snake_case `elicitation_id`, which breaks this adapter's wire handling
+    # (see url_elicitation.py + README). Keep the ceiling below 1.28 until the
+    # adapter is migrated.
+    "mcp>=1.23.0,<1.28.0",
     "pydantic>=2.0",
 ]
 

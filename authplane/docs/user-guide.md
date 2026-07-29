@@ -249,6 +249,7 @@ Important behavior:
 - set `fail_closed=True` to reject tokens when the revocation check fails
 - the client must have AS credentials configured
 - the AS metadata must expose `introspection_endpoint`
+- `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning at resource construction when it detects this misconfiguration.
 
 ```python
 # Fail-closed: reject tokens when introspection is unavailable
