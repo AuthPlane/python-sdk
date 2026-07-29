@@ -32,9 +32,7 @@ async def main():
     )
 
     @mcp.tool(auth=require_scopes("tools/query"))
-    async def query_database(
-        query: str, token: AccessToken = CurrentAccessToken()
-    ) -> str:
+    async def query_database(query: str, token: AccessToken = CurrentAccessToken()) -> str:
         user_id = token.claims.get("sub")
         return f"Query: {query}, User: {user_id}"
 

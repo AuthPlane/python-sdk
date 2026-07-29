@@ -37,6 +37,7 @@ import asyncio
 from fastmcp import FastMCP
 from authplane_fastmcp import authplane_auth
 
+
 async def main() -> None:
     result = await authplane_auth(
         issuer="https://auth.company.com",
@@ -54,6 +55,7 @@ async def main() -> None:
         await mcp.run_async(transport="http", port=8080)
     finally:
         await result.aclose()
+
 
 asyncio.run(main())
 ```
@@ -98,10 +100,12 @@ Use FastMCP's built-in `require_scopes` decorator to enforce per-tool scope requ
 ```python
 from fastmcp.server.auth import require_scopes
 
+
 @mcp.tool(auth=require_scopes("tools/query"))
 def query(sql: str) -> str:
     """Requires the tools/query scope."""
     return f"Ran: {sql}"  # replace with your real handler
+
 
 @mcp.tool(auth=require_scopes("tools/admin", "tools/delete"))
 def delete_all() -> str:
@@ -119,21 +123,22 @@ FastMCP enforces scopes **before** the handler runs by **filtering tools the cal
 from fastmcp.dependencies import CurrentAccessToken
 from fastmcp.server.auth import AccessToken
 
+
 @mcp.tool()
 async def my_tool(data: str, token: AccessToken = CurrentAccessToken()) -> str:
     # Standard JWT claims
-    sub = token.claims.get("sub")         # Subject (user ID)
-    jti = token.claims.get("jti")         # JWT ID
-    iss = token.claims.get("iss")         # Issuer
-    aud = token.claims.get("aud")         # Audience
-    exp = token.claims.get("exp")         # Expiration (Unix timestamp)
-    nbf = token.claims.get("nbf")         # Not before
-    iat = token.claims.get("iat")         # Issued at
+    sub = token.claims.get("sub")  # Subject (user ID)
+    jti = token.claims.get("jti")  # JWT ID
+    iss = token.claims.get("iss")  # Issuer
+    aud = token.claims.get("aud")  # Audience
+    exp = token.claims.get("exp")  # Expiration (Unix timestamp)
+    nbf = token.claims.get("nbf")  # Not before
+    iat = token.claims.get("iat")  # Issued at
 
     # OAuth claims
-    client_id = token.client_id           # Client ID
-    scopes = token.scopes                 # List of granted scopes
-    expires_at = token.expires_at         # Expiration (Unix timestamp)
+    client_id = token.client_id  # Client ID
+    scopes = token.scopes  # List of granted scopes
+    expires_at = token.expires_at  # Expiration (Unix timestamp)
 
     # Custom claims
     tenant = token.claims.get("tenant_id")
@@ -148,6 +153,7 @@ The `claims` dict contains the **full JWT payload** including all standard and c
 
 ```python
 from fastmcp.server.dependencies import get_access_token
+
 
 @mcp.tool()
 async def my_tool(data: str) -> str:
@@ -220,9 +226,11 @@ Implement your own revocation logic with an async callable:
 ```python
 from authplane import VerifiedClaims
 
+
 async def check_blocklist(claims: VerifiedClaims, raw_token: str) -> bool:
     """Return True to reject the token (it is revoked)."""
     return await redis_client.sismember("revoked_tokens", claims.jti)
+
 
 await authplane_auth(
     issuer="https://auth.company.com",
@@ -253,8 +261,8 @@ result = await authplane_auth(
 downstream = await result.client.exchange(
     TokenExchangeOptions(
         subject_token=inbound_token,
-        scope="tools/add",                           # narrow to the minimum
-        resources=("https://downstream.example",),   # RFC 8707 audience binding
+        scope="tools/add",  # narrow to the minimum
+        resources=("https://downstream.example",),  # RFC 8707 audience binding
     )
 )
 
@@ -286,6 +294,7 @@ When a token exchange needs interactive user consent at the AS (for example, fir
 from authplane import ConsentRequiredError
 from authplane.oauth import TokenExchangeOptions
 from mcp.shared.exceptions import UrlElicitationRequiredError
+
 
 @mcp.tool(auth=require_scopes("tools/call_downstream"))
 async def call_downstream(payload: str) -> str:
@@ -379,6 +388,7 @@ When `fetch_settings` is provided, `dev_mode` is ignored for both metadata and J
 ```python
 import asyncio
 
+
 async def main() -> None:
     result = await authplane_auth(...)
     try:
@@ -386,6 +396,7 @@ async def main() -> None:
         await mcp.run_async(transport="http", port=8080)
     finally:
         await result.aclose()
+
 
 asyncio.run(main())
 ```
