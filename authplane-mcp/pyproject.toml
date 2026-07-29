@@ -46,7 +46,7 @@ dev = [
     "respx>=0.21",
     "cryptography>=42",
     "coverage>=7",
-    "ruff>=0.8",
+    "ruff>=0.16,<0.17",
 ]
 
 [tool.pytest.ini_options]
