@@ -222,6 +222,7 @@ async def authplane_mcp_auth(
     fetch_settings: FetchSettings | None = None,
     inbound_dpop: InboundDPoPOptions | None = None,
     revocation_checker: IntrospectionRevocation | RevocationChecker | None = None,
+    fail_closed: bool = False,
 ) -> AuthplaneAuthResult:
     """Build the kwargs to enable Authplane auth on a FastMCP server.
 
@@ -323,10 +324,20 @@ async def authplane_mcp_auth(
               ``introspection_endpoint`` (RFC 7662) discovered from AS
               metadata. Raises ``TokenRevokedError`` if ``active=false``.
               Pass ``as_credentials`` for authenticated introspection.
-              Fails open if the endpoint is unavailable.
+              Fails open if the endpoint is unavailable, unless
+              ``fail_closed=True``.
             - async callable: custom checker called with
               ``(VerifiedClaims, raw_token)``; return ``True`` to reject
               the token (raises ``TokenRevokedError``).
+        fail_closed: Policy applied when the configured
+            ``revocation_checker`` itself fails (e.g. the introspection
+            endpoint is unreachable). ``False`` (default) accepts the
+            token — offline signature/claims validation still applies.
+            ``True`` rejects it with ``TokenRevokedError``, trading
+            availability during an AS outage for a hard revocation
+            guarantee. Only consulted when a ``revocation_checker`` is
+            configured; note that once the client's circuit breaker
+            opens, every request is rejected until the cooldown elapses.
 
     Returns:
         ``AuthplaneAuthResult`` with ``token_verifier`` (``AuthplaneTokenVerifier``),
@@ -384,6 +395,7 @@ async def authplane_mcp_auth(
         resource=resource,
         scopes=resolved_scopes,
         revocation_checker=revocation_checker,
+        fail_closed=fail_closed,
         **verifier_kwargs,
     )
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `authplane-fastmcp`, `authplane-mcp`: `authplane_auth()` and `authplane_mcp_auth()` accept `fail_closed: bool = False` and forward it to `AuthplaneClient.resource(...)`.
+- `AuthplaneClient.resource(...)` logs a warning when `fail_closed=True` is set without a `revocation_checker`.
+
 ## [0.3.0] - 2026-07-21
 
 ### Added

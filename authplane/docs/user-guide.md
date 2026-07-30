@@ -137,11 +137,11 @@ res = client.resource(
     resource="https://api.example.com",
     scopes=["read"],
     inbound_dpop=InboundDPoPOptions(
-        replay_store=InMemoryDPoPReplayStore(),     # process-scoped by default
+        replay_store=InMemoryDPoPReplayStore(),  # process-scoped by default
         max_proof_age_seconds=300,
         clock_skew_seconds=30,
         allowed_proof_algorithms=("RS256", "ES256"),
-        required=True,                              # reject bearer-only tokens
+        required=True,  # reject bearer-only tokens
     ),
 )
 ```
@@ -159,12 +159,15 @@ For each incoming request that may carry a DPoP-bound token, build a
 ```python
 from dataclasses import dataclass
 
+
 @dataclass
 class IncomingRequest:
     """Implements DPoPRequestContext."""
+
     method: str
     url: str
     proof: str | None
+
 
 claims = await res.verify(
     token,
@@ -246,6 +249,7 @@ Important behavior:
 - set `fail_closed=True` to reject tokens when the revocation check fails
 - the client must have AS credentials configured
 - the AS metadata must expose `introspection_endpoint`
+- `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning at resource construction when it detects this misconfiguration.
 
 ```python
 # Fail-closed: reject tokens when introspection is unavailable
@@ -260,6 +264,7 @@ res = client.resource(
 
 ```python
 from authplane import VerifiedClaims
+
 
 async def my_revocation_checker(claims: VerifiedClaims, raw_token: str) -> bool:
     return claims.jti in revoked_jtis
@@ -415,12 +420,12 @@ For multi-instance or shared-state deployments, provide your own `DPoPNonceStore
 ```python
 from authplane import DPoPKeyMaterial, DPoPNonceStore, DPoPProvider
 
-class MyNonceStore:
-    def get(self, key: str) -> str:
-        ...
 
-    def put(self, key: str, nonce: str) -> None:
-        ...
+class MyNonceStore:
+    def get(self, key: str) -> str: ...
+
+    def put(self, key: str, nonce: str) -> None: ...
+
 
 provider = DPoPProvider(
     DPoPKeyMaterial.from_pem(private_key_pem),
@@ -597,8 +602,8 @@ except AuthplaneError as e:
 Generate an RFC 9728 protected resource metadata document with:
 
 ```python
-prm = res.prm_response()      # the document body (a dict)
-url = res.prm_url()           # the well-known URL where clients can fetch it
+prm = res.prm_response()  # the document body (a dict)
+url = res.prm_url()  # the well-known URL where clients can fetch it
 ```
 
 Example output:

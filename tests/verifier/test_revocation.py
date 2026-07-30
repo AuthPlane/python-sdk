@@ -161,6 +161,33 @@ async def test_custom_revocation_checker_error_fails_open(
         await c.aclose()
 
 
+async def test_custom_revocation_checker_error_fail_closed_rejects(
+    mock_jwks: Route,
+    token_factory: Any,
+) -> None:
+    """fail_closed=True -> a crashing revocation checker rejects the token."""
+
+    async def crashing_checker(claims: Any, raw_token: str) -> bool:
+        raise RuntimeError("revocation backend unavailable")
+
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    v = c.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=crashing_checker,
+        fail_closed=True,
+    )
+    try:
+        token = token_factory()
+        with pytest.raises(TokenRevokedError):
+            await v.verify(token)
+    finally:
+        await c.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Built-in introspection tests
 # ---------------------------------------------------------------------------
@@ -204,6 +231,25 @@ async def test_introspection_http_error_fails_open(
     assert claims.sub == "user123"
 
 
+async def test_introspection_http_error_fail_closed_rejects(
+    client_with_introspection: AuthplaneClient,
+    token_factory: Any,
+) -> None:
+    """fail_closed=True -> introspection endpoint outage (HTTP 500) rejects the token."""
+    v = client_with_introspection.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=IntrospectionRevocation(),
+        fail_closed=True,
+    )
+    respx.post(INTROSPECTION_URL).mock(
+        return_value=respx.MockResponse(500, json={"error": "server_error"})
+    )
+    token = token_factory()
+    with pytest.raises(TokenRevokedError):
+        await v.verify(token)
+
+
 async def test_introspection_no_endpoint_in_metadata_skips(
     mock_jwks: Route,  # metadata without introspection_endpoint
     token_factory: Any,
@@ -222,6 +268,96 @@ async def test_introspection_no_endpoint_in_metadata_skips(
         token = token_factory()
         claims = await v.verify(token)
         assert claims.sub == "user123"
+    finally:
+        await c.aclose()
+
+
+async def test_introspection_no_endpoint_in_metadata_fail_closed_rejects(
+    mock_jwks: Route,  # metadata without introspection_endpoint
+    token_factory: Any,
+) -> None:
+    """fail_closed=True + metadata without introspection_endpoint -> every token rejected.
+
+    Unlike an outage this never recovers on its own: the missing endpoint is a
+    permanent property of the AS configuration, not a transient failure.
+    """
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    v = c.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=IntrospectionRevocation(),
+        fail_closed=True,
+    )
+    try:
+        token = token_factory()
+        with pytest.raises(TokenRevokedError):
+            await v.verify(token)
+    finally:
+        await c.aclose()
+
+
+async def test_introspection_open_circuit_fail_closed_rejects(
+    mock_jwks_with_introspection: None,
+    token_factory: Any,
+) -> None:
+    """fail_closed=True + open circuit breaker -> all tokens rejected until cooldown.
+
+    With threshold=1 a single introspection 500 opens the breaker; the next
+    verify() is rejected before any HTTP call (CircuitOpenError -> TokenRevokedError).
+    """
+    from authplane.errors import CircuitOpenError
+
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+        circuit_breaker_threshold=1,
+    )
+    v = c.resource(
+        resource=RESOURCE,
+        scopes=["read:data"],
+        revocation_checker=IntrospectionRevocation(),
+        fail_closed=True,
+    )
+    try:
+        introspection_route = respx.post(INTROSPECTION_URL).mock(
+            return_value=respx.MockResponse(500, json={"error": "server_error"})
+        )
+        token = token_factory()
+
+        # First verify: the 500 rejects the token and trips the breaker.
+        with pytest.raises(TokenRevokedError):
+            await v.verify(token)
+        first_call_count = introspection_route.call_count
+
+        # Second verify: rejected by the open breaker, no HTTP call made.
+        with pytest.raises(TokenRevokedError) as exc_info:
+            await v.verify(token)
+        assert isinstance(exc_info.value.__cause__, CircuitOpenError)
+        assert introspection_route.call_count == first_call_count
+    finally:
+        await c.aclose()
+
+
+async def test_fail_closed_without_checker_warns(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """fail_closed=True with revocation_checker=None is a no-op -> logged warning."""
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("WARNING", logger="authplane.client"):
+            c.resource(
+                resource=RESOURCE,
+                scopes=["read:data"],
+                fail_closed=True,
+            )
+        assert any("fail_closed=True has no effect" in record.message for record in caplog.records)
     finally:
         await c.aclose()
 

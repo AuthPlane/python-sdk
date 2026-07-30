@@ -38,7 +38,7 @@ dev = [
     "cryptography>=42",
     "coverage>=7",
     "pyright>=1.1",
-    "ruff>=0.8",
+    "ruff>=0.16,<0.17",
 ]
 
 [project.urls]
