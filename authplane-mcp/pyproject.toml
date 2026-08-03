@@ -30,7 +30,7 @@ dependencies = [
     # snake_case `elicitation_id`, which breaks this adapter's wire handling
     # (see url_elicitation.py + README). Keep the ceiling below 1.28 until the
     # adapter is migrated.
-    "mcp>=1.23.0,<1.28.0",
+    "mcp>=1.23.0,<2.1.0",
     "pydantic>=2.0",
 ]
 
