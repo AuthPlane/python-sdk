@@ -58,7 +58,16 @@ These tests show up as `skipped` (with their `note` carried through) in both `co
 The suite needs the shared catalog YAML on disk. By default it looks for
 `../conformance/oauth-sdk-conformance-catalog.yaml` (i.e. `python-sdk` and
 [`conformance`](https://github.com/AuthPlane/conformance) checked out as
-siblings). If your layout differs — e.g. nested inside another monorepo —
+siblings). To match CI exactly, check out the catalog revision pinned in
+`.conformance-catalog-ref` at the repo root rather than the latest default
+branch:
+
+```bash
+# From the python-sdk/ clone, with conformance/ checked out as a sibling
+git -C ../conformance checkout "$(cat .conformance-catalog-ref)"
+```
+
+If your layout differs — e.g. nested inside another monorepo —
 point the suite at the catalog explicitly:
 
 ```bash

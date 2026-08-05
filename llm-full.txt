@@ -184,7 +184,7 @@ asyncio.run(main())
 ```python
 import asyncio
 
-from authplane_mcp import authplane_mcp_auth, require_scope
+from authplane_mcp import authplane_mcp_auth, install_request_context, require_scope
 from mcp.server.fastmcp import FastMCP
 
 
@@ -195,6 +195,9 @@ async def main() -> None:
         scopes=["tools/query"],
     )
     mcp = FastMCP("My Server", port=8080, json_response=True, **auth_result)
+    # Advertise issuer / resource verbatim in the PRM and install the
+    # request-context middleware used by inbound DPoP enforcement.
+    install_request_context(mcp)
 
     @mcp.tool()
     async def query(sql: str) -> str:

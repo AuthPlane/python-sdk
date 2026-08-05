@@ -258,7 +258,7 @@ async def test_authplane_auth_returns_auth_result():
 
     with (
         patch("authplane_fastmcp.auth.AuthplaneClient") as mock_client_cls,
-        patch("authplane_fastmcp.auth.RemoteAuthProvider") as mock_auth_cls,
+        patch("authplane_fastmcp.auth._VerbatimPRMRemoteAuthProvider") as mock_auth_cls,
     ):
         mock_client_cls.create = AsyncMock(return_value=mock_client)
         result = await authplane_auth(
@@ -270,6 +270,14 @@ async def test_authplane_auth_returns_auth_result():
         assert result.auth is mock_auth_cls.return_value
         assert result.token_verifier is not None
         assert result.client is mock_client
+
+        # Pin the verbatim keywords the factory forwards to the provider. The
+        # resource is base_url + mcp_path ("/mcp" by default), NOT base_url —
+        # asserting the exact value guards against a regression that passes
+        # base_url (or any wrong kwarg) as the verbatim resource/issuer.
+        provider_kwargs = mock_auth_cls.call_args.kwargs
+        assert provider_kwargs["verbatim_issuer"] == "https://auth.example.com"
+        assert provider_kwargs["verbatim_resource"] == "https://api.example.com/mcp"
 
 
 def test_authplane_auth_result_keys():

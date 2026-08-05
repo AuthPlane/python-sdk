@@ -102,7 +102,8 @@ class AuthplaneClient:
 
         Args:
             issuer: Authorization-server issuer URL (the prefix RFC 8414 metadata
-                is fetched from). Trailing slash is stripped.
+                is fetched from). Stored verbatim and compared byte-for-byte; a
+                trailing slash is significant and is preserved.
             auth: Client authentication for OAuth endpoints. Accepts either a raw
                 :class:`AuthProvider` or an :class:`ASCredentials` shorthand (which
                 is materialised as :class:`ClientCredentialsProvider`).
@@ -117,12 +118,9 @@ class AuthplaneClient:
             metadata_refresh_seconds: Background metadata refresh interval
                 (must be > 0).
             cache_ttl_buffer_seconds: Safety margin subtracted from each token's
-                lifetime before the entry is considered expired. Same shape as
-                java-sdk ``TokenCacheConfig.ttlBufferSeconds`` and ts-sdk
-                ``TokenCache`` ctor. Default 30s.
-            default_ttl_seconds: Fallback lifetime applied when the AS response
-                omits ``expires_in``. Cross-SDK parity with java-sdk
-                ``TokenCacheConfig.defaultTtlSeconds``. Default 3600s.
+                lifetime before the entry is considered expired. Default 30s.
+            default_ttl_seconds: Fallback lifetime applied when the AS omits
+                ``expires_in``. Default 3600s.
             cache_max_entries: Maximum number of cached tokens before
                 least-recently-used eviction kicks in. Default
                 :attr:`TokenCache.DEFAULT_MAX_ENTRIES` (10_000). Must be a
@@ -132,9 +130,19 @@ class AuthplaneClient:
                 circuit opens. Default 5.
             circuit_breaker_cooldown_seconds: Half-open probe interval after the
                 circuit trips. Default 30s.
+
+        Raises:
+            ValueError: If ``issuer`` carries a query or fragment component
+                (RFC 8414 §2 forbids both). This fails fast at construction,
+                before any network fetch.
         """
         client = cls()
-        client._issuer = issuer.rstrip("/")
+        # Identity: the issuer is an identifier (RFC 9068 `iss`), stored verbatim
+        # and compared byte-for-byte. Do NOT strip a trailing slash here — an AS
+        # whose issuer ends in `/` mints tokens whose `iss` keeps the slash, and
+        # normalizing it away rejects every token. Slash stripping belongs only
+        # to .well-known URL derivation (see build_metadata_url), not to identity.
+        client._issuer = issuer
 
         # Dev mode
         resolved_dev_mode = (

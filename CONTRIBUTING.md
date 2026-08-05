@@ -82,7 +82,12 @@ The conformance suite in `conformance-tests/` validates the SDK against the shar
 ```bash
 # From the directory that contains your python-sdk/ clone
 git clone https://github.com/AuthPlane/conformance.git
+
+# Check out the same catalog revision CI pins, so local runs match CI exactly.
+git -C conformance checkout "$(cat python-sdk/.conformance-catalog-ref)"
 ```
+
+CI runs the suite against the catalog revision pinned in `.conformance-catalog-ref` at the repo root, not the catalog's latest default branch — checking out that revision locally keeps your results aligned with CI. (A separate scheduled `conformance-catalog-drift` workflow tracks the latest catalog and fails when new cases need coverage.)
 
 Expected layout:
 

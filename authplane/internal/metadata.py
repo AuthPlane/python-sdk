@@ -30,7 +30,11 @@ class MetadataCache(DocumentCache):
             on_change=on_change,
             error_factory=lambda msg: MetadataFetchError(msg),
         )
-        self._expected_issuer = expected_issuer.rstrip("/")
+        # Identity: the expected issuer is stored verbatim. RFC 8414 §3.3
+        # requires the returned `issuer` to be identical to the configured one,
+        # so a trailing-slash difference is a genuine mismatch and must not be
+        # normalized away on either side of the comparison.
+        self._expected_issuer = expected_issuer
         self._allow_http = allow_http
 
     def _validate_endpoint_url(self, field: str, value: str) -> None:
@@ -50,13 +54,18 @@ class MetadataCache(DocumentCache):
             )
 
     def _validate_metadata(self, metadata: dict[str, Any]) -> dict[str, Any]:
-        issuer = str(metadata.get("issuer", "")).rstrip("/")
+        issuer = str(metadata.get("issuer", ""))
         if not issuer:
             raise MetadataFetchError("AS metadata missing required 'issuer' field")
         if self._expected_issuer and issuer != self._expected_issuer:
-            raise MetadataFetchError(
-                f"AS metadata issuer mismatch: expected {self._expected_issuer!r}, got {issuer!r}"
-            )
+            msg = f"AS metadata issuer mismatch: expected {self._expected_issuer!r}, got {issuer!r}"
+            # The comparison above stays byte-for-byte; only the hint is
+            # conditional. Append the trailing-slash note only when the two
+            # values are otherwise identical — a genuine wrong-host mismatch
+            # would be misleadingly blamed on a slash otherwise.
+            if issuer.rstrip("/") == self._expected_issuer.rstrip("/"):
+                msg += " (identifiers are compared byte-for-byte; a trailing slash is significant)"
+            raise MetadataFetchError(msg)
         for field in (
             "jwks_uri",
             "token_endpoint",
