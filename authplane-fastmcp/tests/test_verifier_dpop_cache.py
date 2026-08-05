@@ -296,9 +296,9 @@ async def test_htu_preserves_percent_encoded_path_from_raw_path() -> None:
     """htu uses ``scope['raw_path']`` so percent-encoding survives.
 
     ASGI populates ``scope['path']`` as the percent-decoded path, but the
-    DPoP proof was signed over the on-wire (still-encoded) URL. The TS
-    sibling reads ``IncomingMessage.url`` (raw bytes), so reading
-    ``raw_path`` here keeps cross-SDK proof binding identical.
+    DPoP proof was signed over the on-wire (still-encoded) URL. Reading
+    ``raw_path`` here keeps the DPoP ``htu`` binding byte-for-byte with the
+    proof's covered value (RFC 9449 §4.3).
     """
     mock = _mock_verifier()
     # Decoded path: "/mcp/users/a/b" ; raw: "/mcp/users/a%2Fb" — a client

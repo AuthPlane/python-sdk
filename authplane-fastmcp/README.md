@@ -11,6 +11,10 @@ Authplane JWT validation for servers built on [FastMCP](https://github.com/Prefe
 pip install authplane-fastmcp
 ```
 
+## Compatibility
+
+Supported `fastmcp` range: **`>=3.2, <4.0.0`**. This adapter also imports the top-level `mcp` package directly (`mcp.shared.exceptions`, `mcp.types`), so it carries its own `mcp` constraint: **`>=1.28.1, <2.0.0`**. The floor is `1.28.1` because earlier releases (`<=1.28.0`) are affected by [PYSEC-2026-3483](https://osv.dev/vulnerability/PYSEC-2026-3483), fixed in `1.28.1`; `fastmcp>=3.2` alone does not guarantee that floor. The adapter targets the mcp 1.x camelCase URL-elicitation field (`ElicitRequestURLParams(elicitationId=...)`), which is the shape of the current 1.x line. As a belt-and-braces measure the adapter does not hard-code that spelling: it resolves the elicitation-id field name from the model's own schema — a known spelling is checked at import, then resolved per call — so a rename within 1.x would be picked up automatically rather than breaking the consent path. mcp 2.0 is not yet supported: it renames the elicitation field to snake_case `elicitation_id`, which is a separate port. If your project needs mcp 2.0, please open an issue.
+
 ## Quickstart
 
 ```python

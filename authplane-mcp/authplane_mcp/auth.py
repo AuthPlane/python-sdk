@@ -5,6 +5,7 @@ and configures all the components needed to add Authplane JWT validation
 to an official MCP Python SDK server in a single call.
 """
 
+import warnings
 from collections.abc import Iterator
 from typing import Any
 
@@ -24,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
 
+from ._prm import rewrite_prm_routes_verbatim
 from ._request_context import AuthplaneRequestContextMiddleware
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
@@ -77,28 +79,40 @@ def require_scope(scope: str) -> None:
 
 
 def install_request_context(mcp: FastMCP) -> None:
-    """Install :class:`AuthplaneRequestContextMiddleware` on a ``FastMCP`` server.
+    """Wire Authplane's per-app hooks onto a ``FastMCP`` server.
 
-    Wraps ``mcp.streamable_http_app`` so the Starlette app it returns
-    runs :class:`AuthplaneRequestContextMiddleware` before MCP's
-    ``AuthenticationMiddleware``. That middleware publishes the active
-    :class:`starlette.requests.Request` on a ContextVar, which
-    :meth:`AuthplaneTokenVerifier.verify_token` reads to forward a
-    :class:`~authplane.DPoPRequestContext` to
-    :meth:`AuthplaneResource.verify`.
+    Wraps ``mcp.streamable_http_app`` so the Starlette app it returns is
+    post-processed with two Authplane concerns before it starts serving.
+    ``mcp.sse_app`` is wrapped with the second concern only — the SSE branch
+    applies just the verbatim-PRM rewrite, not the request-context middleware:
 
-    The MCP SDK's ``FastMCP`` wires its middleware list internally with
-    no public hook for user middleware, so this is the least-invasive way
-    to slot ours in without subclassing or monkeypatching the SDK.
+    1. **Request context (DPoP).** :class:`AuthplaneRequestContextMiddleware`
+       is installed before MCP's ``AuthenticationMiddleware`` (streamable-HTTP
+       app only). That middleware publishes the active
+       :class:`starlette.requests.Request` on a ContextVar, which
+       :meth:`AuthplaneTokenVerifier.verify_token` reads to forward a
+       :class:`~authplane.DPoPRequestContext` to
+       :meth:`AuthplaneResource.verify`.
 
-    Without this call, the verifier still works for non-DPoP flows, but
-    DPoP-bound requests fail closed: :func:`get_current_request` raises,
-    the verifier passes ``dpop_request=None``, and the core rejects bound
-    tokens with ``DPoPBindingMismatchError`` (and rejects bearer-only
-    tokens under ``inbound_dpop=InboundDPoPOptions(required=True)``).
-    The misconfiguration surfaces as a 401 on the first request rather
-    than as a silent bypass, so an operator who skips this call will
-    notice immediately.
+    2. **Verbatim PRM identifiers.** The Protected Resource Metadata route the
+       MCP SDK auto-registers serves ``authorization_servers`` / ``resource``
+       through ``pydantic.AnyHttpUrl``, which normalizes an empty-path
+       authority with a trailing slash. The core SDK compares the issuer /
+       resource identifier byte-for-byte (RFC 8414 §3.3, RFC 9728 §3.3), so the
+       served document is rewritten to advertise the operator-configured
+       identifiers verbatim — otherwise a client that follows the PRM literally
+       is rejected by the strict comparison ("issuer mismatch") and tokens
+       minted for the advertised ``resource`` fail the ``aud`` check.
+
+    The MCP SDK's ``FastMCP`` builds its middleware list and its auth routes
+    internally with no public hook, so wrapping the app factory is the
+    least-invasive way to slot both concerns in without subclassing or
+    monkeypatching the SDK.
+
+    Without this call the verifier still works for non-DPoP flows, but DPoP-bound
+    requests fail closed (``DPoPBindingMismatchError``) and the served PRM keeps
+    the slash-normalized identifiers. Call it right after constructing the
+    ``FastMCP`` instance.
 
     Args:
         mcp: A ``FastMCP`` instance (typically
@@ -110,7 +124,7 @@ def install_request_context(mcp: FastMCP) -> None:
         async def main() -> None:
             result = await authplane_mcp_auth(issuer=..., resource=..., ...)
             mcp = FastMCP("My Server", **result)
-            install_request_context(mcp)  # required for inbound DPoP
+            install_request_context(mcp)
             async with result:
                 await mcp.run_streamable_http_async()
 
@@ -126,6 +140,37 @@ def install_request_context(mcp: FastMCP) -> None:
     if getattr(mcp, _INSTALLED_FLAG, False):
         return
 
+    # The verbatim identifiers ride on the AuthplaneTokenVerifier that
+    # ``authplane_mcp_auth`` stashed on the server. If a server was wired
+    # without the factory (no verbatim identifiers available), the PRM rewrite
+    # is skipped and the request-context middleware is still installed.
+    token_verifier = getattr(mcp, "_token_verifier", None)
+    if token_verifier is None:
+        # ``_token_verifier`` is an MCP SDK private attribute. If a future SDK
+        # release renames it, this lookup returns None and the verbatim PRM
+        # rewrite would quietly no-op, reverting the served document to the
+        # slash-normalized identifiers that break the strict comparison. Surface
+        # that loudly rather than silently regressing.
+        warnings.warn(
+            "FastMCP._token_verifier is absent; skipping the verbatim PRM "
+            "rewrite. The served Protected Resource Metadata will advertise "
+            "slash-normalized issuer/resource identifiers, which the core SDK's "
+            "byte-for-byte comparison rejects. This usually means the MCP SDK "
+            "renamed the private attribute the adapter reads.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    verbatim_issuer = getattr(token_verifier, "_verbatim_issuer", None)
+    verbatim_resource = getattr(token_verifier, "_verbatim_resource", None)
+
+    def rewrite_prm(app: Starlette) -> None:
+        if verbatim_issuer is not None and verbatim_resource is not None:
+            rewrite_prm_routes_verbatim(
+                app.router.routes,
+                issuer=verbatim_issuer,
+                resource=verbatim_resource,
+            )
+
     original_streamable_http_app = mcp.streamable_http_app
 
     def streamable_http_app() -> Starlette:
@@ -135,16 +180,28 @@ def install_request_context(mcp: FastMCP) -> None:
         # invoked once at startup before serving begins, so wrapping is safe
         # here and runs before MCP's AuthenticationMiddleware on every call.
         app.add_middleware(AuthplaneRequestContextMiddleware)
+        rewrite_prm(app)
+        return app
+
+    original_sse_app = mcp.sse_app
+
+    def sse_app(*args: Any, **kwargs: Any) -> Starlette:
+        # Forward whatever positional/keyword args the SDK passes so a future
+        # signature change in ``sse_app`` cannot TypeError at app-build time;
+        # only the verbatim PRM rewrite below is ours.
+        app = original_sse_app(*args, **kwargs)
+        rewrite_prm(app)
         return app
 
     # Fragility: instance-attribute assignment works only because FastMCP
-    # exposes ``streamable_http_app`` as a plain method, not a ``@property``
-    # or ``@cached_property``. If a future MCP SDK release changes that, the
-    # assignment will silently no-op (or raise AttributeError) and DPoP
-    # enforcement will fall back to ``dpop_request=None`` on every request.
+    # exposes ``streamable_http_app`` / ``sse_app`` as plain methods, not
+    # ``@property`` or ``@cached_property``. If a future MCP SDK release changes
+    # that, the assignment will silently no-op (or raise AttributeError) and
+    # both concerns above fall back to the SDK defaults.
     # Track https://github.com/modelcontextprotocol/python-sdk for a public
     # subclassing hook or per-app middleware API and migrate to it when available.
     mcp.streamable_http_app = streamable_http_app
+    mcp.sse_app = sse_app
     setattr(mcp, _INSTALLED_FLAG, True)
 
 
@@ -399,8 +456,16 @@ async def authplane_mcp_auth(
         **verifier_kwargs,
     )
 
-    # Wrap in AuthplaneTokenVerifier
-    token_verifier = AuthplaneTokenVerifier(verifier)
+    # Wrap in AuthplaneTokenVerifier.  The verbatim issuer / resource ride
+    # along on the verifier so ``install_request_context`` can advertise them
+    # unchanged in the served PRM — the MCP SDK builds that document from
+    # ``AuthSettings`` ``AnyHttpUrl`` fields, which normalize an empty-path
+    # authority with a trailing slash (RFC 8414 §3.3, RFC 9728 §3.3).
+    token_verifier = AuthplaneTokenVerifier(
+        verifier,
+        verbatim_issuer=issuer,
+        verbatim_resource=resource,
+    )
 
     # Create AuthSettings for FastMCP.
     #

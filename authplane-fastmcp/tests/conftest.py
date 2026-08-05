@@ -8,11 +8,12 @@ import pytest
 from authplane import AuthplaneResource, VerifiedClaims
 from fastmcp import FastMCP
 from fastmcp.dependencies import CurrentAccessToken
-from fastmcp.server.auth import AccessToken, RemoteAuthProvider, require_scopes
+from fastmcp.server.auth import AccessToken, require_scopes
 from httpx import ASGITransport, AsyncClient
 from pydantic import AnyHttpUrl
 
 from authplane_fastmcp import AuthplaneTokenVerifier
+from authplane_fastmcp.auth import _VerbatimPRMRemoteAuthProvider
 
 
 @pytest.fixture
@@ -99,11 +100,13 @@ def fastmcp_app(token_verifier: AuthplaneTokenVerifier) -> FastMCP:
     Returns:
         FastMCP application instance
     """
-    auth_provider = RemoteAuthProvider(
+    auth_provider = _VerbatimPRMRemoteAuthProvider(
         token_verifier=token_verifier,
         authorization_servers=[AnyHttpUrl("https://auth.example.com")],
         base_url=AnyHttpUrl("https://api.example.com"),
         scopes_supported=["tools/query", "tools/write", "tools/admin"],
+        verbatim_issuer="https://auth.example.com",
+        verbatim_resource="https://api.example.com/mcp",
     )
 
     mcp = FastMCP("Test Server", auth=auth_provider)

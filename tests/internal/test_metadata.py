@@ -88,17 +88,20 @@ async def test_get_jwks_uri_missing_field() -> None:
         await cache.get_jwks_uri()
 
 
-async def test_expected_issuer_trailing_slash_is_normalized() -> None:
-    fetcher = TrackingFetcher(metadata=SAMPLE_METADATA)
+async def test_expected_issuer_trailing_slash_is_significant() -> None:
+    # Identifiers are compared byte-for-byte (RFC 8414 §3.3). A
+    # configured issuer that differs from the advertised metadata issuer only
+    # by a trailing slash is a genuine mismatch and must be rejected, not
+    # silently reconciled.
+    fetcher = TrackingFetcher(metadata=SAMPLE_METADATA)  # issuer has no trailing slash
     cache = MetadataCache(
         fetcher,
         expected_issuer="https://auth.example.com/",
         document_type="metadata",
     )
 
-    metadata = await cache.get()
-
-    assert metadata["issuer"] == "https://auth.example.com"
+    with pytest.raises(MetadataFetchError, match="issuer mismatch"):
+        await cache.get()
 
 
 # ---------------------------------------------------------------------------

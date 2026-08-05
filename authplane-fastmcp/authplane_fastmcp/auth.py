@@ -20,9 +20,48 @@ from authplane import (
 from authplane.oauth import TokenExchangeOptions, TokenResponse
 from fastmcp.server.auth import RemoteAuthProvider
 from pydantic import AnyHttpUrl
+from starlette.routing import Route
 
+from ._prm import rewrite_prm_routes_verbatim
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
+
+
+class _VerbatimPRMRemoteAuthProvider(RemoteAuthProvider):
+    """``RemoteAuthProvider`` that advertises identifiers verbatim in the PRM.
+
+    Upstream builds the Protected Resource Metadata document from
+    ``pydantic.AnyHttpUrl`` fields, which normalize an empty-path authority by
+    appending a trailing slash. Since the core SDK compares the issuer /
+    resource identifier byte-for-byte (RFC 8414 §3.3, RFC 9728 §3.3), the
+    normalized value the base class would serve no longer matches what the
+    verifier accepts. This subclass keeps the whole upstream route (CORS,
+    caching, path handling, field set) and only rewrites the served
+    ``authorization_servers`` and ``resource`` back to the configured strings.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        verbatim_issuer: str,
+        verbatim_resource: str,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._verbatim_issuer = verbatim_issuer
+        self._verbatim_resource = verbatim_resource
+
+    def get_routes(self, *args: Any, **kwargs: Any) -> list[Route]:
+        # Forward whatever positional/keyword args the framework passes so a
+        # future signature change in the base ``get_routes`` cannot TypeError
+        # at app-build time; only the verbatim PRM rewrite below is ours.
+        routes = super().get_routes(*args, **kwargs)
+        rewrite_prm_routes_verbatim(
+            routes,
+            issuer=self._verbatim_issuer,
+            resource=self._verbatim_resource,
+        )
+        return routes
 
 
 def _wrap_client_for_elicitation(client: AuthplaneClient) -> AuthplaneClient:
@@ -287,12 +326,23 @@ async def authplane_auth(
     # Note: FastMCP uses token_verifier.base_url for PRM generation if provided
     token_verifier = AuthplaneTokenVerifier(verifier, base_url=base_url)
 
-    # Wrap in RemoteAuthProvider to get PRM routes
-    auth_provider = RemoteAuthProvider(
+    # Wrap in RemoteAuthProvider to get PRM routes.
+    #
+    # ``authorization_servers`` and ``base_url`` must be ``AnyHttpUrl`` — the
+    # upstream framework requires the URL type internally. That construction
+    # normalizes an empty-path authority with a trailing slash, so the served
+    # PRM would otherwise advertise ``https://auth.example.com/`` for an issuer
+    # configured as ``https://auth.example.com``. ``_VerbatimPRMRemoteAuthProvider``
+    # rewrites the served ``authorization_servers`` / ``resource`` back to the
+    # verbatim configured strings so they match the core SDK's byte-for-byte
+    # comparison (RFC 8414 §3.3, RFC 9728 §3.3).
+    auth_provider = _VerbatimPRMRemoteAuthProvider(
         token_verifier=token_verifier,
         authorization_servers=[AnyHttpUrl(issuer)],
         base_url=AnyHttpUrl(base_url),
         scopes_supported=resolved_scopes,
+        verbatim_issuer=issuer,
+        verbatim_resource=resource,
     )
 
     return AuthplaneAuthResult(

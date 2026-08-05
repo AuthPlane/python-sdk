@@ -92,6 +92,8 @@ class AuthplaneTokenVerifier(TokenVerifier):
         verifier: AuthplaneResource,
         *,
         get_http_request: Callable[[], Request] | None = None,
+        verbatim_issuer: str | None = None,
+        verbatim_resource: str | None = None,
     ) -> None:
         """Initialize the token verifier.
 
@@ -105,9 +107,18 @@ class AuthplaneTokenVerifier(TokenVerifier):
                 :class:`AuthplaneRequestContextMiddleware`). Tests inject
                 a fake to drive the DPoP / per-request-cache paths
                 without spinning up an ASGI app.
+            verbatim_issuer: Operator-configured issuer identifier, kept
+                byte-for-byte so :func:`install_request_context` can advertise
+                it unchanged in the served Protected Resource Metadata (the MCP
+                SDK otherwise serializes it through ``pydantic.AnyHttpUrl`` and
+                appends a trailing slash to an empty-path authority).
+            verbatim_resource: Operator-configured resource identifier, kept
+                byte-for-byte for the same PRM reason.
         """
         self._verifier = verifier
         self._get_http_request = get_http_request or _default_get_http_request
+        self._verbatim_issuer = verbatim_issuer
+        self._verbatim_resource = verbatim_resource
 
         # ``AuthplaneResource.resource`` is operator-configured and must be a
         # string URI — guard against mis-wired mocks (a bare ``MagicMock`` with

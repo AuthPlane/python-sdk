@@ -35,7 +35,7 @@ Requires Python 3.11+.
 import asyncio
 
 from mcp.server.fastmcp import FastMCP
-from authplane_mcp import authplane_mcp_auth, require_scope
+from authplane_mcp import authplane_mcp_auth, install_request_context, require_scope
 
 
 async def main() -> None:
@@ -45,6 +45,10 @@ async def main() -> None:
         scopes=["tools/query", "tools/write"],
     )
     mcp = FastMCP("My Server", port=8080, json_response=True, **auth_result)
+    # Advertises the issuer / resource identifiers verbatim in the Protected
+    # Resource Metadata and installs the request-context middleware used by
+    # inbound DPoP enforcement.
+    install_request_context(mcp)
 
     @mcp.tool()
     async def query(sql: str) -> str:
