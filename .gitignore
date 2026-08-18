@@ -22,6 +22,14 @@ wheels/
 .installed.cfg
 *.egg
 
+# uv lockfiles. Not tracked on main and nothing consumes them — no workflow
+# installs with uv — so they are local resolution artifacts. Three of them were
+# swept into a merge commit as untracked files and accounted for 94% of a PR's
+# diff; ignoring them is what stops that recurring. Tracking them for
+# reproducible installs is a real decision, and it belongs in its own PR
+# alongside the CI change that would make them load-bearing.
+uv.lock
+
 # Testing
 .pytest_cache/
 .coverage

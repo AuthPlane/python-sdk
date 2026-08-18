@@ -1077,24 +1077,76 @@ async def test_rfc9449_dpop_replay_store_must_evict_expired_entries() -> None:
 
 @pytest.mark.conformance(
     "rfc9449-dpop-inbound-nonce-must-be-validated-when-required",
-    note="Not implemented: the SDK has no nonce generation, DPoP-Nonce challenge emission, or challenge-retry lifecycle for resource servers.",
+    level="partial",
+    gaps=["use_case"],
+    note=(
+        "setup/stimulus/expected are covered: the verifier enforces a nonce policy "
+        "when one is supplied. The use_case narrative is not: the SDK issues no "
+        "nonce, emits no 401 + DPoP-Nonce challenge, and expected_nonce is not "
+        "reachable from AuthplaneResource.verify() or the MCP adapters, only from "
+        "verify_dpop_proof. That lifecycle is tracked separately."
+    ),
 )
 async def test_rfc9449_dpop_inbound_nonce_must_be_validated_when_required(
     jwks_keypair: dict[str, Any],
 ) -> None:
-    """Full resource-server nonce challenge-retry flow:
-    1. Client sends proof without nonce.
-    2. Resource server responds 401 + DPoP-Nonce: <fresh-nonce>.
-    3. Client retries with the issued nonce in the proof.
-    4. Resource server verifies the nonce matches and accepts.
+    """A configured nonce policy must reject a proof that carries the wrong
+    nonce, and one that omits the claim entirely.
 
-    The SDK must own the nonce lifecycle: generation, DPoP-Nonce header
-    emission on rejection, and validation on retry. None of this is
-    currently implemented."""
-    pytest.xfail(
-        "Not implemented: SDK lacks nonce generation, DPoP-Nonce challenge "
-        "emission, and the challenge-retry lifecycle for resource servers."
+    The catalog stimulus is "verify_dpop_proof with nonce policy" — setup
+    supplies ``expected_nonce: server-nonce-abc`` against a proof claiming
+    ``nonce: wrong-nonce``, expecting rejection with hint "nonce". Both arms
+    below match ts-sdk's case for the same id. This is the RFC 9449 §9
+    resource-server nonce, not the §8 AS-provided one.
+
+    This was previously ``pytest.xfail``ed on the grounds that the SDK owns no
+    nonce lifecycle. It does not — but the catalog case does not ask for one,
+    and the primitive it does ask for has been present in ``verify_dpop_proof``
+    all along. The xfail reported as a skip, so the suite stayed green while
+    the report carried the case as not-run."""
+    provider = DPoPProvider(
+        DPoPKeyMaterial.from_pem(jwks_keypair["private_key"], algorithm="ES256")
     )
+    url = "https://api.example.com/resource"
+
+    wrong_nonce_proof = provider.build_proof("GET", url, access_token="tok", nonce="wrong-nonce")
+    with pytest.raises(InvalidDPoPProofError, match="nonce mismatch"):
+        await verify_dpop_proof(
+            wrong_nonce_proof,
+            method="GET",
+            url=url,
+            replay_store=MemoryReplayStore(),
+            access_token="tok",
+            expected_jkt=provider.key_material.thumbprint,
+            expected_nonce="server-nonce-abc",
+        )
+
+    # RFC 9449 §9: an omitted nonce claim is as much a policy violation as a
+    # wrong one. The catalog's requirement_summary names both.
+    missing_nonce_proof = provider.build_proof("GET", url, access_token="tok")
+    with pytest.raises(InvalidDPoPProofError, match="nonce mismatch"):
+        await verify_dpop_proof(
+            missing_nonce_proof,
+            method="GET",
+            url=url,
+            replay_store=MemoryReplayStore(),
+            access_token="tok",
+            expected_jkt=provider.key_material.thumbprint,
+            expected_nonce="server-nonce-abc",
+        )
+
+    # The policy must not reject the honest case: the nonce the server issued.
+    matching_proof = provider.build_proof("GET", url, access_token="tok", nonce="server-nonce-abc")
+    verified = await verify_dpop_proof(
+        matching_proof,
+        method="GET",
+        url=url,
+        replay_store=MemoryReplayStore(),
+        access_token="tok",
+        expected_jkt=provider.key_material.thumbprint,
+        expected_nonce="server-nonce-abc",
+    )
+    assert verified.raw["nonce"] == "server-nonce-abc"
 
 
 @pytest.mark.conformance("rfc9728-well-known-path-must-derive-from-resource-uri")

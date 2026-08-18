@@ -1,19 +1,28 @@
-name: Lint workflows
+name: Release tooling
 
 # Catches workflow YAML / shell-in-`run:` regressions at PR time so a
 # typo can't reach a release tag and surface only when a publish run
-# fails. Scoped to changes under `.github/workflows/**` to keep CI
-# overhead off unrelated PRs.
+# fails. The shell scripts under scripts/ are in the same category — a
+# break in them surfaces only when someone reaches for them after a
+# release, which is the worst moment to discover it — so they are linted
+# and tested here too. Scoped to those two paths to keep CI overhead off
+# unrelated PRs.
+#
+# The scripts trigger is `scripts/**`, not `scripts/*.sh`: a single-level
+# glob would leave a future scripts/lib/*.sh both untriggered here and
+# unlinted below, in each case silently.
 
 on:
   pull_request:
     paths:
       - ".github/workflows/**"
+      - "scripts/**"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/**"
+      - "scripts/**"
 
 permissions:
   contents: read
@@ -56,9 +65,36 @@ jobs:
           echo "${ACTIONLINT_INSTALL_DIR}" >> "${GITHUB_PATH}"
           "${ACTIONLINT_INSTALL_DIR}/actionlint" -version
 
-      # `-shellcheck=shellcheck` makes the shellcheck dependency explicit
-      # rather than relying on actionlint's implicit lookup against the
-      # runner image's $PATH; if the Ubuntu image ever drops shellcheck the
-      # job fails loudly instead of silently degrading.
+      # Both steps below resolve `shellcheck` off the runner image's $PATH —
+      # actionlint via `-shellcheck=shellcheck`, the script lint directly.
+      # Asserting it once, up front, is what makes that dependency explicit:
+      # naming the binary in actionlint's flag only changes which lookup
+      # fails, and neither step announces the version it linted with. If the
+      # Ubuntu image ever drops shellcheck, this fails first and says so,
+      # rather than actionlint quietly degrading to no shell analysis.
+      - name: Check shellcheck is available
+        run: shellcheck --version
+
       - name: Run actionlint
         run: actionlint -color -shellcheck=shellcheck
+
+      - name: Shellcheck the release scripts
+        # find, not `scripts/*.sh`: the single-level glob would silently skip
+        # a future scripts/lib/*.sh, the same blind spot the path trigger had.
+        # An empty result is an error rather than a green no-op, so a moved or
+        # renamed directory cannot pass as a clean lint.
+        run: |
+          mapfile -d '' -t sh_files < <(find scripts -type f -name '*.sh' -print0)
+          if [[ ${#sh_files[@]} -eq 0 ]]; then
+            echo "error: no shell scripts found under scripts/" >&2
+            exit 1
+          fi
+          printf 'shellcheck: %s\n' "${sh_files[@]}"
+          shellcheck "${sh_files[@]}"
+
+      # backport-fixes.sh accepts a branch or a tag as --from, and only the
+      # branch form has a remote-tracking ref. The tag form is what the release
+      # flow tells you to use once release.yml has deleted the branch, so it is
+      # the form least likely to be exercised before it is needed.
+      - name: Test backport-fixes.sh
+        run: scripts/backport-fixes.test.sh
