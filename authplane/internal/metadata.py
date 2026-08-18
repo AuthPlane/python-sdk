@@ -2,7 +2,7 @@
 
 import logging
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from ..errors import MetadataFetchError, MissingMetadataEndpointError
 from .document_cache import DocumentCache, DocumentChangeCallback, DocumentFetcherCallable
@@ -43,7 +43,27 @@ class MetadataCache(DocumentCache):
         In production mode (allow_http=False), endpoint URLs must be absolute
         HTTPS URLs. In dev mode (allow_http=True), HTTP is also permitted.
         """
-        parsed = urlparse(value)
+        # urlsplit, guarded. Two urllib traps escape as a bare ValueError on a
+        # malformed authority — a netloc with `[` and no `]` ("Invalid IPv6
+        # URL"), and a non-numeric port, which is parsed lazily and raises at
+        # attribute access — and this value is AS metadata, i.e. remote content.
+        # The MCP adapters catch only AuthplaneError, so an unwrapped ValueError
+        # here turns a metadata rejection into an unhandled 500. Same guard as
+        # `_split_dpop_url` and `internal/urls.py`; this call site was the one
+        # left out of that audit.
+        #
+        # urlsplit rather than urlparse for the module's one parse idiom: only
+        # scheme and netloc are read, so `;params` cannot reach anything here,
+        # but the safety of a urlparse should not have to be re-argued per site.
+        try:
+            parsed = urlsplit(value)
+            # Read, not discarded: SplitResult.port is parsed lazily, so an
+            # out-of-range or non-numeric port raises here rather than at split.
+            _ = parsed.port
+        except ValueError as exc:
+            raise MetadataFetchError(
+                f"AS metadata field {field!r} is not a valid URL: {value!r}"
+            ) from exc
         if not parsed.scheme or not parsed.netloc:
             raise MetadataFetchError(
                 f"AS metadata field {field!r} is not an absolute URL: {value!r}"

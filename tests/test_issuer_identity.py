@@ -7,12 +7,13 @@ behaviors are distinct and must not be fused.
 """
 
 from collections.abc import AsyncGenerator, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 import respx
 
-from authplane import AuthplaneClient, FetchSettings
+from authplane import AuthplaneClient, AuthplaneResource, FetchSettings
 from authplane.errors import InvalidClaimsError, MetadataFetchError
 from authplane.internal.fetch_result import FetchResult
 from authplane.internal.metadata import MetadataCache
@@ -186,7 +187,7 @@ def test_metadata_url_rejects_bare_empty_query_issuer() -> None:
 
 
 # (d2) A fragment-bearing issuer is rejected too. RFC 8414 §2 forbids BOTH a
-# query and a fragment; urlunparse silently drops a fragment, so without the
+# query and a fragment; urlunsplit silently drops a fragment, so without the
 # gate `https://auth.example.com/t#x` would derive a fragment-free .well-known
 # URL and later surface as a confusing "issuer mismatch".
 def test_metadata_url_rejects_fragment_bearing_issuer() -> None:
@@ -244,3 +245,72 @@ async def test_client_create_rejects_fragment_bearing_issuer() -> None:
             issuer="https://auth.example.com/t#x",
             fetch_settings=FetchSettings(ssrf_protection=False),
         )
+
+
+async def test_client_resource_rejects_fragment_at_construction(
+    client: AuthplaneClient,
+) -> None:
+    # Symmetric with the issuer guard on create(). Before this, the only check
+    # lived in build_prm_url, whose production caller is prm_url() — invoked
+    # while composing an RFC 9728 challenge on a 401 path — so a fragment in the
+    # configured resource turned a startup misconfiguration into a 500 emitted
+    # from the failure path.
+    with pytest.raises(ValueError, match="must not contain a fragment") as excinfo:
+        client.resource("https://api.example.com/mcp#frag")
+
+    # AuthplaneResource.__init__ gates the indicator too, so the rejection would
+    # still happen with the factory's own call deleted — just one frame deeper,
+    # pointing at the constructor rather than at the line the operator wrote.
+    # That is the whole reason the duplicate call is kept, so pin it: the raise
+    # itself is always in urls.py (validate_resource_indicator), and what this
+    # asserts is which frame invoked it.
+    # ``TracebackEntry.path`` is typed ``Path | str``, hence the round-trip.
+    #
+    # The expected filename is read off the method itself rather than written
+    # as "client.py": the claim is "the factory's own call raised", not "the
+    # factory lives in a file of that name", and hardcoding the second turns a
+    # module rename into a red test with no behaviour change — the coupling this
+    # case says it does not want. Deleting the factory's call still reddens it,
+    # because the frame then reads verifier.py.
+    factory_module = Path(AuthplaneClient.resource.__code__.co_filename).name
+    frames = [Path(str(entry.path)).name for entry in excinfo.traceback]
+    assert frames[-2] == factory_module
+
+
+async def test_authplane_resource_rejects_fragment_when_constructed_directly(
+    client: AuthplaneClient,
+) -> None:
+    # AuthplaneResource is exported from the package root, so constructing it
+    # without the factory is a supported path — and it used to skip the gate
+    # entirely, which left the guarantee above one path short of true. Same
+    # rejection, at the constructor.
+    with pytest.raises(ValueError, match="must not contain a fragment"):
+        AuthplaneResource(
+            client,
+            resource="https://api.example.com/mcp#frag",
+            scopes=[],
+            allowed_algorithms=["RS256"],
+        )
+
+
+async def test_authplane_resource_accepts_query_when_constructed_directly(
+    client: AuthplaneClient,
+) -> None:
+    # The other direction: the constructor gate must not reject what the
+    # factory accepts. A query is legal (RFC 9728 §3.1); only the fragment is not.
+    resource = AuthplaneResource(
+        client,
+        resource="https://api.example.com/mcp?tenant=a",
+        scopes=[],
+        allowed_algorithms=["RS256"],
+    )
+    # Also pins that the gate is a check, not a normalization: the constructor
+    # stores the configured string byte-for-byte, query included.
+    assert resource.resource == "https://api.example.com/mcp?tenant=a"
+
+
+async def test_client_resource_accepts_query(client: AuthplaneClient) -> None:
+    # RFC 9728 §3.1 derives over "the path and/or query components", so a query
+    # is legal on a resource indicator; only the fragment is forbidden.
+    resource = client.resource("https://api.example.com/mcp?tenant=a")
+    assert resource is not None

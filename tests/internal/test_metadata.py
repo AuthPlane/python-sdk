@@ -285,3 +285,32 @@ async def test_get_token_endpoint_missing_field() -> None:
 
     with pytest.raises(MetadataFetchError, match="token_endpoint"):
         await cache.get_token_endpoint()
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://[::1/jwks",  # urlsplit itself: "Invalid IPv6 URL"
+        "https://auth.example.com:notaport/jwks",  # port cast, at attribute access
+        "https://auth.example.com:99999/jwks",  # port out of range
+    ],
+)
+async def test_malformed_endpoint_url_raises_the_sdk_error(bad_url: str) -> None:
+    """A malformed authority in AS metadata must not escape as a bare ValueError.
+
+    This value is remote content, and the MCP adapters catch only
+    AuthplaneError — so an unwrapped urllib ValueError turns a metadata
+    rejection into an unhandled 500. Same guard as ``_split_dpop_url`` and
+    ``internal/urls.py``; this call site was the one left out of that audit.
+    """
+    metadata = dict(SAMPLE_METADATA)
+    metadata["jwks_uri"] = bad_url
+
+    class BadFetcher:
+        async def __call__(self, *_args: Any, **_kwargs: Any) -> FetchResult:
+            return FetchResult(document=metadata)
+
+    cache = MetadataCache(BadFetcher(), document_type="metadata")
+
+    with pytest.raises(MetadataFetchError):
+        await cache.get_jwks_uri()

@@ -17,6 +17,7 @@ from .internal import (
     JWKSCache,
     MetadataCache,
     build_metadata_url,
+    validate_resource_indicator,
 )
 from .net import FetchSettings
 from .net.ssrf import SSRFError
@@ -132,9 +133,10 @@ class AuthplaneClient:
                 circuit trips. Default 30s.
 
         Raises:
-            ValueError: If ``issuer`` carries a query or fragment component
-                (RFC 8414 §2 forbids both). This fails fast at construction,
-                before any network fetch.
+            InvalidIssuerError: If ``issuer`` carries a query or fragment
+                component (RFC 8414 §2 forbids both). This fails fast at
+                construction, before any network fetch. Subclasses ``ValueError``,
+                so an existing ``except ValueError`` still catches it.
         """
         client = cls()
         # Identity: the issuer is an identifier (RFC 9068 `iss`), stored verbatim
@@ -427,8 +429,32 @@ class AuthplaneClient:
         ``dpop_signing_alg_values_supported`` and
         ``dpop_bound_access_tokens_required``; omitting the argument keeps
         DPoP fields out of PRM entirely.
+
+        Raises:
+            InvalidResourceError: If *resource* carries a fragment component.
+                RFC 8707 §2 forbids one in a resource indicator. Rejected here,
+                at construction, for the same reason ``create()`` rejects a
+                malformed issuer — the alternative is surfacing it from
+                ``prm_url()`` while composing an RFC 9728 challenge, i.e. from
+                inside a 401 response path. Subclasses ``ValueError``, so an
+                existing ``except ValueError`` still catches it.
+            ValueError: If *allowed_algorithms* contains an algorithm outside
+                ``("RS256", "ES256")``. Raised by
+                :class:`~authplane.verifier.AuthplaneResource`'s constructor,
+                which this method forwards to, and propagated unchanged.
         """
         from .verifier import AuthplaneResource
+
+        # Deliberately duplicated: AuthplaneResource.__init__ runs this same
+        # gate, and it — not this call — is the authoritative one, since it also
+        # covers constructing the package-root export directly. What this call
+        # is load-bearing for is the traceback: it raises at the line the
+        # operator wrote, symmetrically with the issuer guard in create(),
+        # rather than one frame deeper in the constructor. Pinned by
+        # test_client_resource_rejects_fragment_at_construction, which asserts
+        # the invoking frame — deleting this line turns that test red rather
+        # than changing behaviour.
+        validate_resource_indicator(resource)
 
         # fail_closed is only consulted when a revocation check runs; setting
         # it without a checker means no revocation check happens at all, which
