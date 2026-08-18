@@ -70,7 +70,12 @@ def _resolve_elicitation_id_kwarg(model: type[BaseModel]) -> str:
     # with no id). The ``mcp<2`` ceiling means this branch can only be reached
     # inside mcp 1.x, so a third spelling is an unexpected schema change: fail
     # loudly rather than emit a malformed elicitation.
-    raise ImportError(
+    # RuntimeError, not ImportError: this resolver runs both at import time (where
+    # ImportError is the right shape) and lazily from
+    # ``_build_url_elicitation_params``, where the installed package imported
+    # fine and the failure is a runtime schema mismatch. ImportError from a
+    # non-import call site sends the reader looking for a missing dependency.
+    raise RuntimeError(
         f"authplane-fastmcp cannot resolve the elicitation-id field on {model.__name__!r}: "
         "none of the known spellings (elicitationId, elicitation_id) is a declared "
         "field. The installed mcp is not compatible; require mcp>=1.28.1,<2."
@@ -79,9 +84,17 @@ def _resolve_elicitation_id_kwarg(model: type[BaseModel]) -> str:
 
 # Fail fast at import: the installed mcp must expose a known elicitation-id
 # spelling. Resolution is otherwise lazy (see _build_url_elicitation_params) so
-# tests can patch the model without re-triggering this. The bare call exists
-# only for its import-time validation side effect; no name is bound.
-_resolve_elicitation_id_kwarg(ElicitRequestURLParams)
+# tests can patch the model without re-triggering this. The name below is never
+# read — it is bound only so this validation runs as an import-time side effect.
+#
+# The resolver raises RuntimeError because it is also called lazily, where the
+# package imported fine and the failure is a runtime schema mismatch. At *this*
+# call site the failure really is "the installed distribution is unusable", so
+# translate it to the shape a reader expects from a failing import.
+try:
+    _ELICITATION_ID_KWARG = _resolve_elicitation_id_kwarg(ElicitRequestURLParams)
+except RuntimeError as exc:  # pragma: no cover - exercised via importlib.reload
+    raise ImportError(str(exc)) from exc
 
 
 def _build_url_elicitation_params(

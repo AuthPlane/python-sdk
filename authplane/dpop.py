@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol, cast
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from authlib.jose import JsonWebKey, jwt
 
@@ -19,6 +19,7 @@ from .errors import (
     InvalidDPoPProofError,
 )
 from .internal.jwt import decode_jwt_header
+from .internal.urls import host_literal
 
 SUPPORTED_DPOP_ALGORITHMS = ("ES256", "RS256")
 
@@ -34,23 +35,57 @@ def _decode_jwt_header(token: str) -> dict[str, Any]:  # pyright: ignore[reportU
         raise InvalidDPoPProofError(f"DPoP proof header must be a JSON object: {exc}") from exc
 
 
+def _split_dpop_url(url: str) -> tuple[SplitResult, int | None]:
+    """Split *url* and resolve its port, mapping urllib's bare ``ValueError``s.
+
+    Two of them escape on a malformed authority: ``urlsplit`` itself rejects a
+    netloc containing ``[`` without ``]`` (``Invalid IPv6 URL``), and
+    ``SplitResult.port`` is parsed lazily, so a non-numeric or out-of-range port
+    raises at attribute access rather than at split time.
+
+    Both callers below run on attacker-controlled input — ``dpop_verification``
+    passes the proof's own ``htu`` claim through ``normalize_dpop_htu`` — and the
+    MCP adapters catch only ``AuthplaneError``, so a ``ValueError`` reaching them
+    turns a 401 into an unhandled 500. ``internal/urls.py`` guards the same
+    urllib trap on the derivation side.
+    """
+    try:
+        parsed = urlsplit(url)
+        return parsed, parsed.port
+    except ValueError as exc:
+        raise InvalidDPoPProofError(f"DPoP URL is not a valid URI, got {url!r}") from exc
+
+
 def normalize_dpop_htu(url: str) -> str:
-    """Normalize a URI for DPoP `htu` generation and comparison."""
-    parsed = urlparse(url)
+    """Normalize a URI for DPoP `htu` generation and comparison.
+
+    urlsplit, not urlparse: urlparse peels an RFC 3986 ``;params`` segment off
+    the last path segment into its own slot, and urlunparse then drops it
+    unless it is passed back. RFC 9449 §4.3 defines ``htu`` as the request URI
+    with query and fragment removed, and RFC 3986 §3.3 puts ``;params`` in the
+    path — so it has to survive. ``dpop_verification`` normalizes both the
+    request URL and the proof's ``htu`` through here before comparing them,
+    which makes this a binding check: collapsing ``/mcp;v=1`` onto ``/mcp``
+    would let a proof minted for one endpoint be accepted at the other,
+    defeating the cross-endpoint replay protection the comparison exists for.
+
+    ``internal/urls.py`` uses urlsplit for the same reason, on derivation
+    rather than binding.
+    """
+    parsed, port = _split_dpop_url(url)
     if not parsed.scheme or not parsed.hostname:
         raise InvalidDPoPProofError(f"DPoP URL must be absolute, got {url!r}")
 
     scheme = parsed.scheme.lower()
-    hostname = parsed.hostname.lower()
-    port = parsed.port
+    host = host_literal(parsed.hostname.lower())
     include_port = port is not None and not (
         (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
     )
-    netloc = f"{hostname}:{port}" if include_port and port is not None else hostname
+    netloc = f"{host}:{port}" if include_port and port is not None else host
     # DPoP binds to the target URI without query/fragment so the same resource
     # remains stable across equivalent requests.
     path = parsed.path or "/"
-    return urlunparse((scheme, netloc, path, "", "", ""))
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _public_jwk(jwk_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -292,13 +327,18 @@ class DPoPProvider:
             )
 
     def _nonce_key(self, url: str) -> str:
-        parsed = urlparse(url)
+        # Only scheme/host/port are read, so ``;params`` cannot reach the key —
+        # but urlsplit is used anyway, so the module has one parse idiom rather
+        # than a urlparse whose safety has to be argued case by case.
+        parsed, port = _split_dpop_url(url)
         if not parsed.scheme or not parsed.hostname:
             raise InvalidDPoPProofError(f"DPoP URL must be absolute, got {url!r}")
-        port = parsed.port
         if port is None:
             port = 443 if parsed.scheme.lower() == "https" else 80
-        return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}:{port}"
+        # Bracketed for the same reason as the htu above: this key is an origin
+        # string, and an unbracketed IPv6 literal makes two different origins
+        # collide as readily as it makes one unparseable.
+        return f"{parsed.scheme.lower()}://{host_literal(parsed.hostname.lower())}:{port}"
 
     def note_nonce(self, url: str, nonce: str) -> None:
         """Store a server-provided DPoP-Nonce for the given URL's origin."""

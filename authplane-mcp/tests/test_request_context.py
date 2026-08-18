@@ -10,7 +10,9 @@ verifier relies on doesn't silently regress.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import warnings
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from mcp.server.fastmcp import FastMCP
@@ -26,6 +28,7 @@ from authplane_mcp import (
 from authplane_mcp._request_context import (
     _current_request,  # pyright: ignore[reportPrivateUsage]
 )
+from authplane_mcp.verifier import AuthplaneTokenVerifier
 
 
 def test_get_current_request_outside_scope_raises() -> None:
@@ -199,3 +202,114 @@ def test_install_request_context_is_idempotent() -> None:
     app = mcp.streamable_http_app()
     middleware_classes = [m.cls for m in app.user_middleware]
     assert middleware_classes.count(AuthplaneRequestContextMiddleware) == 1
+
+
+# ---------------------------------------------------------------------------
+# install_request_context — verbatim-PRM detection (three distinct states)
+# ---------------------------------------------------------------------------
+
+
+def _stub_verifier(**kwargs: Any) -> AuthplaneTokenVerifier:
+    resource = SimpleNamespace(resource="https://api.example.com/mcp")
+    return AuthplaneTokenVerifier(cast("Any", resource), **kwargs)
+
+
+def test_no_warning_when_server_has_no_auth() -> None:
+    """A FastMCP with no auth configured has nothing to rewrite.
+
+    ``_token_verifier`` exists on the instance and is ``None``. The old code
+    branched on ``is None`` alone and warned here, telling the operator the MCP
+    SDK had renamed a private attribute — which is not what happened.
+    """
+    mcp: FastMCP[Any] = FastMCP("test")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        install_request_context(mcp)
+
+
+def test_warns_when_verifier_carries_no_verbatim_identifiers() -> None:
+    """The regression the warning exists to catch, on the path it used to miss.
+
+    ``AuthplaneTokenVerifier(verifier)`` is a supported public constructor and
+    leaves both verbatim identifiers unset. The verifier *is* present, so the
+    old ``is None`` check stayed quiet while the served PRM kept advertising the
+    slash-normalized identifiers this SDK's own comparison rejects.
+    """
+    mcp: FastMCP[Any] = FastMCP("test")
+    mcp._token_verifier = _stub_verifier()  # type: ignore[attr-defined]
+    with pytest.warns(RuntimeWarning, match="no verbatim issuer/resource"):
+        install_request_context(mcp)
+
+
+def test_no_warning_when_verbatim_identifiers_are_present() -> None:
+    mcp: FastMCP[Any] = FastMCP("test")
+    mcp._token_verifier = _stub_verifier(  # type: ignore[attr-defined]
+        verbatim_issuer="https://auth.example.com",
+        verbatim_resource="https://api.example.com/mcp",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        install_request_context(mcp)
+
+
+def test_warns_about_a_renamed_sdk_attribute_only_when_absent() -> None:
+    """The 'SDK renamed the attribute' wording is reserved for that case."""
+    mcp: FastMCP[Any] = FastMCP("test")
+    # ``_token_verifier`` is set on the instance by FastMCP.__init__; deleting it
+    # is the closest stand-in for an upstream rename, which is the only thing
+    # that should produce this wording.
+    del mcp._token_verifier  # type: ignore[attr-defined]
+    assert not hasattr(mcp, "_token_verifier")
+    with pytest.warns(RuntimeWarning, match="renamed the private attribute"):
+        install_request_context(mcp)
+
+
+def test_verbatim_identifiers_accessor() -> None:
+    assert _stub_verifier().verbatim_identifiers() is None
+    assert _stub_verifier(verbatim_issuer="https://a").verbatim_identifiers() is None
+    assert _stub_verifier(
+        verbatim_issuer="https://a", verbatim_resource="https://b"
+    ).verbatim_identifiers() == ("https://a", "https://b")
+
+
+def test_install_tolerates_a_server_without_sse_app() -> None:
+    """A future 1.x that drops ``sse_app`` must not break streamable-HTTP servers.
+
+    Everything else in ``install_request_context`` is defensive (``getattr`` for
+    ``_token_verifier``, ``*args``/``**kwargs`` forwarding); the ``sse_app``
+    lookup was the one bare attribute access, and SSE is not on the
+    streamable-HTTP path at all.
+    """
+    mcp: FastMCP[Any] = FastMCP("test")
+    # Save and restore rather than reload: `from ... import FastMCP` bound this
+    # module's name to the original class object, so importlib.reload would build
+    # a *new* class and leave this one permanently mutated for later tests.
+    original = FastMCP.sse_app
+    del FastMCP.sse_app  # type: ignore[attr-defined]
+    try:
+        install_request_context(mcp)
+        app = mcp.streamable_http_app()
+        assert app.user_middleware[0].cls is AuthplaneRequestContextMiddleware
+    finally:
+        FastMCP.sse_app = original  # type: ignore[attr-defined]
+
+
+def test_install_wraps_sse_app_when_present() -> None:
+    """The present branch had no coverage at all.
+
+    Only the absent-`sse_app` case was pinned, so `mcp.sse_app = sse_app` could
+    have been deleted outright and every suite stayed green — on a line that had
+    just been moved inside a conditional.
+
+    Asserted on the instance dict, not by comparing the attribute to a value
+    captured earlier: attribute access on a method builds a fresh bound object
+    each time, so an identity check passes whether or not the assignment
+    happened. The instance dict gains the key only when it does.
+    """
+    mcp: FastMCP[Any] = FastMCP("test")
+    assert "sse_app" not in vars(mcp)
+
+    install_request_context(mcp)
+
+    assert "sse_app" in vars(mcp)
+    assert vars(mcp)["sse_app"].__name__ == "sse_app"

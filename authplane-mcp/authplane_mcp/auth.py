@@ -84,7 +84,9 @@ def install_request_context(mcp: FastMCP) -> None:
     Wraps ``mcp.streamable_http_app`` so the Starlette app it returns is
     post-processed with two Authplane concerns before it starts serving.
     ``mcp.sse_app`` is wrapped with the second concern only — the SSE branch
-    applies just the verbatim-PRM rewrite, not the request-context middleware:
+    applies just the verbatim-PRM rewrite, not the request-context middleware —
+    and only when the attribute exists, since SSE is not on the streamable-HTTP
+    path and a future 1.x could drop it:
 
     1. **Request context (DPoP).** :class:`AuthplaneRequestContextMiddleware`
        is installed before MCP's ``AuthenticationMiddleware`` (streamable-HTTP
@@ -141,16 +143,29 @@ def install_request_context(mcp: FastMCP) -> None:
         return
 
     # The verbatim identifiers ride on the AuthplaneTokenVerifier that
-    # ``authplane_mcp_auth`` stashed on the server. If a server was wired
-    # without the factory (no verbatim identifiers available), the PRM rewrite
-    # is skipped and the request-context middleware is still installed.
+    # ``authplane_mcp_auth`` stashed on the server. Four states are possible
+    # here — collapsing them onto "is the attribute None?" both misses the
+    # regression this warning exists to catch and fires spuriously on a server
+    # that simply has no auth:
+    #
+    #   1. ``_token_verifier`` missing *as an attribute* — the MCP SDK renamed
+    #      its private attribute. The rewrite would silently no-op forever.
+    #   2. present but ``None`` — the server has no auth configured at all.
+    #      Nothing to rewrite and nothing wrong; stay quiet.
+    #   3. present, but built without ``authplane_mcp_auth`` — a supported
+    #      public constructor (``AuthplaneTokenVerifier(verifier)``) carries no
+    #      verbatim identifiers. This is the case that used to pass unnoticed:
+    #      a verifier *is* present, so no warning fired, and the served PRM kept
+    #      advertising the slash-normalized identifiers that this SDK's own
+    #      byte-for-byte comparison rejects.
+    #   4. present, non-None, but not an AuthplaneTokenVerifier — someone else's
+    #      verifier. Nothing to rewrite and the byte-for-byte comparison is not
+    #      in play, so stay quiet, same as (2).
+    has_attr = hasattr(mcp, "_token_verifier")
     token_verifier = getattr(mcp, "_token_verifier", None)
-    if token_verifier is None:
-        # ``_token_verifier`` is an MCP SDK private attribute. If a future SDK
-        # release renames it, this lookup returns None and the verbatim PRM
-        # rewrite would quietly no-op, reverting the served document to the
-        # slash-normalized identifiers that break the strict comparison. Surface
-        # that loudly rather than silently regressing.
+    verbatim: tuple[str, str] | None = None
+
+    if not has_attr:
         warnings.warn(
             "FastMCP._token_verifier is absent; skipping the verbatim PRM "
             "rewrite. The served Protected Resource Metadata will advertise "
@@ -160,15 +175,27 @@ def install_request_context(mcp: FastMCP) -> None:
             RuntimeWarning,
             stacklevel=2,
         )
-    verbatim_issuer = getattr(token_verifier, "_verbatim_issuer", None)
-    verbatim_resource = getattr(token_verifier, "_verbatim_resource", None)
+    elif isinstance(token_verifier, AuthplaneTokenVerifier):
+        verbatim = token_verifier.verbatim_identifiers()
+        if verbatim is None:
+            warnings.warn(
+                "AuthplaneTokenVerifier carries no verbatim issuer/resource; "
+                "skipping the verbatim PRM rewrite. The served Protected "
+                "Resource Metadata will advertise slash-normalized identifiers, "
+                "which the core SDK's byte-for-byte comparison rejects. Build "
+                "the server with authplane_mcp_auth(...) so the operator's "
+                "identifiers reach the served document.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def rewrite_prm(app: Starlette) -> None:
-        if verbatim_issuer is not None and verbatim_resource is not None:
+        if verbatim is not None:
+            issuer, resource = verbatim
             rewrite_prm_routes_verbatim(
                 app.router.routes,
-                issuer=verbatim_issuer,
-                resource=verbatim_resource,
+                issuer=issuer,
+                resource=resource,
             )
 
     original_streamable_http_app = mcp.streamable_http_app
@@ -183,15 +210,12 @@ def install_request_context(mcp: FastMCP) -> None:
         rewrite_prm(app)
         return app
 
-    original_sse_app = mcp.sse_app
-
-    def sse_app(*args: Any, **kwargs: Any) -> Starlette:
-        # Forward whatever positional/keyword args the SDK passes so a future
-        # signature change in ``sse_app`` cannot TypeError at app-build time;
-        # only the verbatim PRM rewrite below is ours.
-        app = original_sse_app(*args, **kwargs)
-        rewrite_prm(app)
-        return app
+    # Guarded like the ``_token_verifier`` lookup above rather than accessed
+    # directly: ``sse_app`` is not part of the streamable-HTTP path, so a future
+    # 1.x that drops it would otherwise take down servers that never touch SSE
+    # at import of this helper. Everything else in this function is defensive;
+    # this was the one bare attribute access.
+    original_sse_app = getattr(mcp, "sse_app", None)
 
     # Fragility: instance-attribute assignment works only because FastMCP
     # exposes ``streamable_http_app`` / ``sse_app`` as plain methods, not
@@ -201,7 +225,23 @@ def install_request_context(mcp: FastMCP) -> None:
     # Track https://github.com/modelcontextprotocol/python-sdk for a public
     # subclassing hook or per-app middleware API and migrate to it when available.
     mcp.streamable_http_app = streamable_http_app
-    mcp.sse_app = sse_app
+
+    # Defined inside the guard rather than above it with an ``assert``: the
+    # neighbouring module states the convention ("guard explicitly rather than
+    # asserting, since ``assert`` is stripped under ``python -O``"), and closing
+    # over a name the type checker already knows is non-None needs neither.
+    if original_sse_app is not None:
+
+        def sse_app(*args: Any, **kwargs: Any) -> Starlette:
+            # Forward whatever positional/keyword args the SDK passes so a
+            # future signature change in ``sse_app`` cannot TypeError at
+            # app-build time; only the verbatim PRM rewrite below is ours.
+            app = original_sse_app(*args, **kwargs)
+            rewrite_prm(app)
+            return app
+
+        mcp.sse_app = sse_app
+
     setattr(mcp, _INSTALLED_FLAG, True)
 
 

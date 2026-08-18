@@ -20,14 +20,14 @@ from authplane import (
 from authplane.oauth import TokenExchangeOptions, TokenResponse
 from fastmcp.server.auth import RemoteAuthProvider
 from pydantic import AnyHttpUrl
-from starlette.routing import Route
+from starlette.routing import BaseRoute
 
 from ._prm import rewrite_prm_routes_verbatim
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
 
 
-class _VerbatimPRMRemoteAuthProvider(RemoteAuthProvider):
+class VerbatimPRMRemoteAuthProvider(RemoteAuthProvider):
     """``RemoteAuthProvider`` that advertises identifiers verbatim in the PRM.
 
     Upstream builds the Protected Resource Metadata document from
@@ -51,7 +51,7 @@ class _VerbatimPRMRemoteAuthProvider(RemoteAuthProvider):
         self._verbatim_issuer = verbatim_issuer
         self._verbatim_resource = verbatim_resource
 
-    def get_routes(self, *args: Any, **kwargs: Any) -> list[Route]:
+    def get_routes(self, *args: Any, **kwargs: Any) -> list[BaseRoute]:
         # Forward whatever positional/keyword args the framework passes so a
         # future signature change in the base ``get_routes`` cannot TypeError
         # at app-build time; only the verbatim PRM rewrite below is ours.
@@ -62,6 +62,18 @@ class _VerbatimPRMRemoteAuthProvider(RemoteAuthProvider):
             resource=self._verbatim_resource,
         )
         return routes
+
+
+def _derive_resource_url(base_url: str, mcp_path: str) -> str:
+    """Compose the canonical resource identifier (= JWT audience) from the mount.
+
+    This must match exactly what ``RemoteAuthProvider`` advertises in the PRM,
+    which FastMCP computes as ``base_url`` joined with the transport mount path
+    via ``_get_resource_url()``. That agreement is pinned directly against
+    upstream's function by ``test_derive_resource_url_matches_fastmcp``, so it
+    is checked rather than only asserted here.
+    """
+    return base_url.rstrip("/") + "/" + mcp_path.lstrip("/")
 
 
 def _wrap_client_for_elicitation(client: AuthplaneClient) -> AuthplaneClient:
@@ -227,7 +239,15 @@ async def authplane_auth(
         mcp_path: Mount path of the MCP endpoint (default ``"/mcp"``).
             The JWT audience (resource) is derived as
             ``base_url + mcp_path``. Only set this if you changed
-            FastMCP's default HTTP mount path.
+            FastMCP's default HTTP mount path. Pass a real mount path — an
+            empty string is not one. Against a ``base_url`` that carries a
+            path, ``""`` derives an identifier FastMCP does not serve:
+            upstream short-circuits a falsy path and returns the base URL
+            untouched, while this join appends a slash. Accepted rather than
+            rejected, since raising would be a behaviour change to a public
+            factory for an input nothing passes; the divergence itself is
+            pinned by
+            ``test_derive_resource_url_diverges_from_fastmcp_on_an_empty_mount_path``.
         as_credentials: Client credentials for authenticating to the AS.
             Shared by introspection (RFC 7662) and token exchange (RFC 8693).
             Required when using ``IntrospectionRevocation`` for authenticated
@@ -270,10 +290,7 @@ async def authplane_auth(
     """
     resolved_scopes = scopes or []
 
-    # Derive the canonical resource URL (= JWT audience) from base_url + mcp_path.
-    # This must match exactly what RemoteAuthProvider advertises in the PRM, which
-    # FastMCP computes as base_url + mcp_path via _get_resource_url().
-    resource = base_url.rstrip("/") + "/" + mcp_path.lstrip("/")
+    resource = _derive_resource_url(base_url, mcp_path)
 
     # Prepare client-level kwargs, filtering out None to use SDK defaults
     client_kwargs_raw: dict[str, Any] = {
@@ -332,11 +349,11 @@ async def authplane_auth(
     # upstream framework requires the URL type internally. That construction
     # normalizes an empty-path authority with a trailing slash, so the served
     # PRM would otherwise advertise ``https://auth.example.com/`` for an issuer
-    # configured as ``https://auth.example.com``. ``_VerbatimPRMRemoteAuthProvider``
+    # configured as ``https://auth.example.com``. ``VerbatimPRMRemoteAuthProvider``
     # rewrites the served ``authorization_servers`` / ``resource`` back to the
     # verbatim configured strings so they match the core SDK's byte-for-byte
     # comparison (RFC 8414 §3.3, RFC 9728 §3.3).
-    auth_provider = _VerbatimPRMRemoteAuthProvider(
+    auth_provider = VerbatimPRMRemoteAuthProvider(
         token_verifier=token_verifier,
         authorization_servers=[AnyHttpUrl(issuer)],
         base_url=AnyHttpUrl(base_url),

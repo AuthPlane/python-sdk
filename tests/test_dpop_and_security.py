@@ -26,6 +26,7 @@ from authplane.errors import (
     MetadataFetchError,
     MissingMetadataEndpointError,
     ProtocolError,
+    www_authenticate,
 )
 from authplane.internal.document_cache import JWKSCache
 from authplane.internal.fetch_result import FetchResult
@@ -280,6 +281,142 @@ async def test_verify_dpop_proof_method_mismatch(dpop_provider: DPoPProvider) ->
             access_token="access-token",
             expected_jkt=dpop_provider.key_material.thumbprint,
         )
+
+
+async def test_verify_dpop_proof_rejects_wrong_nonce_under_policy(
+    dpop_provider: DPoPProvider,
+) -> None:
+    """``expected_nonce`` had no test at all outside the conformance suite.
+
+    The parameter has been on ``verify_dpop_proof`` all along, and nothing in
+    the unit suite exercised it — so the resource-server nonce policy (RFC 9449
+    §9, not the §8 AS-provided nonce) could have been deleted without anything
+    here going red.
+    """
+    proof = dpop_provider.build_proof(
+        "GET", "https://api.example.com/resource", access_token="access-token", nonce="stale"
+    )
+
+    with pytest.raises(InvalidDPoPProofError, match="nonce mismatch") as excinfo:
+        await verify_dpop_proof(
+            proof,
+            method="GET",
+            url="https://api.example.com/resource",
+            replay_store=MemoryReplayStore(),
+            access_token="access-token",
+            expected_jkt=dpop_provider.key_material.thumbprint,
+            expected_nonce="server-nonce-abc",
+        )
+    # The rejection reaches an unauthenticated caller via error_description in
+    # the WWW-Authenticate challenge, so it must not echo the nonce the server
+    # is expecting — that would supply a valid nonce without the round trip.
+    assert "server-nonce-abc" not in www_authenticate(excinfo.value)
+    assert "stale" not in str(excinfo.value)
+
+
+async def test_verify_dpop_proof_rejects_missing_nonce_under_policy(
+    dpop_provider: DPoPProvider,
+) -> None:
+    """An omitted nonce claim is as much a policy violation as a wrong one."""
+    proof = dpop_provider.build_proof(
+        "GET", "https://api.example.com/resource", access_token="access-token"
+    )
+
+    with pytest.raises(InvalidDPoPProofError, match="nonce mismatch"):
+        await verify_dpop_proof(
+            proof,
+            method="GET",
+            url="https://api.example.com/resource",
+            replay_store=MemoryReplayStore(),
+            access_token="access-token",
+            expected_jkt=dpop_provider.key_material.thumbprint,
+            expected_nonce="server-nonce-abc",
+        )
+
+
+async def test_verify_dpop_proof_without_policy_ignores_the_nonce_claim(
+    dpop_provider: DPoPProvider,
+) -> None:
+    """No configured policy means no nonce requirement.
+
+    The guard is ``if expected_nonce:``, so a caller that never opts in must
+    not start rejecting proofs that happen to carry a nonce — the AS-issued
+    one, for instance, on a token the resource server is merely verifying.
+    """
+    proof = dpop_provider.build_proof(
+        "GET",
+        "https://api.example.com/resource",
+        access_token="access-token",
+        nonce="as-issued-nonce",
+    )
+
+    verified = await verify_dpop_proof(
+        proof,
+        method="GET",
+        url="https://api.example.com/resource",
+        replay_store=MemoryReplayStore(),
+        access_token="access-token",
+        expected_jkt=dpop_provider.key_material.thumbprint,
+    )
+    assert verified.raw["nonce"] == "as-issued-nonce"
+
+
+async def test_verify_dpop_proof_rejects_params_segment_endpoint_swap(
+    dpop_provider: DPoPProvider,
+) -> None:
+    """A proof minted for ``/mcp;v=1`` must not be accepted at ``/mcp``.
+
+    RFC 3986 §3.3 puts a ``;params`` segment in the path, and RFC 9449 §4.3
+    strips only query and fragment from ``htu`` — so these are two distinct
+    endpoints. ``normalize_dpop_htu`` ran urlparse/urlunparse with an empty
+    params slot, which collapsed them onto one ``htu``. Since verification
+    normalizes both sides through it, the URI-binding comparison silently
+    passed across that pair and a proof for one endpoint was replayable at the
+    other. This is the binding half of the collapse; the derivation half is
+    covered by ``TestParamsSegmentIsNotCollapsed`` in tests/internal/test_urls.py.
+    """
+    replay_store = MemoryReplayStore()
+    proof = dpop_provider.build_proof(
+        "GET", "https://api.example.com/mcp;v=1", access_token="access-token"
+    )
+
+    with pytest.raises(InvalidDPoPProofError, match="URL mismatch"):
+        await verify_dpop_proof(
+            proof,
+            method="GET",
+            url="https://api.example.com/mcp",
+            replay_store=replay_store,
+            access_token="access-token",
+            expected_jkt=dpop_provider.key_material.thumbprint,
+        )
+
+
+async def test_verify_dpop_proof_accepts_the_same_params_segment(
+    dpop_provider: DPoPProvider,
+) -> None:
+    """The other direction: keeping the segment must not break the honest case.
+
+    A stricter normalizer that rejected ``/mcp;v=1`` against itself would pass
+    the test above for the wrong reason.
+    """
+    replay_store = MemoryReplayStore()
+    proof = dpop_provider.build_proof(
+        "GET", "https://api.example.com/mcp;v=1", access_token="access-token"
+    )
+
+    verified = await verify_dpop_proof(
+        proof,
+        method="GET",
+        url="https://api.example.com/mcp;v=1",
+        replay_store=replay_store,
+        access_token="access-token",
+        expected_jkt=dpop_provider.key_material.thumbprint,
+    )
+    # ``VerifiedDPoPProof.htu`` is the raw claim, so this asserts the *outbound*
+    # side: build_proof minted an htu carrying the segment. The inbound
+    # comparison is what the successful return above proves.
+    assert verified.htu == "https://api.example.com/mcp;v=1"
+    assert verified.key_thumbprint == dpop_provider.key_material.thumbprint
 
 
 async def test_verify_dpop_proof_rejects_expired_exp_claim(dpop_provider: DPoPProvider) -> None:
@@ -573,3 +710,13 @@ async def test_mode3_not_configured_does_not_allocate_replay_store(
     # Internal attribute: confirms the load-bearing optimisation that nothing is
     # allocated when DPoP is not in use.
     assert verifier._dpop_replay_store is None  # type: ignore[reportPrivateUsage]
+
+
+def test_nonce_key_maps_a_malformed_authority_to_the_sdk_error(
+    dpop_provider: DPoPProvider,
+) -> None:
+    # The outbound half of the same urllib trap: ``.port`` is parsed lazily, so
+    # a bare ValueError would escape note_nonce/current_nonce instead of the
+    # AuthplaneError the caller catches.
+    with pytest.raises(InvalidDPoPProofError):
+        dpop_provider.note_nonce("https://auth.example.com:abc/oauth/token", "nonce-123")

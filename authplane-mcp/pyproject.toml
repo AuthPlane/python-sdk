@@ -29,7 +29,11 @@ dependencies = [
     # Floor is 1.28.1: mcp <=1.28.0 carries PYSEC-2026-3483, fixed in 1.28.1.
     # This adapter targets the mcp 1.x server API (`mcp.server.fastmcp.FastMCP`)
     # and the camelCase URL-elicitation field (`ElicitRequestURLParams(
-    # elicitationId=...)`), both of which hold through the 1.x line. The upper
+    # elicitationId=...)`), both of which hold through the 1.x line. (An earlier
+    # ceiling here was justified by "1.28 renamed it to snake_case
+    # `elicitation_id`" — that was wrong: the rename lands in 2.0, not 1.28.
+    # Noted so the next reader does not re-derive the same doubt. The dynamic
+    # resolver in url_elicitation.py makes the spelling moot either way.) The upper
     # bound excludes mcp 2.0, which removes `mcp.server.fastmcp` and renames the
     # field to snake_case `elicitation_id`; supporting it is a separate port.
     "mcp>=1.28.1,<2",

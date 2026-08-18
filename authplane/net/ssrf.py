@@ -9,10 +9,11 @@ This module provides SSRF-protected HTTP fetching with:
 import json
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
+from ..internal.urls import host_literal
 from .ip_validation import SSRFError, format_ip_for_url, is_ip_allowed, resolve_hostname
 
 
@@ -25,6 +26,11 @@ class ValidatedURL:
     port: int
     path: str
     resolved_ips: list[str]
+    # Appended rather than inserted: this is a frozen dataclass, and adding a
+    # required field mid-list silently breaks positional construction for anyone
+    # importing it directly. Low blast radius — it is in no `__all__` and is not
+    # re-exported — but the position costs nothing.
+    scheme: str = "https"
 
 
 @dataclass(frozen=True)
@@ -61,8 +67,21 @@ async def validate_url(
     Raises:
         SSRFError: If URL is invalid or resolves to blocked IPs
     """
+    # urlsplit, not urlparse: urlparse peels an RFC 3986 ``;params`` segment off
+    # the last path segment into its own slot, and ``ValidatedURL.path`` is what
+    # the pinned request URL is rebuilt from below — so a urlparse here issues
+    # the request to ``/token`` when the caller asked for ``/token;v=1``. That
+    # silently retargets the request, undoes the ``;params``-preserving
+    # derivation in ``internal/urls.py`` before it reaches the wire, and puts the
+    # outbound DPoP proof's ``htu`` (built from the caller's URL in ``net/http``)
+    # out of sync with the request line the AS actually sees.
+    #
+    # ``.port`` is resolved inside the guard because it is parsed lazily and
+    # raises on a non-numeric or out-of-range port, which would escape this
+    # function as a bare ValueError rather than an SSRFError.
     try:
-        parsed = urlparse(url)
+        parsed = urlsplit(url)
+        parsed_port = parsed.port
     except (ValueError, AttributeError) as e:
         raise SSRFError(f"Invalid URL: {e}") from e
 
@@ -78,7 +97,7 @@ async def validate_url(
         raise SSRFError("URL must have a host")
 
     hostname = parsed.hostname or parsed.netloc
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    port = parsed_port or (443 if parsed.scheme == "https" else 80)
 
     # Resolve and validate IPs
     resolved_ips = await resolve_hostname(hostname, port)
@@ -100,6 +119,17 @@ async def validate_url(
 
     return ValidatedURL(
         original_url=url,
+        # The parsed scheme, already lowercased by urlsplit. Carried rather than
+        # recovered downstream: rebuilding it with `url.startswith("https://")`
+        # meant an uppercase `HTTPS://` passed the HTTPS-only gate above — which
+        # compares against the normalized scheme — and was then assembled as
+        # `http://`, putting the bytes on the wire in the clear. The port stays
+        # 443 so the request fails rather than silently downgrading, but the
+        # bytes leave unencrypted either way, and in `form_post` they carry the
+        # auth headers. Reachable from AS metadata: `jwks_uri`,
+        # `token_endpoint` and `introspection_endpoint` are validated against
+        # the lowercased scheme and reach the fetch verbatim.
+        scheme=parsed.scheme,
         hostname=hostname,
         port=port,
         path=parsed.path + ("?" + parsed.query if parsed.query else ""),
@@ -135,8 +165,8 @@ async def _execute_pinned_request(
         # reconstruction of the request URI from Host + path. IPv6 literals are
         # bracketed per RFC 3986 §3.2.2.
         default_port = 443 if scheme == "https" else 80
-        host_literal = f"[{hostname}]" if ":" in hostname else hostname
-        headers["Host"] = host_literal if port == default_port else f"{host_literal}:{port}"
+        literal = host_literal(hostname)
+        headers["Host"] = literal if port == default_port else f"{literal}:{port}"
         headers["Accept"] = "application/json"
 
         stream_kwargs: dict[str, Any] = {
@@ -245,7 +275,7 @@ async def _ssrf_safe_request(
     last_error: Exception | None = None
 
     for pinned_ip in validated.resolved_ips:
-        scheme = "https" if url.startswith("https://") else "http"
+        scheme = validated.scheme
         pinned_url = f"{scheme}://{format_ip_for_url(pinned_ip)}:{validated.port}{validated.path}"
 
         try:

@@ -24,6 +24,10 @@ import authplane_fastmcp.url_elicitation as url_elicitation
 from authplane_fastmcp.auth import (
     _wrap_client_for_elicitation,  # pyright: ignore[reportPrivateUsage]
 )
+from authplane_fastmcp.url_elicitation import (
+    _resolve_elicitation_id_kwarg,  # pyright: ignore[reportPrivateUsage]
+    to_url_elicitation_required_error,
+)
 
 _OPTIONS = TokenExchangeOptions(subject_token="test")
 
@@ -42,7 +46,7 @@ def test_returns_url_elicitation_for_consent_with_url() -> None:
         status_code=400,
     )
 
-    mapped = url_elicitation.to_url_elicitation_required_error(error)
+    mapped = to_url_elicitation_required_error(error)
 
     assert isinstance(mapped, UrlElicitationRequiredError)
     assert mapped.error.code == URL_ELICITATION_REQUIRED
@@ -57,7 +61,7 @@ def test_returns_url_elicitation_for_consent_with_url() -> None:
 
 def test_returns_none_for_non_consent_error() -> None:
     assert (
-        url_elicitation.to_url_elicitation_required_error(
+        to_url_elicitation_required_error(
             AuthError("bad request", code="invalid_request", status_code=400)
         )
         is None
@@ -71,7 +75,7 @@ def test_returns_none_for_consent_without_url() -> None:
         cause_detail="missing_user_consent",
         consent_url=None,
     )
-    assert url_elicitation.to_url_elicitation_required_error(error) is None
+    assert to_url_elicitation_required_error(error) is None
 
 
 def test_url_elicitation_builds_valid_params_under_installed_mcp() -> None:
@@ -86,7 +90,7 @@ def test_url_elicitation_builds_valid_params_under_installed_mcp() -> None:
         status_code=400,
     )
 
-    mapped = url_elicitation.to_url_elicitation_required_error(error)
+    mapped = to_url_elicitation_required_error(error)
 
     assert isinstance(mapped, UrlElicitationRequiredError)
     assert mapped.error.data is not None
@@ -116,12 +120,7 @@ def test_schema_lookup_picks_snake_case_after_rename() -> None:
     # The positive schema lookup resolves the constructor kwarg from the model
     # itself, so a rename to ``elicitation_id`` is picked up rather than the
     # camelCase kwarg silently landing in ``__pydantic_extra__``.
-    assert (
-        url_elicitation._resolve_elicitation_id_kwarg(  # pyright: ignore[reportPrivateUsage]
-            _StubRenamedElicit
-        )
-        == "elicitation_id"
-    )
+    assert _resolve_elicitation_id_kwarg(_StubRenamedElicit) == "elicitation_id"
 
 
 class _NoElicitId(BaseModel):
@@ -136,10 +135,13 @@ def test_resolver_raises_when_no_known_spelling() -> None:
     # With ``extra="allow"``, returning a default kwarg for a model that declares
     # neither spelling would land it silently in ``__pydantic_extra__`` (a -32042
     # with no id). The resolver must instead raise, naming the unrecognized model.
-    with pytest.raises(ImportError, match="cannot resolve the elicitation-id field"):
-        url_elicitation._resolve_elicitation_id_kwarg(  # pyright: ignore[reportPrivateUsage]
-            _NoElicitId
-        )
+    #
+    # RuntimeError, not ImportError: called directly like this — as
+    # _build_url_elicitation_params does — the package imported fine and the
+    # failure is a runtime schema mismatch. The import-time call site translates
+    # it to ImportError, which the next test pins.
+    with pytest.raises(RuntimeError, match="cannot resolve the elicitation-id field"):
+        _resolve_elicitation_id_kwarg(_NoElicitId)
 
 
 def test_import_raises_when_model_lacks_known_spelling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -181,7 +183,7 @@ def test_rename_path_still_yields_minus_32042_with_id(monkeypatch: pytest.Monkey
         status_code=400,
     )
 
-    mapped = url_elicitation.to_url_elicitation_required_error(error)
+    mapped = to_url_elicitation_required_error(error)
 
     assert isinstance(mapped, UrlElicitationRequiredError)
     assert mapped.error.code == URL_ELICITATION_REQUIRED

@@ -245,10 +245,11 @@ This uses the RFC 7662 introspection endpoint after local JWT verification.
 
 Important behavior:
 
-- by default it is **fail-open**: if introspection fails, the token is accepted
+- by default it is **fail-open**: if introspection fails, the token is accepted and a warning is logged on every `verify()`
 - set `fail_closed=True` to reject tokens when the revocation check fails
 - the client must have AS credentials configured
 - the AS metadata must expose `introspection_endpoint`
+- `fail_closed` has no effect when `revocation_checker` is `None` — there is no check to fail. The SDK logs a warning at resource construction if you set one without the other, so the no-op configuration is visible rather than silent.
 
 ```python
 # Fail-closed: reject tokens when introspection is unavailable
@@ -557,6 +558,13 @@ Common meanings:
 - `MetadataFetchError`: AS metadata unavailable or invalid
 - `JWKSFetchError`: JWKS unavailable
 - `MissingMetadataEndpointError`: required discovered endpoint missing
+- `InvalidIssuerError`: the configured issuer carries a query or fragment component (RFC 8414 §2). Raised from `AuthplaneClient.create()`, at construction, before any network fetch. Subclasses `ValueError` as well as `AuthplaneError`, so an existing `except ValueError` still catches it
+- `InvalidResourceError`: the configured resource indicator carries a fragment component (RFC 8707 §2). Raised at construction, from three call sites, of which one is authoritative:
+  - `AuthplaneResource.__init__` — the authoritative gate. Every construction path reaches it, including direct construction of the package-root export, so `AuthplaneResource(...)` built by hand raises here too.
+  - `AuthplaneClient.resource()` — redundant for the guarantee, kept for the traceback: it raises at the line the operator wrote rather than one frame deeper in the constructor.
+  - `build_prm_url()` — a defensive backstop only. Its production caller is `AuthplaneResource.prm_url()`, which operators invoke inside a 401 response path, so validating *only* there turned a configuration error into a 500 on the failure path.
+
+  Subclasses `ValueError` as well as `AuthplaneError`, on the same terms as `InvalidIssuerError`
 - `ProtocolError`: malformed successful OAuth response
 - `VerifierRuntimeError`: unexpected verifier or DPoP validation runtime failure
 - `InsufficientScopeError`: authorization failure, typically HTTP 403

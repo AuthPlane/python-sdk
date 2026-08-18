@@ -48,6 +48,40 @@ asyncio.run(main())
 
 `authplane_auth()` holds background JWKS and metadata refresh tasks; call `aclose()` on the returned `client` during server shutdown.
 
+## Hand-rolling the auth provider
+
+`authplane_auth()` returns a `VerbatimPRMRemoteAuthProvider`, a `RemoteAuthProvider`
+subclass that serves the Protected Resource Metadata identifiers byte-for-byte.
+It matters: upstream builds the PRM from `pydantic.AnyHttpUrl` fields, which append
+a trailing slash to an empty-path authority, and the core SDK compares identifiers
+verbatim — so a client that follows the advertised value literally is rejected.
+
+If you build a `RemoteAuthProvider` yourself instead of calling `authplane_auth()`
+— a documented FastMCP pattern — use the subclass rather than the base class:
+
+```python
+from authplane_fastmcp import VerbatimPRMRemoteAuthProvider
+from pydantic import AnyHttpUrl
+
+provider = VerbatimPRMRemoteAuthProvider(
+    token_verifier=token_verifier,
+    authorization_servers=[AnyHttpUrl(issuer)],
+    base_url=AnyHttpUrl(base_url),
+    scopes_supported=scopes,
+    # The two that make it verbatim. Pass the identifiers exactly as configured,
+    # not the AnyHttpUrl forms above — that is the whole point: those normalize.
+    verbatim_issuer=issuer,
+    verbatim_resource=resource,
+)
+```
+
+`base_url` is the server's base URL and `verbatim_resource` is the full resource
+identifier; they are not the same value when the MCP server is mounted under a
+path.
+
+If you cannot subclass, `rewrite_prm_routes_verbatim(routes, issuer=..., resource=...)`
+is exported as a supported hook — apply it to the route list your provider returns.
+
 ## Documentation
 
 PRM behavior, dev mode, revocation checking, manual setup, scope enforcement semantics, claim access, the full `authplane_auth` / `AuthplaneTokenVerifier` API, and error handling: **[User Guide](https://github.com/AuthPlane/python-sdk/blob/main/authplane-fastmcp/docs/user-guide.md)**.
