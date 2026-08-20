@@ -78,8 +78,14 @@ class TestResourceIndicatorValidation:
     def test_validate_does_not_echo_credentials(self) -> None:
         with pytest.raises(ValueError) as exc:
             validate_resource_indicator("https://svc:s3cr3t@api.example.com/mcp#frag")
-        assert "s3cr3t" not in str(exc.value)
-        assert "api.example.com" in str(exc.value)
+        message = str(exc.value)
+        assert "s3cr3t" not in message
+        # Compare the echoed identifier whole rather than asking whether the host
+        # appears somewhere in the message. A containment check cannot tell "the
+        # host is the identifier" from "the host occurs inside a longer one", so
+        # it would also pass on a message naming the wrong resource -- and it is
+        # the shape static analysis flags as incomplete URL sanitization.
+        assert message.rsplit(": ", 1)[-1] == repr("https://api.example.com/mcp")
 
     def test_malformed_port_does_not_mask_the_rfc_error(self) -> None:
         # ParseResult.port raises ValueError on a non-integer port. Building the
