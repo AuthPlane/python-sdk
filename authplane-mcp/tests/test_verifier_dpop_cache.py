@@ -278,8 +278,11 @@ async def test_htu_origin_from_configured_resource_not_host_header() -> None:
     await verifier.verify_token("valid_token")
 
     ctx = mock.verify.await_args.kwargs["dpop_request"]
-    assert ctx.url.startswith("https://api.example.com")
-    assert "attacker" not in ctx.url
+    # Exact htu: the configured resource origin plus the request path, with no
+    # trace of the attacker-controlled Host / X-Forwarded-Proto headers. A
+    # prefix or substring check could pass on a URL that merely embeds the
+    # expected origin.
+    assert ctx.url == "https://api.example.com/mcp"
 
 
 @pytest.mark.asyncio

@@ -601,9 +601,8 @@ def test_public_names_are_importable_from_the_package_root() -> None:
     # imports them from the root — conftest reaches into .auth — so without this
     # the __all__ entries could rot without a test noticing.
     import authplane_fastmcp
-    from authplane_fastmcp import VerbatimPRMRemoteAuthProvider, rewrite_prm_routes_verbatim
 
     assert "VerbatimPRMRemoteAuthProvider" in authplane_fastmcp.__all__
     assert "rewrite_prm_routes_verbatim" in authplane_fastmcp.__all__
-    assert VerbatimPRMRemoteAuthProvider is not None
-    assert rewrite_prm_routes_verbatim is not None
+    assert authplane_fastmcp.VerbatimPRMRemoteAuthProvider is not None
+    assert authplane_fastmcp.rewrite_prm_routes_verbatim is not None

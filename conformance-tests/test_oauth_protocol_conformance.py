@@ -3,6 +3,7 @@
 import base64
 from typing import Any
 from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -449,10 +450,15 @@ async def test_rfc8693_multiple_resource_parameters_must_be_emitted() -> None:
         {},
         _NO_SSRF,
     )
-    body = route.calls.last.request.content.decode()
-    assert body.count("resource=") == 2
-    assert "api-one.example.com" in body
-    assert "api-two.example.com" in body
+    # Parse the form body and compare the exact parameter values: this proves
+    # two separate `resource` parameters were emitted with precisely these
+    # identifiers, where a substring check would also pass on longer URLs that
+    # merely contain the expected hosts.
+    body = parse_qs(route.calls.last.request.content.decode())
+    assert body["resource"] == [
+        "https://api-one.example.com",
+        "https://api-two.example.com",
+    ]
 
 
 @respx.mock
@@ -485,10 +491,15 @@ async def test_rfc8693_multiple_audience_parameters_must_be_emitted() -> None:
         {},
         _NO_SSRF,
     )
-    body = route.calls.last.request.content.decode()
-    assert body.count("audience=") == 2
-    assert "api-one.example.com" in body
-    assert "api-two.example.com" in body
+    # Parse the form body and compare the exact parameter values: this proves
+    # two separate `audience` parameters were emitted with precisely these
+    # identifiers, where a substring check would also pass on longer URLs that
+    # merely contain the expected hosts.
+    body = parse_qs(route.calls.last.request.content.decode())
+    assert body["audience"] == [
+        "https://api-one.example.com",
+        "https://api-two.example.com",
+    ]
 
 
 @respx.mock
@@ -614,7 +625,10 @@ async def test_rfc8707_verifier_must_accept_resource_when_present_in_aud_array(
     claims = await verifier.verify(
         token_factory(aud=["https://api.example.com", "https://other.example.com"])
     )  # type: ignore[arg-type]
-    assert "https://api.example.com" in claims.audience
+    # Compare the full audience rather than testing membership: the exact
+    # tuple also proves the configured resource was matched as a whole value,
+    # not as a substring of a longer audience entry.
+    assert claims.audience == ("https://api.example.com", "https://other.example.com")
 
 
 # ---------------------------------------------------------------------------

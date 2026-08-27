@@ -84,15 +84,15 @@ def _resolve_elicitation_id_kwarg(model: type[BaseModel]) -> str:
 
 # Fail fast at import: the installed mcp must expose a known elicitation-id
 # spelling. Resolution is otherwise lazy (see _build_url_elicitation_params) so
-# tests can patch the model without re-triggering this. The name below is never
-# read — it is bound only so this validation runs as an import-time side effect.
+# tests can patch the model without re-triggering this. The result is discarded
+# — the resolver is called here purely for its import-time validation.
 #
 # The resolver raises RuntimeError because it is also called lazily, where the
 # package imported fine and the failure is a runtime schema mismatch. At *this*
 # call site the failure really is "the installed distribution is unusable", so
 # translate it to the shape a reader expects from a failing import.
 try:
-    _ELICITATION_ID_KWARG = _resolve_elicitation_id_kwarg(ElicitRequestURLParams)
+    _resolve_elicitation_id_kwarg(ElicitRequestURLParams)
 except RuntimeError as exc:  # pragma: no cover - exercised via importlib.reload
     raise ImportError(str(exc)) from exc
 

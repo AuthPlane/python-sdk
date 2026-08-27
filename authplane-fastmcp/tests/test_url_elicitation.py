@@ -20,7 +20,7 @@ from mcp.shared.exceptions import UrlElicitationRequiredError
 from mcp.types import URL_ELICITATION_REQUIRED, ElicitRequestURLParams
 from pydantic import BaseModel
 
-import authplane_fastmcp.url_elicitation as url_elicitation
+from authplane_fastmcp import url_elicitation
 from authplane_fastmcp.auth import (
     _wrap_client_for_elicitation,  # pyright: ignore[reportPrivateUsage]
 )
