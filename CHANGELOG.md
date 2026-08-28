@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-28
 
 > **Versioning:** This entry contains breaking changes. The project is pre-1.0 (`0.x`); per SemVer, breaking changes on the `0.x` line ship in the next **minor** (targeting `0.4.0`), not a major bump. `RELEASE_POLICY.md`'s "major bump for breaking changes" rule takes effect once the project reaches `1.0.0`.
 
