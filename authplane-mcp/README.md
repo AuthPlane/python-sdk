@@ -13,14 +13,14 @@ pip install authplane-mcp
 
 ## Compatibility
 
-Supported `mcp` range: **`>=1.23.0, <1.28.0`**. MCP 1.28 renamed the elicitation field from `elicitationId` (camelCase) to `elicitation_id` (snake_case), which breaks this adapter's current wire handling. If your project needs MCP 1.28+, please open an issue — the adapter update is straightforward, we just haven't cut it yet.
+Supported `mcp` range: **`>=1.28.1, <2.0.0`**. The floor is `1.28.1` because earlier releases (`<=1.28.0`) are affected by [PYSEC-2026-3483](https://osv.dev/vulnerability/PYSEC-2026-3483), fixed in `1.28.1`. The adapter targets the mcp 1.x server API (`mcp.server.fastmcp.FastMCP`) and the camelCase URL-elicitation field (`ElicitRequestURLParams(elicitationId=...)`), which are the shape of the current 1.x line. As a belt-and-braces measure the adapter does not hard-code that spelling: it resolves the elicitation-id field name from the model's own schema — a known spelling is checked at import, then resolved per call — so a rename within 1.x would be picked up automatically rather than breaking the consent path. mcp 2.0 is not yet supported: it removes `mcp.server.fastmcp` and renames the elicitation field to snake_case `elicitation_id`, which is a separate port. If your project needs mcp 2.0, please open an issue.
 
 ## Quickstart
 
 ```python
 import asyncio
 
-from authplane_mcp import authplane_mcp_auth, require_scope
+from authplane_mcp import authplane_mcp_auth, install_request_context, require_scope
 from mcp.server.fastmcp import FastMCP
 
 
@@ -31,6 +31,10 @@ async def main() -> None:
         scopes=["tools/query", "tools/write"],
     )
     mcp = FastMCP("My MCP Server", port=8080, json_response=True, **auth_result)
+    # Wires Authplane's per-app hooks onto the server: advertises the issuer /
+    # resource identifiers verbatim in the Protected Resource Metadata and
+    # installs the request-context middleware used by inbound DPoP enforcement.
+    install_request_context(mcp)
 
     @mcp.tool()
     async def query_database(query: str) -> str:

@@ -278,8 +278,11 @@ async def test_htu_origin_from_configured_resource_not_host_header() -> None:
     await verifier.verify_token("valid_token")
 
     ctx = mock.verify.await_args.kwargs["dpop_request"]
-    assert ctx.url.startswith("https://api.example.com")
-    assert "attacker" not in ctx.url
+    # Exact htu: the configured resource origin plus the request path, with no
+    # trace of the attacker-controlled Host / X-Forwarded-Proto headers. A
+    # prefix or substring check could pass on a URL that merely embeds the
+    # expected origin.
+    assert ctx.url == "https://api.example.com/mcp"
 
 
 @pytest.mark.asyncio
@@ -302,9 +305,9 @@ async def test_htu_preserves_percent_encoded_path_from_raw_path() -> None:
     """htu uses ``scope['raw_path']`` so percent-encoding survives.
 
     ASGI populates ``scope['path']`` as the percent-decoded path, but the
-    DPoP proof was signed over the on-wire (still-encoded) URL. The TS
-    sibling reads ``IncomingMessage.url`` (raw bytes), so reading
-    ``raw_path`` here keeps cross-SDK proof binding identical.
+    DPoP proof was signed over the on-wire (still-encoded) URL. Reading
+    ``raw_path`` here keeps the DPoP ``htu`` binding byte-for-byte with the
+    proof's covered value (RFC 9449 §4.3).
     """
     mock = _mock_verifier()
     # Decoded path: "/mcp/users/a/b" ; raw: "/mcp/users/a%2Fb" — a client

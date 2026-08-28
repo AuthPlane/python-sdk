@@ -17,6 +17,7 @@ from .internal import (
     JWKSCache,
     MetadataCache,
     build_metadata_url,
+    validate_resource_indicator,
 )
 from .net import FetchSettings
 from .net.ssrf import SSRFError
@@ -102,7 +103,8 @@ class AuthplaneClient:
 
         Args:
             issuer: Authorization-server issuer URL (the prefix RFC 8414 metadata
-                is fetched from). Trailing slash is stripped.
+                is fetched from). Stored verbatim and compared byte-for-byte; a
+                trailing slash is significant and is preserved.
             auth: Client authentication for OAuth endpoints. Accepts either a raw
                 :class:`AuthProvider` or an :class:`ASCredentials` shorthand (which
                 is materialised as :class:`ClientCredentialsProvider`).
@@ -117,12 +119,9 @@ class AuthplaneClient:
             metadata_refresh_seconds: Background metadata refresh interval
                 (must be > 0).
             cache_ttl_buffer_seconds: Safety margin subtracted from each token's
-                lifetime before the entry is considered expired. Same shape as
-                java-sdk ``TokenCacheConfig.ttlBufferSeconds`` and ts-sdk
-                ``TokenCache`` ctor. Default 30s.
-            default_ttl_seconds: Fallback lifetime applied when the AS response
-                omits ``expires_in``. Cross-SDK parity with java-sdk
-                ``TokenCacheConfig.defaultTtlSeconds``. Default 3600s.
+                lifetime before the entry is considered expired. Default 30s.
+            default_ttl_seconds: Fallback lifetime applied when the AS omits
+                ``expires_in``. Default 3600s.
             cache_max_entries: Maximum number of cached tokens before
                 least-recently-used eviction kicks in. Default
                 :attr:`TokenCache.DEFAULT_MAX_ENTRIES` (10_000). Must be a
@@ -132,9 +131,20 @@ class AuthplaneClient:
                 circuit opens. Default 5.
             circuit_breaker_cooldown_seconds: Half-open probe interval after the
                 circuit trips. Default 30s.
+
+        Raises:
+            InvalidIssuerError: If ``issuer`` carries a query or fragment
+                component (RFC 8414 §2 forbids both). This fails fast at
+                construction, before any network fetch. Subclasses ``ValueError``,
+                so an existing ``except ValueError`` still catches it.
         """
         client = cls()
-        client._issuer = issuer.rstrip("/")
+        # Identity: the issuer is an identifier (RFC 9068 `iss`), stored verbatim
+        # and compared byte-for-byte. Do NOT strip a trailing slash here — an AS
+        # whose issuer ends in `/` mints tokens whose `iss` keeps the slash, and
+        # normalizing it away rejects every token. Slash stripping belongs only
+        # to .well-known URL derivation (see build_metadata_url), not to identity.
+        client._issuer = issuer
 
         # Dev mode
         resolved_dev_mode = (
@@ -419,8 +429,32 @@ class AuthplaneClient:
         ``dpop_signing_alg_values_supported`` and
         ``dpop_bound_access_tokens_required``; omitting the argument keeps
         DPoP fields out of PRM entirely.
+
+        Raises:
+            InvalidResourceError: If *resource* carries a fragment component.
+                RFC 8707 §2 forbids one in a resource indicator. Rejected here,
+                at construction, for the same reason ``create()`` rejects a
+                malformed issuer — the alternative is surfacing it from
+                ``prm_url()`` while composing an RFC 9728 challenge, i.e. from
+                inside a 401 response path. Subclasses ``ValueError``, so an
+                existing ``except ValueError`` still catches it.
+            ValueError: If *allowed_algorithms* contains an algorithm outside
+                ``("RS256", "ES256")``. Raised by
+                :class:`~authplane.verifier.AuthplaneResource`'s constructor,
+                which this method forwards to, and propagated unchanged.
         """
         from .verifier import AuthplaneResource
+
+        # Deliberately duplicated: AuthplaneResource.__init__ runs this same
+        # gate, and it — not this call — is the authoritative one, since it also
+        # covers constructing the package-root export directly. What this call
+        # is load-bearing for is the traceback: it raises at the line the
+        # operator wrote, symmetrically with the issuer guard in create(),
+        # rather than one frame deeper in the constructor. Pinned by
+        # test_client_resource_rejects_fragment_at_construction, which asserts
+        # the invoking frame — deleting this line turns that test red rather
+        # than changing behaviour.
+        validate_resource_indicator(resource)
 
         # fail_closed is only consulted when a revocation check runs; setting
         # it without a checker means no revocation check happens at all, which

@@ -200,6 +200,108 @@ def test_normalize_dpop_htu_rejects_relative_url() -> None:
         normalize_dpop_htu("/relative")
 
 
+def test_normalize_dpop_htu_keeps_the_params_segment() -> None:
+    # urlparse peels ";params" off the last path segment; urlunparse then drops
+    # it unless passed back. RFC 3986 §3.3 puts it in the path, and htu is the
+    # request URI minus query and fragment only, so it has to survive.
+    assert (
+        normalize_dpop_htu("https://api.example.com/mcp;v=1") == "https://api.example.com/mcp;v=1"
+    )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "https://api.example.com:abc/mcp",  # port cast, raised at attribute access
+        "https://api.example.com:99999/mcp",  # port out of range
+        "https://[::1#frag",  # urlsplit itself: "Invalid IPv6 URL"
+    ],
+)
+def test_normalize_dpop_htu_maps_malformed_authorities_to_the_sdk_error(malformed: str) -> None:
+    # dpop_verification passes the proof's own htu claim through here, so this
+    # runs on attacker-controlled input. The MCP adapters catch only
+    # AuthplaneError, so a bare urllib ValueError turns a 401 into an
+    # unhandled 500.
+    with pytest.raises(InvalidDPoPProofError):
+        normalize_dpop_htu(malformed)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://[::1]:8080/mcp", "https://[::1]:8080/mcp"),
+        ("https://[2001:db8::1]:9443/token", "https://[2001:db8::1]:9443/token"),
+        # Default port elided, brackets still required.
+        ("https://[::1]/mcp", "https://[::1]/mcp"),
+        ("http://[::1]:80/mcp", "http://[::1]/mcp"),
+        # Case folding still applies inside the brackets.
+        ("https://[2001:DB8::1]/mcp", "https://[2001:db8::1]/mcp"),
+    ],
+)
+def test_normalize_dpop_htu_brackets_ipv6_literals(url: str, expected: str) -> None:
+    # SplitResult.hostname strips the brackets RFC 3986 §3.2.2 requires, so
+    # reassembling the authority from it produced an invalid URI:
+    # "https://[::1]:8080/mcp" came back as "https://::1:8080/mcp".
+    assert normalize_dpop_htu(url) == expected
+
+
+def test_normalize_dpop_htu_is_idempotent_over_ipv6() -> None:
+    # The end-to-end consequence, and the reason this is not cosmetic: htu is
+    # emitted by the client and re-parsed by the server, both this SDK. The
+    # unbracketed form is rejected by _split_dpop_url, so an honest proof against
+    # an IPv6 endpoint was refused — reachable in dev mode against http://[::1].
+    once = normalize_dpop_htu("https://[::1]:8080/mcp")
+    assert normalize_dpop_htu(once) == once
+
+
+# `::1:8080` is itself a valid IPv6 literal, so these are two distinct endpoints
+# whose unbracketed forms are byte-identical:
+#
+#   'https://[::1]:8080/x'  -> 'https://::1:8080/x'
+#   'https://[::1:8080]/x'  -> 'https://::1:8080/x'
+#
+# which is the same acceptance widening this PR started from, in its IPv6
+# variant. The first version of these two cases compared `:8080` against `:9443`
+# — distinct with or without brackets — so both passed with the bracketing
+# removed and neither tested what its docstring claimed. That is the criticism
+# this PR made of itself in round one: "a normalizer that over-rejected would
+# satisfy the first test alone".
+_COLLIDING_IPV6 = ("https://[::1]:8080/x", "https://[::1:8080]/x")
+
+
+def test_normalize_dpop_htu_keeps_colliding_ipv6_authorities_apart() -> None:
+    bracketed, literal = _COLLIDING_IPV6
+    assert normalize_dpop_htu(bracketed) != normalize_dpop_htu(literal)
+
+
+def test_nonce_key_is_a_well_formed_origin_for_an_ipv6_literal(
+    jwks_keypair: dict[str, Any],
+) -> None:
+    # `_nonce_key` cannot collide the way `htu` does — it always appends an
+    # explicit port, so the two authorities above stay distinct even unbracketed
+    # (``::1:8080`` against ``::1:8080:443``). What the bracketing buys here is
+    # that the key is a well-formed origin rather than an unparseable string, so
+    # that is what this asserts: the same reassembly bug, without claiming an
+    # acceptance widening that this function's shape rules out.
+    provider = DPoPProvider(
+        DPoPKeyMaterial.from_pem(jwks_keypair["private_key"], algorithm="ES256")
+    )
+
+    key = provider._nonce_key("https://[::1]:8080/token")  # pyright: ignore[reportPrivateUsage]
+
+    assert key == "https://[::1]:8080"
+    # And it survives the module's own parser, which the unbracketed form does not.
+    assert normalize_dpop_htu(f"{key}/token") == "https://[::1]:8080/token"
+
+
+def test_normalize_dpop_htu_still_strips_query_and_fragment() -> None:
+    # The swap must not widen what htu drops: RFC 9449 §4.3 removes exactly
+    # query and fragment.
+    assert (
+        normalize_dpop_htu("https://api.example.com/mcp?a=1#frag") == "https://api.example.com/mcp"
+    )
+
+
 def test_jwk_thumbprint_rejects_unknown_kty() -> None:
     with pytest.raises(InvalidDPoPProofError):
         jwk_thumbprint({"kty": "oct"})

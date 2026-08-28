@@ -23,42 +23,86 @@ Tests can carry optional coverage metadata to flag partial coverage or known gap
 
 ```python
 @pytest.mark.conformance(
-    "rfc9449-dpop-proof-jwk-must-not-include-private-key-material",
+    "<catalog-case-id>",
     level="partial",
     gaps=["expected.error_hint"],
-    note="Python rejects the proof but does not expose a stable diagnostic.",
+    note="<which part of the case the test does not reach>",
 )
 async def test_...(...):
     ...
 ```
 
+The case id is a placeholder on purpose: naming a real one here would claim
+coverage metadata that the marker on the actual test may not carry.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `level` | `"full"` | `"full"` or `"partial"` — how closely the test matches the catalog spec |
-| `gaps` | `[]` | List of expected catalog fields not covered by this test |
-| `note` | `""` | Free-text explanation (appears in both JSON and Markdown reports) |
+| `level` | `"full"` | `"full"` or `"partial"` — how closely the test matches the catalog spec. Always reaches `conformance-report.md`. |
+| `gaps` | `[]` | Catalog *field paths* the test does not reach (`use_case`, `expected.error_hint`, …). Reaches `conformance-report.md` only alongside a `note`; always reaches `conformance-report.json`. |
+| `note` | `""` | Free-text prose. Gates the Coverage Notes section — see below. |
 
-### Not-yet-implemented tests
+Keep them in that order — `gaps` names the fields, `note` carries the prose —
+and **always write a `note` alongside `gaps`, because `note` is the gate**. In
+`conftest.py`'s `_build_markdown_report`, a single filter (`:216`) selects the
+cases with a truthy `note`, and it decides both whether the Coverage Notes
+section is emitted at all (`:217`) and which cases it lists (`:219`) — and the
+`Gaps:` line (`:224-225`) is emitted *inside* that section. So a `gaps`-only
+marker states no reason anywhere in `conformance-report.md` and its `gaps`
+survive in `conformance-report.json` alone; set a `note` and both render.
 
-Tests for features that don't exist yet should still be present with the marker and a `pytest.xfail(...)` body that documents what is missing:
+`level` is not gated on `note`: it reaches the markdown either way, via the
+Cases table's Coverage column (`:193-197`).
+
+Also keep `|` out of the `note` — it is interpolated into a markdown table cell
+unescaped and will break the row.
+
+### Partial coverage vs. not implemented
+
+A test that exercises part of a case but not all of it is a `partial`: it still
+runs and still asserts. Prefer that over an `xfail` wherever one is honest — an
+`xfail` asserts nothing, so it cannot notice the day the gap closes, and it
+reports as a skip while the report carries the case as not-run.
+
+A case with nothing behind it at all should carry the marker with a
+`pytest.xfail(...)` body documenting what is missing:
 
 ```python
 @pytest.mark.conformance(
-    "rfc9449-dpop-inbound-nonce-must-be-validated-when-required",
-    note="Not implemented: the SDK has no nonce generation, DPoP-Nonce challenge emission, or challenge-retry lifecycle for resource servers.",
+    "<catalog-case-id>",
+    note="Not implemented: <what the SDK does not have>.",
 )
-async def test_rfc9449_dpop_inbound_nonce_must_be_validated_when_required(...):
+async def test_<catalog_case_id>(...):
     pytest.xfail("Not implemented: ...")
 ```
 
-These tests show up as `skipped` (with their `note` carried through) in both `conformance-report.json` and `conformance-report.md` — pytest classifies `xfail` outcomes as skips. Keeping the suite green for known gaps means CI never has to be ignored to merge; the gap is still visible in the report's per-case status and coverage notes.
+The id is a placeholder deliberately: **the suite currently has no `xfail`s**,
+so there is no live case to point at, and `test_catalog_alignment.py` requires
+every catalog id to carry a marker — so any real id named here would be one
+that does have a test behind it. (This section previously used
+`rfc9449-dpop-inbound-nonce-must-be-validated-when-required` as its worked
+example; that case now runs as a `partial`.)
+
+`xfail` tests show up as `skipped` — with their `note` carried through — in both
+`conformance-report.json` and `conformance-report.md`, because pytest
+classifies `xfail` outcomes as skips. Keeping the suite green for known gaps
+means CI never has to be ignored to merge; the gap stays visible in the
+report's per-case status and coverage notes.
 
 ## Running
 
 The suite needs the shared catalog YAML on disk. By default it looks for
 `../conformance/oauth-sdk-conformance-catalog.yaml` (i.e. `python-sdk` and
 [`conformance`](https://github.com/AuthPlane/conformance) checked out as
-siblings). If your layout differs — e.g. nested inside another monorepo —
+siblings). To match CI exactly, check out the catalog revision pinned in
+`.conformance-catalog-ref` at the repo root rather than the latest default
+branch:
+
+```bash
+# From the python-sdk/ clone, with conformance/ checked out as a sibling
+git -C ../conformance checkout "$(cat .conformance-catalog-ref)"
+```
+
+If your layout differs — e.g. nested inside another monorepo —
 point the suite at the catalog explicitly:
 
 ```bash

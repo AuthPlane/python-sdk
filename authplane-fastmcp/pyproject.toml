@@ -30,6 +30,12 @@ dependencies = [
     # re-verify the `FastMCP` constructor + `fastmcp.server.auth.require_scopes`
     # surface the adapter consumes.
     "fastmcp>=3.2,<4",
+    # This adapter imports the top-level `mcp` package directly (e.g.
+    # `mcp.shared.exceptions`, `mcp.types`), so it needs a direct floor of
+    # 1.28.1 to reach the PYSEC-2026-3483 fix — `fastmcp>=3.2,<4` alone does not
+    # guarantee it. Upper bound excludes mcp 2.0, which renames the URL
+    # elicitation field to snake_case `elicitation_id` (a separate port).
+    "mcp>=1.28.1,<2",
     "pydantic>=2.0",
 ]
 

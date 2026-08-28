@@ -136,6 +136,7 @@ class TestValidateURLSchemes:
 def _make_validated_url(ips: list[str] | None = None) -> ValidatedURL:
     return ValidatedURL(
         original_url="https://example.com/jwks.json",
+        scheme="https",
         hostname="example.com",
         port=443,
         path="/jwks.json",
@@ -216,6 +217,7 @@ class TestSSRFSafeFetchEdgeCases:
         """A non-JSON response on the first IP causes a retry on the second IP."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/jwks.json",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/jwks.json",
@@ -269,6 +271,7 @@ class TestSSRFSafeFetchEdgeCases:
         """When all resolved IPs fail, the last error is raised."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/jwks.json",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/jwks.json",
@@ -297,6 +300,7 @@ class TestSSRFSafeFetchEdgeCases:
         """When all IPs return invalid JSON, the JSONDecodeError is raised."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/jwks.json",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/jwks.json",
@@ -366,6 +370,7 @@ class TestSSRFSafeFetchEdgeCases:
         """When all IPs time out, the last TimeoutException is propagated."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/jwks.json",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/jwks.json",
@@ -405,6 +410,7 @@ class TestSSRFSafePost:
         """ssrf_safe_post returns the parsed JSON body on a 200 response."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://auth.example.com/introspect",
+            scheme="https",
             hostname="auth.example.com",
             port=443,
             path="/introspect",
@@ -444,6 +450,7 @@ class TestSSRFSafePost:
         """ssrf_safe_post passes form_data as the `data` kwarg to client.stream."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://auth.example.com/introspect",
+            scheme="https",
             hostname="auth.example.com",
             port=443,
             path="/introspect",
@@ -488,6 +495,7 @@ class TestSSRFSafePost:
         is not valid JSON (all IPs exhausted)."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://auth.example.com/introspect",
+            scheme="https",
             hostname="auth.example.com",
             port=443,
             path="/introspect",
@@ -527,6 +535,7 @@ class TestSSRFSafePost:
         """ssrf_safe_post propagates the last RequestError when all IPs fail."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://auth.example.com/introspect",
+            scheme="https",
             hostname="auth.example.com",
             port=443,
             path="/introspect",

@@ -244,7 +244,7 @@ Trade-offs to understand before enabling `fail_closed=True`:
 
 - **Availability**: an authorization server or introspection outage makes every request fail with 401 until the outage resolves. Once the client's circuit breaker opens, checks fail fast and all tokens are rejected until the cooldown elapses.
 - **Credentials**: authorization servers commonly require authenticated introspection; without valid `as_credentials` the introspection call fails, which under `fail_closed=True` means every token is rejected. Verify credentials as part of deployment, not just at rollout.
-- **Metadata**: an AS whose metadata document does not advertise `introspection_endpoint` fails every introspection attempt. Under the default that check is silently skipped; under `fail_closed=True` every token is rejected — and unlike an outage this never self-recovers, because the missing endpoint is a permanent property of the AS configuration. Confirm the endpoint is present in AS metadata before enabling.
+- **Metadata**: an AS whose metadata document does not advertise `introspection_endpoint` fails every introspection attempt. Under the default that check is skipped and every request logs a `Revocation check failed (fail-open)` warning — for a missing endpoint that is every request, permanently, since the condition never clears; under `fail_closed=True` every token is rejected — and unlike an outage this never self-recovers, because the missing endpoint is a permanent property of the AS configuration. Confirm the endpoint is present in AS metadata before enabling.
 - `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning at resource construction when it detects this misconfiguration.
 
 ### Custom Revocation Checker
@@ -529,9 +529,35 @@ Returned by `authplane_auth()`. Supports `**` unpacking into `FastMCP()` — the
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `auth` | `RemoteAuthProvider` | Auth provider for FastMCP |
+| `auth` | `RemoteAuthProvider` (a `VerbatimPRMRemoteAuthProvider` in practice) | Auth provider for FastMCP. `authplane_auth()` always constructs the subclass — see below — but the attribute is typed as the base class, so a checker will not offer subclass members without a narrowing check |
 | `token_verifier` | `AuthplaneTokenVerifier` | Token verifier (for advanced / manual setup) |
 | `client` | `AuthplaneClient` | Underlying SDK client (use `client.exchange()` for RFC 8693) |
+
+### `VerbatimPRMRemoteAuthProvider`
+
+`RemoteAuthProvider` subclass that serves the Protected Resource Metadata identifiers
+byte-for-byte. Upstream builds the PRM from `pydantic.AnyHttpUrl` fields, which append a
+trailing slash to an empty-path authority; the core SDK compares identifiers verbatim, so a
+client following the advertised value literally is rejected.
+
+`authplane_auth()` returns one already configured. Construct it directly only when you build
+the provider yourself — a documented FastMCP pattern — since using the base class instead
+loses the verbatim PRM silently.
+
+| Constructor argument | Description |
+|---|---|
+| `verbatim_issuer` | The issuer exactly as configured, not the `AnyHttpUrl` form |
+| `verbatim_resource` | The resource identifier exactly as configured |
+
+Everything else is forwarded to `RemoteAuthProvider` — note `base_url` is the server base,
+which is not the same value as `verbatim_resource` when the server is mounted under a path.
+
+### `rewrite_prm_routes_verbatim(routes, *, issuer, resource)`
+
+The rewrite itself, exported for the case where you cannot subclass. Apply it to the route
+list your provider returns. It wraps the single route whose path is the RFC 9728 §3.1
+derivation of `resource`, and emits a `RuntimeWarning` when routes exist under the well-known
+prefix but none is that derivation — meaning the rewrite did nothing.
 
 ### `AuthplaneTokenVerifier`
 

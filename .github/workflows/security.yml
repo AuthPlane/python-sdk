@@ -74,16 +74,6 @@ jobs:
         # latest released version, so `pip install --upgrade pip` can't pull
         # a patched build. Drop this ignore once pip >= 26.1 is on PyPI.
         # See https://github.com/pypa/pip/pull/13870.
-        #
-        # PYSEC-2026-3483: affects mcp <= 1.27.2 (fixed in 1.28.1). The
-        # authplane-mcp adapter pins mcp <1.28.0 because 1.28 renamed the
-        # elicitation field elicitationId -> elicitation_id (snake_case),
-        # which breaks url_elicitation.py's ElicitRequestURLParams wire
-        # handling (every consent-driven exchange would raise a pydantic
-        # ValidationError). Accepted risk until the adapter is migrated to
-        # the 1.28 field name and the floor is raised to 1.28.1; drop this
-        # ignore then.
         run: >-
           pip-audit --skip-editable --progress-spinner off
           --ignore-vuln CVE-2026-3219
-          --ignore-vuln PYSEC-2026-3483

@@ -2,17 +2,19 @@
 
 import time
 from collections.abc import AsyncGenerator
+from typing import Protocol
 from unittest.mock import AsyncMock, PropertyMock
 
 import pytest
 from authplane import AuthplaneResource, VerifiedClaims
 from fastmcp import FastMCP
 from fastmcp.dependencies import CurrentAccessToken
-from fastmcp.server.auth import AccessToken, RemoteAuthProvider, require_scopes
+from fastmcp.server.auth import AccessToken, require_scopes
 from httpx import ASGITransport, AsyncClient
 from pydantic import AnyHttpUrl
 
 from authplane_fastmcp import AuthplaneTokenVerifier
+from authplane_fastmcp.auth import VerbatimPRMRemoteAuthProvider
 
 
 @pytest.fixture
@@ -81,6 +83,14 @@ def mock_verifier(valid_claims: VerifiedClaims) -> AsyncMock:
 def token_verifier(mock_verifier: AsyncMock) -> AuthplaneTokenVerifier:
     """AuthplaneTokenVerifier with mocked AuthplaneResource.
 
+    Deliberately not built on ``build_token_verifier`` below, despite the shape
+    overlapping. This one exists to drive ``verify()`` — it carries a side effect
+    distinguishing a valid token from an invalid one, and a fixed resource — while
+    ``build_token_verifier`` serves the PRM and derivation tests, which never call
+    ``verify`` and need the resource to follow their parameters. Folding them
+    together would mean one constructor with a `verify` argument nobody in the
+    second group passes.
+
     Returns:
         AuthplaneTokenVerifier(mock_verifier)
     """
@@ -99,11 +109,13 @@ def fastmcp_app(token_verifier: AuthplaneTokenVerifier) -> FastMCP:
     Returns:
         FastMCP application instance
     """
-    auth_provider = RemoteAuthProvider(
+    auth_provider = VerbatimPRMRemoteAuthProvider(
         token_verifier=token_verifier,
         authorization_servers=[AnyHttpUrl("https://auth.example.com")],
         base_url=AnyHttpUrl("https://api.example.com"),
         scopes_supported=["tools/query", "tools/write", "tools/admin"],
+        verbatim_issuer="https://auth.example.com",
+        verbatim_resource="https://api.example.com/mcp",
     )
 
     mcp = FastMCP("Test Server", auth=auth_provider)
@@ -143,3 +155,61 @@ async def test_client(fastmcp_app: FastMCP) -> AsyncGenerator[AsyncClient, None]
         base_url="http://testserver",
     ) as client:
         yield client
+
+
+# Shared by test_integration.py and test_auth_factory.py.
+#
+# It lives in conftest rather than in a module of its own because this package
+# runs pytest with `--import-mode=importlib`: the test directory is not put on
+# `sys.path`, so `import _helpers` does not resolve, and making `tests/` a
+# package to allow `from ._helpers import ...` names it `tests` — which collides
+# with the repo-root `tests/` package in release.yml's combined invocation and
+# takes the whole run down with "Plugin already registered under a different
+# name". conftest is the one module pytest guarantees is importable from every
+# test module in the tree, via the fixture below.
+def build_token_verifier(
+    base_url: str, resource: str, *, scopes: list[str] | None = None
+) -> AuthplaneTokenVerifier:
+    """A production ``AuthplaneTokenVerifier`` over a mocked ``AuthplaneResource``.
+
+    One definition rather than three. ``test_integration.py`` had two
+    byte-identical copies of this construction and ``test_auth_factory.py`` a
+    third variant, which is the same "two expressions required to agree, neither
+    referencing the other" shape that motivated extracting
+    ``_derive_resource_url`` in the first place.
+
+    The verifier itself is the production class, deliberately: it is the
+    argument ``auth.py``'s comment says PRM generation can read
+    (``token_verifier.base_url``), and upstream's ``__init__`` reads
+    ``required_scopes`` off it. A bare mock there would collapse the two
+    coercion paths production uses — a raw ``str`` ``base_url`` into the
+    verifier, an ``AnyHttpUrl`` into the provider — into one.
+    """
+    resource_mock = AsyncMock(spec=AuthplaneResource)
+    type(resource_mock).resource = PropertyMock(return_value=resource)
+    if scopes is not None:
+        type(resource_mock).scopes = PropertyMock(return_value=scopes)
+    return AuthplaneTokenVerifier(resource_mock, base_url=base_url)
+
+
+class TokenVerifierFactory(Protocol):
+    """The shared constructor's signature, preserved across the fixture.
+
+    `Callable[..., AuthplaneTokenVerifier]` erases exactly the parameter checking
+    that importing `build_token_verifier` directly used to provide — and
+    `base_url` and `resource` are both `str`, so swapping them type-checks and
+    silently builds a verifier whose resource origin comes from the wrong string.
+    That is the class of mis-wiring `verifier.py`'s `isinstance` guard exists to
+    catch, so the indirection should not be what reintroduces it.
+    """
+
+    def __call__(
+        self, base_url: str, resource: str, *, scopes: list[str] | None = None
+    ) -> AuthplaneTokenVerifier:
+        """Build a verifier for ``resource`` against the server at ``base_url``."""
+
+
+@pytest.fixture
+def token_verifier_factory() -> TokenVerifierFactory:
+    """`build_token_verifier`, for tests that cannot import across modules."""
+    return build_token_verifier

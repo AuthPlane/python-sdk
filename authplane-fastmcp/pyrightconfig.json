@@ -12,5 +12,8 @@
   "reportUnusedVariable": "warning",
   "reportUnnecessaryTypeIgnoreComment": "error",
   "reportUnnecessaryIsInstance": "warning",
-  "reportUnnecessaryComparison": "warning"
+  "reportUnnecessaryComparison": "warning",
+  "extraPaths": [
+    "tests"
+  ]
 }

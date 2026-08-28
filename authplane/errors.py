@@ -23,6 +23,35 @@ class AuthplaneError(Exception):
     pass
 
 
+class InvalidIssuerError(AuthplaneError, ValueError):
+    """Raised when an issuer identifier is not the shape RFC 8414 §2 requires.
+
+    Inherits ``ValueError`` as well as ``AuthplaneError`` so existing
+    ``except ValueError`` handlers keep working — the identifier guards raised a
+    bare ``ValueError`` before this class existed, and that is a public contract.
+    What it adds is the ability to tell *which* ``ValueError``: a configuration
+    error on the issuer was previously indistinguishable from, say,
+    ``jwks_refresh_seconds must be positive``.
+
+    """
+
+    pass
+
+
+class InvalidResourceError(AuthplaneError, ValueError):
+    """Raised when a resource indicator is not the shape RFC 8707 §2 requires.
+
+    Same additive shape as :class:`InvalidIssuerError`, and for the same reason:
+    rejecting a fragment-bearing resource at ``AuthplaneClient.resource(...)`` is
+    a behaviour change for a deployment that used to start, and the only way to
+    catch it specifically was ``except ValueError`` — which is exactly the
+    undiscriminating handler the issuer half of this work set out to improve on.
+    Typing one identifier and not the other would have left that half-done.
+    """
+
+    pass
+
+
 class TokenMissingError(AuthplaneError):
     """Raised when no token is provided for validation."""
 

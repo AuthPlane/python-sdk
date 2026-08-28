@@ -36,7 +36,7 @@ from ..errors import (
     VerifierRuntimeError,
 )
 from ..internal.jwt import decode_jwt_header
-from ..internal.urls import build_prm_url
+from ..internal.urls import build_prm_url, validate_resource_indicator
 from ..oauth.prm import build_prm
 from ..oauth.types import IntrospectionRevocation
 from .claims import VerifiedClaims, freeze_value
@@ -51,7 +51,23 @@ _ALLOWED_ALGORITHMS = ("RS256", "ES256")
 
 
 class AuthplaneResource:
-    """Verifies RFC 9068-style JWT access tokens."""
+    """Verifies RFC 9068-style JWT access tokens.
+
+    Usually built through :meth:`AuthplaneClient.resource`, but the class is
+    exported from the package root and constructing it directly is supported.
+    Either way the constructor validates the resource indicator, so the
+    construction-time guarantee does not depend on which path was taken.
+
+    Raises:
+        InvalidResourceError: If *resource* carries a fragment component.
+            RFC 8707 §2 forbids one in a resource indicator. Rejected here, at
+            construction, rather than from ``prm_url()`` while composing an
+            RFC 9728 challenge — i.e. from inside a 401 response path.
+            Subclasses ``ValueError``, so an existing ``except ValueError``
+            still catches it.
+        ValueError: If *allowed_algorithms* contains an algorithm outside
+            ``("RS256", "ES256")``.
+    """
 
     def __init__(
         self,
@@ -64,6 +80,21 @@ class AuthplaneResource:
         fail_closed: bool = False,
         inbound_dpop: InboundDPoPOptions | None = None,
     ) -> None:
+        # THIS is the authoritative resource gate — every construction path
+        # goes through it. The class is exported from the package root, so
+        # constructing it directly is supported, and a gate living only in
+        # AuthplaneClient.resource() would let that path defer the rejection to
+        # prm_url(), i.e. to an RFC 9728 challenge on a 401 response path. That
+        # is the failure mode the check exists to prevent.
+        #
+        # The factory keeps a call of its own, deliberately: it is redundant
+        # for the guarantee and load-bearing for the traceback, raising at the
+        # line the operator wrote rather than one frame deeper in here. Pinned
+        # by test_client_resource_rejects_fragment_at_construction, which
+        # asserts the invoking frame — do not dedupe the pair without reading
+        # it. build_prm_url's call is the third, a defensive backstop.
+        validate_resource_indicator(resource)
+
         invalid = [alg for alg in allowed_algorithms if alg not in _ALLOWED_ALGORITHMS]
         if invalid:
             raise ValueError(

@@ -138,7 +138,10 @@ async def test_multi_audience_token_accepted(
     """A token whose aud claim is a multi-element list is accepted when resource is present."""
     token = token_factory(aud=["https://api.example.com", "https://other.com"])  # type: ignore[arg-type]
     claims = await verifier.verify(token)
-    assert "https://api.example.com" in claims.audience
+    # Compare the full audience rather than testing membership: the exact
+    # tuple also proves the configured resource was matched as a whole value,
+    # not as a substring of a longer audience entry.
+    assert claims.audience == ("https://api.example.com", "https://other.com")
 
 
 # ---------------------------------------------------------------------------

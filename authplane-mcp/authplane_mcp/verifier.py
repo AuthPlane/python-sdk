@@ -77,8 +77,7 @@ class AuthplaneTokenVerifier(TokenVerifier):
     call's in-flight verify task is stashed on ``request.state`` keyed by
     the access token; any subsequent invocation within the same request
     awaits the same task instead of re-entering the inbound DPoP replay
-    store. The cache is defensive: it mirrors the TS adapter's
-    ``AsyncLocalStorage`` pattern and pre-empts a class of regressions
+    store. The cache is defensive: it pre-empts a class of regressions
     where a future framework change (transport rewrite, custom auth
     provider, ASGI wrapper) would silently double-call ``verify_token``
     and the second call's proof would be rejected as
@@ -92,6 +91,8 @@ class AuthplaneTokenVerifier(TokenVerifier):
         verifier: AuthplaneResource,
         *,
         get_http_request: Callable[[], Request] | None = None,
+        verbatim_issuer: str | None = None,
+        verbatim_resource: str | None = None,
     ) -> None:
         """Initialize the token verifier.
 
@@ -105,9 +106,18 @@ class AuthplaneTokenVerifier(TokenVerifier):
                 :class:`AuthplaneRequestContextMiddleware`). Tests inject
                 a fake to drive the DPoP / per-request-cache paths
                 without spinning up an ASGI app.
+            verbatim_issuer: Operator-configured issuer identifier, kept
+                byte-for-byte so :func:`install_request_context` can advertise
+                it unchanged in the served Protected Resource Metadata (the MCP
+                SDK otherwise serializes it through ``pydantic.AnyHttpUrl`` and
+                appends a trailing slash to an empty-path authority).
+            verbatim_resource: Operator-configured resource identifier, kept
+                byte-for-byte for the same PRM reason.
         """
         self._verifier = verifier
         self._get_http_request = get_http_request or _default_get_http_request
+        self._verbatim_issuer = verbatim_issuer
+        self._verbatim_resource = verbatim_resource
 
         # ``AuthplaneResource.resource`` is operator-configured and must be a
         # string URI — guard against mis-wired mocks (a bare ``MagicMock`` with
@@ -124,6 +134,25 @@ class AuthplaneTokenVerifier(TokenVerifier):
     def verifier(self) -> AuthplaneResource:
         """The underlying ``AuthplaneResource`` instance."""
         return self._verifier
+
+    def verbatim_identifiers(self) -> tuple[str, str] | None:
+        """Return ``(issuer, resource)`` as configured, or ``None``.
+
+        The PRM rewrite in :mod:`authplane_mcp.auth` needs the operator's
+        identifiers byte-for-byte, not the slash-normalized forms upstream's
+        ``RemoteAuthProvider`` derives. Both are set only by
+        ``authplane_mcp_auth``; a verifier built through the public
+        ``AuthplaneTokenVerifier(...)`` constructor carries neither, and the
+        rewrite must be skipped rather than half-applied.
+
+        Returning ``None`` for that case — instead of exposing two private
+        attributes across module boundaries — keeps the "are these usable?"
+        question answerable in one call, which is what the caller actually
+        branches on.
+        """
+        if self._verbatim_issuer is None or self._verbatim_resource is None:
+            return None
+        return self._verbatim_issuer, self._verbatim_resource
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Validate a JWT and return an MCP ``AccessToken``.
@@ -209,18 +238,16 @@ class AuthplaneTokenVerifier(TokenVerifier):
         not configured for inbound DPoP, the verifier's Mode-3 path
         rejects any DPoP signal regardless of what is passed here.
 
-        Cross-SDK note: the TS sibling ``buildDpopRequestContext``
-        returns ``undefined`` when no ``DPoP`` header is present;
-        Python intentionally always builds the context with
-        ``proof=None``. Both shapes are behaviorally equivalent in
-        the core verifier (Mode 3 path treats absent and ``None``
-        proofs the same), but a DPoP-bound token with no proof
-        yields a more specific ``DPoPProofMissingError`` here
-        instead of ``DPoPBindingMismatchError``. The error-type
-        contract is pinned per language by design.
+        Note: the context is always built, with ``proof=None`` when no
+        ``DPoP`` header is present, rather than omitted. Both shapes are
+        behaviorally equivalent in the core verifier (the Mode 3 path
+        treats absent and ``None`` proofs the same), but building it
+        unconditionally means a DPoP-bound token with no proof yields the
+        more specific ``DPoPProofMissingError`` instead of
+        ``DPoPBindingMismatchError``.
         """
-        # ``raw_request_path`` reads ``scope["raw_path"]`` to preserve
-        # percent-encoding for DPoP ``htu`` parity with the TS sibling.
+        # ``raw_request_path`` reads ``scope["raw_path"]`` so percent-encoding
+        # is preserved in the DPoP ``htu`` (RFC 9449 §4.3, RFC 3986 §6.2.2.2).
         # ``request.url.query`` is sourced from ``scope["query_string"]``
         # without percent-decoding, so it is already on-wire-safe.
         url = f"{self._resource_origin}{raw_request_path(request)}"

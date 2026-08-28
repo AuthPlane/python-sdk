@@ -1,0 +1,64 @@
+name: Conformance catalog drift
+
+# Weekly (plus on-demand) check that the SDK's @pytest.mark.conformance markers
+# still cover the LATEST conformance catalog default branch, independent of the
+# pinned SHA that gates PR CI (.conformance-catalog-ref). A newly added,
+# uncovered catalog case FAILS this scheduled job so the drift is visible on the
+# Actions dashboard; it never breaks PR CI, which has no pull_request trigger and
+# runs against the pinned .conformance-catalog-ref.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Least-privilege default; this workflow only reads the repo.
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install package dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Intentionally UNPINNED: track the catalog's default branch so newly
+      # added cases surface here. PR CI stays on the pinned .conformance-catalog-ref.
+      - name: Clone latest conformance catalog default branch (out of tree)
+        run: |
+          git clone --depth 1 https://github.com/AuthPlane/conformance.git "$RUNNER_TEMP/conformance"
+
+      - name: Check catalog alignment against the latest catalog
+        id: align
+        env:
+          AUTHPLANE_CONFORMANCE_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+        run: |
+          pytest conformance-tests/test_catalog_alignment.py -v
+
+      - name: Report drift
+        if: always()
+        run: |
+          if [ "${{ steps.align.outcome }}" = "success" ]; then
+            echo "Conformance markers cover the latest catalog default branch." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Conformance catalog drift detected: the SDK's @pytest.mark.conformance markers do not cover every case in the latest catalog default branch. Extend coverage in conformance-tests/, then bump .conformance-catalog-ref to adopt the new cases."
+            {
+              echo "## Conformance catalog drift detected"
+              echo ""
+              echo "The SDK's \`@pytest.mark.conformance\` markers do not cover every case in the **latest** conformance catalog default branch."
+              echo "PR CI is unaffected — it runs against the pinned \`.conformance-catalog-ref\`."
+              echo "Extend coverage in \`conformance-tests/\`, then bump \`.conformance-catalog-ref\` to adopt the new cases."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

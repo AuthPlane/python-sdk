@@ -35,7 +35,7 @@ Requires Python 3.11+.
 import asyncio
 
 from mcp.server.fastmcp import FastMCP
-from authplane_mcp import authplane_mcp_auth, require_scope
+from authplane_mcp import authplane_mcp_auth, install_request_context, require_scope
 
 
 async def main() -> None:
@@ -45,6 +45,10 @@ async def main() -> None:
         scopes=["tools/query", "tools/write"],
     )
     mcp = FastMCP("My Server", port=8080, json_response=True, **auth_result)
+    # Advertises the issuer / resource identifiers verbatim in the Protected
+    # Resource Metadata and installs the request-context middleware used by
+    # inbound DPoP enforcement.
+    install_request_context(mcp)
 
     @mcp.tool()
     async def query(sql: str) -> str:
@@ -232,7 +236,7 @@ Trade-offs to understand before enabling `fail_closed=True`:
 
 - **Availability**: an authorization server or introspection outage makes every request fail with 401 until the outage resolves. Once the client's circuit breaker opens, checks fail fast and all tokens are rejected until the cooldown elapses.
 - **Credentials**: authorization servers commonly require authenticated introspection; without valid `as_credentials` the introspection call fails, which under `fail_closed=True` means every token is rejected. Verify credentials as part of deployment, not just at rollout.
-- **Metadata**: an AS whose metadata document does not advertise `introspection_endpoint` fails every introspection attempt. Under the default that check is silently skipped; under `fail_closed=True` every token is rejected — and unlike an outage this never self-recovers, because the missing endpoint is a permanent property of the AS configuration. Confirm the endpoint is present in AS metadata before enabling.
+- **Metadata**: an AS whose metadata document does not advertise `introspection_endpoint` fails every introspection attempt. Under the default that check is skipped and every request logs a `Revocation check failed (fail-open)` warning — for a missing endpoint that is every request, permanently, since the condition never clears; under `fail_closed=True` every token is rejected — and unlike an outage this never self-recovers, because the missing endpoint is a permanent property of the AS configuration. Confirm the endpoint is present in AS metadata before enabling.
 - `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning at resource construction when it detects this misconfiguration.
 
 ### Custom Revocation Checker

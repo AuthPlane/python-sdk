@@ -206,6 +206,24 @@ class TestValidateURL:
         with pytest.raises(SSRFError, match="must use HTTPS"):
             await validate_url("not a url")
 
+    @patch("authplane.net.ssrf.resolve_hostname")
+    async def test_params_segment_survives_into_path(self, mock_resolve: AsyncMock) -> None:
+        """An RFC 3986 ``;params`` segment must stay in the request path.
+
+        ``urlparse`` moves it out of ``.path`` into its own slot, so the pinned
+        URL built from ``ValidatedURL.path`` would target ``/token`` when the
+        caller asked for ``/token;v=1``. RFC 3986 §3.3 puts it in the path.
+        """
+        mock_resolve.return_value = ["8.8.8.8"]
+
+        validated = await validate_url("https://as.example.com/token;v=1?x=1")
+        assert validated.path == "/token;v=1?x=1"
+
+    async def test_malformed_port_raises_ssrf_error(self) -> None:
+        """``SplitResult.port`` parses lazily; the bare ValueError must not escape."""
+        with pytest.raises(SSRFError, match="Invalid URL"):
+            await validate_url("https://as.example.com:abc/token")
+
 
 @pytest.mark.asyncio
 class TestSSRFSafeFetch:
@@ -220,6 +238,7 @@ class TestSSRFSafeFetch:
         # Setup validation
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/.well-known/jwks.json",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/.well-known/jwks.json",
@@ -264,6 +283,91 @@ class TestSSRFSafeFetch:
         assert call_args[0][1] == "https://1.2.3.4:443/.well-known/jwks.json"
         assert call_args[1]["headers"]["Host"] == "example.com"
 
+    @patch("authplane.net.ssrf.resolve_hostname")
+    @patch("httpx.AsyncClient")
+    async def test_pinned_url_retains_params_segment(
+        self, mock_client_class: MagicMock, mock_resolve: AsyncMock
+    ) -> None:
+        """The pinned URL must address the endpoint the caller named.
+
+        ``validate_url`` is deliberately not mocked here: the pinned URL is
+        assembled from ``ValidatedURL.path``, so this is the assertion that ties
+        the parse fix to the bytes on the wire. With ``urlparse`` the request
+        goes to ``/token`` — a different endpoint than the caller asked for, and
+        a different one than the outbound DPoP proof's ``htu`` names.
+        """
+        mock_resolve.return_value = ["1.2.3.4"]
+
+        mock_response = MagicMock()
+        mock_response.headers = {"content-length": "2"}
+
+        async def mock_aiter_bytes() -> AsyncGenerator[bytes, None]:
+            yield b"{}"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        mock_response.status_code = 200
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_cm)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__.return_value = None
+        mock_client_class.return_value = mock_client
+
+        await ssrf_safe_get("https://as.example.com/token;v=1")
+
+        call_args = mock_client.stream.call_args
+        assert call_args[0][1] == "https://1.2.3.4:443/token;v=1"
+
+    @patch("authplane.net.ssrf.resolve_hostname")
+    @patch("httpx.AsyncClient")
+    async def test_uppercase_scheme_stays_on_the_wire_as_https(
+        self, mock_client_class: MagicMock, mock_resolve: AsyncMock
+    ) -> None:
+        """An uppercase scheme must not be downgraded to cleartext.
+
+        ``validate_url`` is deliberately not mocked, for the same reason as the
+        params-segment case above: the defect was that the gate and the wire
+        read the scheme from two different places. ``urlsplit`` lowercases it,
+        so ``HTTPS://`` passed the HTTPS-only check, and the pinned URL was then
+        rebuilt with ``url.startswith("https://")`` — false — and issued as
+        ``http://``. The port stays 443, so the request fails rather than
+        silently downgrading, but the bytes leave unencrypted, and in
+        ``form_post`` they carry the auth headers.
+
+        Reachable from AS metadata: ``jwks_uri``, ``token_endpoint`` and
+        ``introspection_endpoint`` are validated against the normalized scheme
+        and reach the fetch verbatim.
+        """
+        mock_resolve.return_value = ["1.2.3.4"]
+
+        mock_response = MagicMock()
+        mock_response.headers = {"content-length": "2"}
+
+        async def mock_aiter_bytes() -> AsyncGenerator[bytes, None]:
+            yield b"{}"
+
+        mock_response.aiter_bytes = mock_aiter_bytes
+        mock_response.status_code = 200
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__.return_value = mock_response
+        mock_stream_cm.__aexit__.return_value = None
+
+        mock_client = AsyncMock()
+        mock_client.stream = MagicMock(return_value=mock_stream_cm)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__.return_value = None
+        mock_client_class.return_value = mock_client
+
+        await ssrf_safe_get("HTTPS://as.example.com/jwks")
+
+        call_args = mock_client.stream.call_args
+        assert call_args[0][1] == "https://1.2.3.4:443/jwks"
+
     @patch("authplane.net.ssrf.validate_url")
     @patch("httpx.AsyncClient")
     async def test_host_header_includes_non_default_port(
@@ -272,6 +376,7 @@ class TestSSRFSafeFetch:
         """Non-default port must appear in the Host header (RFC 7230 §5.4)."""
         mock_validate.return_value = ValidatedURL(
             original_url="http://localhost:9000/foo",
+            scheme="http",
             hostname="localhost",
             port=9000,
             path="/foo",
@@ -309,6 +414,7 @@ class TestSSRFSafeFetch:
         """Default HTTP port 80 must be omitted from the Host header."""
         mock_validate.return_value = ValidatedURL(
             original_url="http://example.com/path",
+            scheme="http",
             hostname="example.com",
             port=80,
             path="/path",
@@ -346,6 +452,7 @@ class TestSSRFSafeFetch:
         """IPv6 hostnames must be bracketed in the Host header (RFC 3986 §3.2.2)."""
         mock_validate.return_value = ValidatedURL(
             original_url="http://[::1]:9000/foo",
+            scheme="http",
             hostname="::1",
             port=9000,
             path="/foo",
@@ -383,6 +490,7 @@ class TestSSRFSafeFetch:
         """Should reject response if Content-Length exceeds max_size."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/large",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/large",
@@ -414,6 +522,7 @@ class TestSSRFSafeFetch:
         """Should reject response if actual content exceeds max_size."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/large",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/large",
@@ -450,6 +559,7 @@ class TestSSRFSafeFetch:
         """Should disable redirects to prevent bypass."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/",
@@ -490,6 +600,7 @@ class TestSSRFSafeFetch:
         """Should configure timeout for all operations."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/",
@@ -538,6 +649,7 @@ class TestSSRFSafeFetch:
         """Should try next IP if first times out."""
         mock_validate.return_value = ValidatedURL(
             original_url="https://example.com/",
+            scheme="https",
             hostname="example.com",
             port=443,
             path="/",

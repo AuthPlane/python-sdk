@@ -150,12 +150,15 @@ async def verify_dpop_proof(
             f"DPoP proof URL mismatch: expected {normalized_url!r}, got {htu!r}"
         )
 
-    if expected_nonce:
-        actual_nonce = str(claims.get("nonce", ""))
-        if actual_nonce != expected_nonce:
-            raise InvalidDPoPProofError(
-                f"DPoP proof nonce mismatch: expected {expected_nonce!r}, got {actual_nonce!r}"
-            )
+    # RFC 9449 §9 (Resource Server-Provided Nonce). Opt-in: an empty
+    # expected_nonce means no policy, so a proof carrying an AS-issued nonce
+    # still verifies. The message carries no values on purpose — errors on this
+    # path reach an unauthenticated caller through the `error_description` of a
+    # `WWW-Authenticate` challenge (see `www_authenticate` in errors.py), and
+    # echoing the server's expected nonce there would hand out a currently
+    # valid nonce without the challenge round trip the freshness proof rests on.
+    if expected_nonce and str(claims.get("nonce", "")) != expected_nonce:
+        raise InvalidDPoPProofError("DPoP proof nonce mismatch")
 
     _validate_dpop_temporal(
         claims, iat, max_age_seconds=max_age_seconds, clock_skew_seconds=clock_skew_seconds

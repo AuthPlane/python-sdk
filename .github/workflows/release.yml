@@ -96,7 +96,20 @@ jobs:
       # need its auth/persist-credentials features for a public read-only repo.
       - name: Clone shared conformance catalog (out of tree)
         run: |
-          git clone --depth 1 https://github.com/AuthPlane/conformance.git "$RUNNER_TEMP/conformance"
+          # Conformance catalog pinned by SHA, single-sourced from the tracked
+          # .conformance-catalog-ref at the repo root (read from the checked-out
+          # workspace, so the Checkout step above must precede this one). Bump
+          # that file when adopting new catalog cases, together with the SDK-side
+          # conformance coverage, so a catalog change can never break CI on its
+          # own. Source: github.com/AuthPlane/conformance.
+          CONFORMANCE_CATALOG_REF="$(cat "$GITHUB_WORKSPACE/.conformance-catalog-ref")"
+          grep -Eq '^[0-9a-f]{40}$' <<<"$CONFORMANCE_CATALOG_REF" \
+            || { echo "::error::.conformance-catalog-ref must be a 40-hex commit SHA"; exit 1; }
+          git init -q "$RUNNER_TEMP/conformance"
+          git -C "$RUNNER_TEMP/conformance" \
+            fetch --depth=1 https://github.com/AuthPlane/conformance.git "$CONFORMANCE_CATALOG_REF" \
+            || { echo "::error::Pinned conformance catalog ref $CONFORMANCE_CATALOG_REF is unreachable"; exit 1; }
+          git -C "$RUNNER_TEMP/conformance" checkout -q FETCH_HEAD
 
       - name: Set up Python 3.11
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

@@ -10,22 +10,48 @@ marker instead of an external mapping file::
 Optional coverage metadata can be added::
 
     @pytest.mark.conformance(
-        "rfc9449-dpop-proof-jwk-must-not-include-private-key-material",
+        "<catalog-case-id>",
         level="partial",
         gaps=["expected.error_hint"],
-        note="Python rejects the proof but does not expose a stable diagnostic.",
+        note="<which part of the case the test does not reach>",
     )
     async def test_...(...):
         ...
 
-Tests that are not yet implemented should use ``pytest.xfail`` — these
-appear as ``skipped`` in the generated report (pytest classifies ``xfail``
-outcomes as skips) so the suite stays green for known gaps while the gap
-itself remains visible in the per-case status and the ``note`` field::
+Case ids in this docstring are placeholders on purpose: a real id here would
+be claiming coverage metadata that the marker on the actual test may not
+carry.
 
-    @pytest.mark.conformance("rfc9449-dpop-inbound-nonce-must-be-validated-when-required")
+``gaps`` holds *catalog field paths* — the parts of the case the test does
+not reach. ``note`` holds the prose. Always write a ``note`` alongside
+``gaps``, because ``note`` is the gate: one filter selects the cases with a
+truthy ``note``, and it decides both whether the Coverage Notes section is
+emitted at all and which cases it lists — and the ``Gaps:`` line is emitted
+*inside* that section. So a ``gaps``-only marker states no reason anywhere
+in ``conformance-report.md`` and its ``gaps`` survive in
+``conformance-report.json`` alone; set a ``note`` and both render. ``level``
+is not gated on ``note`` — it reaches the markdown either way, via the Cases
+table's Coverage column.
+
+A test that exercises part of a case but not all of it is a ``partial`` — it
+still runs and still asserts::
+
+    @pytest.mark.conformance(
+        "<catalog-case-id>",
+        level="partial",
+        gaps=["use_case"],
+        note="setup/stimulus/expected are covered; the lifecycle the use_case "
+        "narrates is not implemented and is not exercised here.",
+    )
     async def test_...(...):
-        pytest.xfail("Not implemented: inbound nonce enforcement")
+        ...
+
+A case with nothing behind it at all should use ``pytest.xfail``, which the
+report records as ``skipped`` (pytest classifies ``xfail`` outcomes as skips)
+so the suite stays green while the per-case status keeps the gap visible.
+Prefer a running ``partial`` where one is honest: an xfail asserts nothing,
+so it cannot notice the day the gap closes. The suite currently has no
+xfails.
 """
 
 import json

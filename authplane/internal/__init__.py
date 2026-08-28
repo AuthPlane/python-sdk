@@ -10,7 +10,7 @@ from .document_cache import (
 from .document_fetcher import DocumentFetcher
 from .fetch_result import FetchResult
 from .metadata import MetadataCache
-from .urls import build_metadata_url, build_prm_url
+from .urls import build_metadata_url, build_prm_url, validate_resource_indicator
 
 __all__ = [
     "DocumentCache",
@@ -23,4 +23,5 @@ __all__ = [
     "build_metadata_url",
     "build_prm_url",
     "parse_expires_at",
+    "validate_resource_indicator",
 ]

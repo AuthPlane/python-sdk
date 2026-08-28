@@ -16,14 +16,21 @@ try:
 except _PackageNotFoundError:  # pragma: no cover - source tree without an install
     __version__ = "0.0.0+unknown"
 
-from .auth import AuthplaneAuthResult, authplane_auth
+from ._prm import rewrite_prm_routes_verbatim
+from .auth import (
+    AuthplaneAuthResult,
+    VerbatimPRMRemoteAuthProvider,
+    authplane_auth,
+)
 from .url_elicitation import to_url_elicitation_required_error
 from .verifier import AuthplaneTokenVerifier
 
 __all__ = [
     "AuthplaneAuthResult",
     "AuthplaneTokenVerifier",
+    "VerbatimPRMRemoteAuthProvider",
     "__version__",
     "authplane_auth",
+    "rewrite_prm_routes_verbatim",
     "to_url_elicitation_required_error",
 ]
