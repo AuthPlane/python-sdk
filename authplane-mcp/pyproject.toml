@@ -25,7 +25,7 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "authplane-sdk",
+    "authplane-sdk==0.4.0",
     # Floor is 1.28.1: mcp <=1.28.0 carries PYSEC-2026-3483, fixed in 1.28.1.
     # This adapter targets the mcp 1.x server API (`mcp.server.fastmcp.FastMCP`)
     # and the camelCase URL-elicitation field (`ElicitRequestURLParams(
