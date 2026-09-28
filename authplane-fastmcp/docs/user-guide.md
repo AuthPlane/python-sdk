@@ -86,6 +86,7 @@ All parameters of `authplane_auth()`:
 | `revocation_checker` | see [below](#token-revocation-checking) | `None` | Token revocation strategy |
 | `fail_closed` | `bool` | `False` | Reject tokens when the revocation check itself fails, instead of accepting them (see [below](#failure-policy-fail-open-vs-fail-closed)) |
 | `fetch_settings` | `FetchSettings` | `None` | Full SSRF / fetch settings applied to both metadata and JWKS fetches (overrides `dev_mode`) |
+| `resource_metadata_url` | `str` | `None` | URL to advertise as RFC 9728 §5.1 `resource_metadata` instead of the derivation of the resource, for an AS-hosted PRM document. Does **not** reach the challenge FastMCP emits — see [below](#where-the-prm-document-lives) |
 | `inbound_dpop` | `InboundDPoPOptions` | `None` | Per-resource inbound DPoP policy (replay store, max proof age, clock skew, accepted proof algorithms, `required`). When set, the resource advertises DPoP support in PRM (RFC 9728 §2). See **Inbound DPoP through the FastMCP adapter** below for current limitations. |
 
 ### Inbound DPoP through the FastMCP adapter
@@ -183,6 +184,31 @@ The response includes:
 
 No additional configuration is needed; PRM is served automatically.
 
+### Where the PRM document lives
+
+Two topologies, and the adapter supports both:
+
+**(a) Resource-hosted — the default.** This server serves the document itself at the well-known path derived from the resource (`base_url` + `mcp_path`, RFC 9728 §3.1), exactly as the table above shows. Nothing to configure.
+
+**(b) AS-hosted.** The authorization server serves the document for every registered Resource — authserver >= 0.2.0 serves one at `<issuer>/.well-known/oauth-protected-resource/{ref}`, where `ref` is the RFC 9728 §3.1 path suffix of the Resource URI (or its slug) — and this server only points clients at it. Useful when the resource server cannot host well-known paths. Pass `resource_metadata_url=`:
+
+```python
+mcp = FastMCP(
+    "My MCP Server",
+    **await authplane_auth(
+        issuer="https://auth.company.com",
+        base_url="https://mcp.company.com",
+        resource_metadata_url="https://auth.company.com/.well-known/oauth-protected-resource/mcp",
+    ),
+)
+```
+
+**FastMCP's own challenge keeps the derived URL.** No upstream parameter accepts a metadata URL: `AuthProvider` takes `base_url` and `resource_base_url`, both resource *identifiers*, and `fastmcp.server.http` derives the challenge URL from `AuthProvider._get_resource_url(path)` through `mcp.server.auth.routes.build_resource_metadata_url` before passing it to `fastmcp.server.auth.middleware.RequireAuthMiddleware`. So the 401 and the 403 `insufficient_scope` that middleware sends carry the resource-hosted URL whatever you configure here — and `resource_base_url` is not the lever either, since it also moves the PRM route this adapter serves. What the option does reach is every challenge this SDK composes: `AuthplaneTokenVerifier.resource_metadata_url()`, and through it any middleware of your own calling `response_headers_for(...)`. Until upstream accepts a URL, option (b) is only fully effective for a server whose 401/403 you emit yourself.
+
+**RFC 9728 §3.3 constrains topology (b).** The rule binds the document's `resource` value to *the URL the document was fetched from*, not to the API URL the client called: the value "MUST be identical to the protected resource's resource identifier value into which the well-known URI path suffix was inserted to create the URL used to retrieve the metadata", and otherwise "MUST NOT be used". Those two readings coincide only when the metadata URL is the §3.1 derivation of the resource — i.e. in topology (a). An AS-hosted document on a different origin is therefore usable only against clients that do not enforce §3.3, and that check is what stops a resource server from pointing a client at metadata for somebody else's resource. See the [core user guide](../../authplane/docs/user-guide.md) for the worked example.
+
+Whichever topology you pick, the Resource URI registered at the AS, the resource derived here from `base_url` + `mcp_path`, and this server's public URL must be one identical string — a trailing slash or a `:443` spelled out on one side only is a mismatch.
+
 ## Token Revocation Checking
 
 By default, tokens are validated offline (signature + claims only). You can enable revocation checking to catch tokens that have been revoked before they expire.
@@ -217,8 +243,14 @@ await authplane_auth(
 
 - The introspection endpoint is automatically discovered from AS metadata.
 - If the endpoint returns `active=false`, the token is rejected with `TokenRevokedError`.
-- **Fails open by default**: if the introspection endpoint is unavailable, the token is accepted (offline validation still applies). Pass `fail_closed=True` to reject instead (see [below](#failure-policy-fail-open-vs-fail-closed)).
-- `as_credentials` enables authenticated introspection (recommended for production).
+- **An introspection error lets the token through**: if the introspection endpoint is unavailable, the token is accepted (offline validation still applies). This is the default; pass `fail_closed=True` to refuse instead (see [below](#failure-policy-fail-open-vs-fail-closed)).
+- `as_credentials` is required. The resource server's client must be **confidential** (it has a secret) and must be either the client the token was issued to or a runtime-client of the Resource named in the token's `aud`. Register it once per resource:
+
+  ```bash
+  authserver admin resource runtime-client add --client-id <rs-client-id> --slug <resource-slug>
+  ```
+
+  A public client cannot introspect at all. Since authserver 0.1.2 an unauthenticated introspection call, or one from a client that is neither the issuer nor a runtime-client, is answered with `{"active": false}` — not an error — so every token is rejected as revoked. The SDK warns at startup when `IntrospectionRevocation` is configured without `as_credentials`, and once per resource the first time `active=false` comes back for a token that passed local verification.
 
 ### Failure Policy: Fail-Open vs Fail-Closed
 
@@ -243,9 +275,10 @@ await authplane_auth(
 Trade-offs to understand before enabling `fail_closed=True`:
 
 - **Availability**: an authorization server or introspection outage makes every request fail with 401 until the outage resolves. Once the client's circuit breaker opens, checks fail fast and all tokens are rejected until the cooldown elapses.
-- **Credentials**: authorization servers commonly require authenticated introspection; without valid `as_credentials` the introspection call fails, which under `fail_closed=True` means every token is rejected. Verify credentials as part of deployment, not just at rollout.
+- **Credentials**: without valid `as_credentials`, or with a client that is not a runtime-client of the resource, authserver ≥ 0.1.2 answers `active=false` rather than an error — so every token is rejected under **both** policies, and `fail_closed` does not change that. Verify the credentials and the runtime-client registration as part of deployment, not just at rollout.
 - **Metadata**: an AS whose metadata document does not advertise `introspection_endpoint` fails every introspection attempt. Under the default that check is skipped and every request logs a `Revocation check failed (fail-open)` warning — for a missing endpoint that is every request, permanently, since the condition never clears; under `fail_closed=True` every token is rejected — and unlike an outage this never self-recovers, because the missing endpoint is a permanent property of the AS configuration. Confirm the endpoint is present in AS metadata before enabling.
-- `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning at resource construction when it detects this misconfiguration.
+- `fail_closed` has no effect when `revocation_checker` is `None` — the flag is only consulted when a revocation check actually runs. The SDK logs a warning when it detects this misconfiguration.
+- The SDK also logs at INFO when a revocation checker is configured fail-open, so the posture in effect appears in startup output rather than only in the docs. See the core SDK user guide for why that one is not a warning.
 
 ### Custom Revocation Checker
 
@@ -310,7 +343,23 @@ downstream = await result.client.exchange(
 | `resources` | `tuple[str, ...]` | Target resource identifiers (RFC 8707). Binds the downstream token's audience. |
 | `audiences` | `tuple[str, ...]` | Explicit audiences when not using `resources`. |
 
-`client.exchange()` raises `InvalidGrantError` on a rejected grant, `ConsentRequiredError` when the AS requires interactive user consent before issuance, `CircuitOpenError` when the AS circuit is open, and other `AuthplaneError` subclasses for transport/protocol failures. See [Error Handling](#error-handling) and [URL Elicitation for Consent](#url-elicitation-for-consent) below.
+**Operator step — allowlist the exchanging client.** authserver 0.2.0 only honours a cross-client exchange when the exchanging client is allowlisted on the target Resource. For each MCP server that exchanges for a downstream resource it does not itself act as, add its client id to that Resource's exchange policy:
+
+```http
+PATCH /admin/resources/{id}
+{"policy": {"exchange": {"allowed_client_ids": ["<exchanging-client-id>"]}}}
+```
+
+A client exchanging a token that was issued to itself, a fronted exchange, and a Broker resource need nothing.
+
+`client.exchange()` raises:
+
+- `AccessDeniedError` (`access_denied`, HTTP 403) — the exchanging client is not allowlisted on the target Resource. This is an operator-side fix (the `PATCH` above); re-prompting the user will not clear it, which is why it is a distinct class from `ConsentRequiredError`.
+- `InvalidTargetError` (`invalid_target`, HTTP 400, RFC 8707 §2.2) — the `resource` string does not match a granted resource byte for byte; a trailing slash is enough.
+- `ConsentRequiredError` — the AS requires interactive user consent before issuance.
+- `InvalidGrantError` on a rejected grant, `CircuitOpenError` when the AS circuit is open, and other `AuthplaneError` subclasses for transport/protocol failures. `AccessDeniedError` and `InvalidTargetError` never trip the circuit breaker.
+
+See [Error Handling](#error-handling) and [URL Elicitation for Consent](#url-elicitation-for-consent) below.
 
 ## URL Elicitation for Consent
 
@@ -445,6 +494,10 @@ Scope checks happen *after* token validation succeeds and are a separate enforce
 
 When you handle an `AuthplaneError` outside the verifier — typically because you are wrapping the adapter in your own middleware or calling `AuthplaneResource.verify()` directly — use `response_headers_for(error, …)` to map the error to `(status, {"WWW-Authenticate": challenge})` in one call. It forwards `realm`, `resource_metadata_url`, and `scope` into the underlying `www_authenticate()` helper, which sanitizes every interpolated value against header injection.
 
+`error_description` is a fixed sentence chosen by the error code, never the exception's message — the challenge goes to a caller who has not authenticated, and the SDK's messages name the `kid`, claim, or expected audience that failed. The message stays on the exception and is logged at `DEBUG` on the `authplane.errors` logger; `verbose_description=True` puts it back on the wire for development only.
+
+A resource running `inbound_dpop` in optional mode accepts both `Bearer` and `DPoP` and should advertise both (RFC 9449 §7.1). `response_headers_for()` cannot express that — a dict holds one value per header name — so pair `http_status()` with `www_authenticate_challenges(error, schemes=("Bearer", "DPoP"), algs=…)` and emit one `WWW-Authenticate` header value per element. See the core SDK user guide for the full example.
+
 ```python
 from authplane import AuthplaneError, response_headers_for
 
@@ -454,7 +507,7 @@ except AuthplaneError as error:
     status, headers = response_headers_for(
         error,
         realm="api.example.com",
-        resource_metadata_url=resource.prm_url(),
+        resource_metadata_url=resource.resource_metadata_url(),
     )
     return Response(status_code=status, headers=headers)
 ```
@@ -514,6 +567,7 @@ async def authplane_auth(
     inbound_dpop: InboundDPoPOptions | None = None,
     revocation_checker: IntrospectionRevocation | RevocationChecker | None = None,
     fail_closed: bool = False,
+    resource_metadata_url: str | None = None,
 ) -> AuthplaneAuthResult
 ```
 
@@ -568,6 +622,7 @@ FastMCP `TokenVerifier` implementation.
 | `verify_token(token: str) -> AccessToken \| None` | Validate JWT, return `AccessToken` or `None` |
 | `verifier` (property) | Access underlying `AuthplaneResource` |
 | `scopes_supported` (property) | Scopes configured in the verifier |
+| `resource_metadata_url() -> str` | URL to advertise as RFC 9728 §5.1 `resource_metadata` — the configured override, or the derivation |
 
 ### Core SDK types
 

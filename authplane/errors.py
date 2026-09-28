@@ -4,7 +4,11 @@ All exceptions inherit from AuthplaneError for easy catching.
 InsufficientScope is distinguishable for 403 HTTP status mapping.
 """
 
+import logging
 import re
+from collections.abc import Sequence
+
+_LOGGER = logging.getLogger(__name__)
 
 _HEADER_VALUE_UNSAFE = re.compile(r'[\r\n"\\]+')
 
@@ -13,6 +17,42 @@ def _sanitize_header_value(value: str) -> str:
     """Replace CR, LF, double-quote, and backslash with a single space so the
     value cannot break out of a quoted ``WWW-Authenticate`` parameter or inject
     additional header fields. Leading/trailing whitespace is stripped.
+
+    This is a backstop and must not be read as the guarantee for
+    ``resource_metadata``. Substituting there was in fact the wrong remedy for
+    a configured identifier: the header stayed parseable, but it advertised a
+    URL that no longer matched the one a client derives from the identifier
+    this SDK also serves as the ``resource`` member of the PRM document, which
+    is the RFC 9728 §3.3 mismatch reached by another route — the challenge
+    looked fine and discovery failed anyway. A `"` or a `\\` in the **host** of
+    a configured resource identifier is now rejected at construction
+    (``internal/urls.py``), which is where that defect is worst: a backslash
+    there leaves the challenge well-formed and redirects a conformant client to
+    a different origin entirely.
+
+    The host is the whole of that guarantee, and the scoping is deliberate
+    rather than incidental. The construction gate scans ``parsed.hostname``,
+    while ``build_prm_url`` splices the identifier's path and query into the
+    derived URL verbatim (RFC 9728 §3.1 inserts the well-known segment
+    *between* the host and them, so all three land inside this one
+    quoted-string). Measured on 3.12: ``https://api.example.com/m"cp``
+    constructs, derives
+    ``https://api.example.com/.well-known/oauth-protected-resource/m"cp``, and
+    arrives here — where the substitution advertises ``.../m cp``, the same
+    RFC 9728 §3.3 mismatch one component over. Same-origin and ending in a
+    client-side discard rather than a redirect to another host, which is why
+    that axis is a separate decision with its own migration cost and is not
+    settled here. Until it is, this function is what stands between a path- or
+    query-borne delimiter and the challenge.
+
+    It is kept rather than removed for three reasons, none of which the
+    construction gate covers. ``realm`` and ``scope`` pass through here and are
+    gated nowhere — they are free-form operator strings. So is
+    ``resource_metadata_url`` itself: it is a plain ``str`` parameter of the
+    public ``www_authenticate``/``response_headers_for``, and nothing obliges a
+    caller to have obtained it from ``AuthplaneResource.prm_url()``. And CR/LF
+    here defend against header-field injection, a different hazard from the
+    quoted-string one, on values whose provenance this module cannot see.
     """
     return _HEADER_VALUE_UNSAFE.sub(" ", value).strip()
 
@@ -236,6 +276,37 @@ class ConsentRequiredError(AuthError):
         return f"{self} ({sid}: {cause})"
 
 
+class AccessDeniedError(AuthError):
+    """AS refused the request outright (``access_denied``, HTTP 403).
+
+    No RFC section is cited because there is none for this endpoint: RFC 6749
+    defines ``access_denied`` at the *authorization* endpoint (§4.1.2.1), and
+    neither the token-endpoint list (§5.2) nor RFC 8693 §2.2.2 includes it.
+    The code as used here is authserver's token-endpoint extension.
+
+    On a token exchange this is a policy decision, not a consent gap: the
+    exchanging client is not in the target Resource's exchange allowlist
+    (``policy.exchange.allowed_client_ids`` / ``policy.runtime.client_ids``).
+    Re-prompting the user cannot fix it — the operator has to allowlist the
+    client on the Resource — which is why it is kept apart from
+    :class:`ConsentRequiredError`. Not an outage signal: it never trips the
+    circuit breaker.
+    """
+
+    pass
+
+
+class InvalidTargetError(AuthError):
+    """The ``resource`` parameter names no granted resource (RFC 8707 §2.2 'invalid_target').
+
+    The AS compares the indicator byte for byte against the resources it
+    knows, so a trailing slash or a differing scheme is enough. Not an
+    outage signal: it never trips the circuit breaker.
+    """
+
+    pass
+
+
 class InvalidClientError(AuthError):
     """AS rejected the client credentials (RFC 6749 'invalid_client')."""
 
@@ -284,12 +355,180 @@ class CircuitOpenError(AuthError):
     pass
 
 
+# The challenge reaches a caller who by definition has not authenticated, so
+# `error_description` is built from the RFC 6750 §3.1 / RFC 9449 §7.1 error
+# code, never from the exception message. The SDK's own messages name the
+# failing detail — the unknown `kid`, the claim that did not validate, the
+# `typ` that was rejected — and an `aud` mismatch in particular would hand the
+# caller the exact audience string the resource expects, which is the value
+# they would need in order to request a token for it. RFC 6750 §3 does not
+# require `error_description` to be diagnostic: the `error` code already
+# carries everything a conforming client needs to decide what to do next.
+# `_sanitize_header_value` is not a defence here — it prevents header
+# injection, not disclosure; a sanitized `kid` is still a `kid`.
+#
+# The descriptions carry no comma. A comma inside a quoted-string is legal
+# RFC 7235, but it is also the separator between challenge parameters and
+# between header values, so keeping it out of the one parameter whose text we
+# choose leaves nothing for a lenient client-side parser to split on.
+_SAFE_ERROR_DESCRIPTIONS: dict[str, str] = {
+    "invalid_token": "The access token is missing or not valid for this resource",
+    "insufficient_scope": "The access token does not carry the scope this operation requires",
+    "invalid_dpop_proof": "The DPoP proof is missing or not valid for this request",
+}
+
+# Fallback for an error code added without a matching entry above. Kept
+# deliberately contentless for the same reason the table exists.
+_FALLBACK_ERROR_DESCRIPTION = "The request could not be authenticated"
+
+# Authentication schemes this SDK can advertise. Unlike the quoted challenge
+# parameters, the scheme is a bare RFC 7235 token, so an unrecognized value is
+# rejected outright rather than sanitized into the header.
+_SUPPORTED_SCHEMES: dict[str, str] = {"bearer": "Bearer", "dpop": "DPoP"}
+
+
+def _error_code_for(error: AuthplaneError, scheme: str) -> str:
+    """Return the RFC 6750 §3.1 error code to advertise for ``error`` under ``scheme``."""
+    if isinstance(error, InsufficientScopeError):
+        return "insufficient_scope"
+    if isinstance(error, DPoPMultipleProofsError) and scheme == "DPoP":
+        # RFC 9449 §7.1 prescribes `invalid_dpop_proof` for §4.3
+        # cardinality rejections, not the SDK's historical `invalid_token`
+        # used by the other `DPoPError` shapes. Scoped to this error;
+        # a broader sweep is a separate change. The code is defined for the
+        # DPoP scheme, so a Bearer challenge emitted alongside it keeps
+        # `invalid_token` rather than naming a code Bearer does not define.
+        return "invalid_dpop_proof"
+    return "invalid_token"
+
+
+def _scheme_for(error: AuthplaneError) -> str:
+    """Return the single scheme that matches ``error``'s type."""
+    return (
+        "DPoP"
+        if isinstance(error, DPoPError) and not isinstance(error, DPoPNotSupportedError)
+        else "Bearer"
+    )
+
+
+def _description_for(error: AuthplaneError, error_code: str, verbose: bool) -> str:
+    """Return the `error_description` value to emit for ``error``."""
+    if verbose:
+        return _sanitize_header_value(str(error))
+    return _SAFE_ERROR_DESCRIPTIONS.get(error_code, _FALLBACK_ERROR_DESCRIPTION)
+
+
+def _normalize_schemes(schemes: Sequence[str]) -> list[str]:
+    """Canonicalize and de-duplicate ``schemes``, preserving caller order."""
+    normalized: list[str] = []
+    for scheme in schemes:
+        canonical = _SUPPORTED_SCHEMES.get(scheme.strip().lower())
+        if canonical is None:
+            raise ValueError(
+                f"Unsupported authentication scheme {scheme!r}; "
+                f"only {sorted(_SUPPORTED_SCHEMES.values())} can be advertised"
+            )
+        if canonical not in normalized:
+            normalized.append(canonical)
+    if not normalized:
+        raise ValueError("schemes must be non-empty; omit it to derive the scheme from the error")
+    return normalized
+
+
+def _normalize_algs(algs: Sequence[str] | None) -> tuple[str, ...]:
+    """Resolve ``algs`` to the exact set to advertise, rejecting what cannot be.
+
+    Three inputs, three defined meanings:
+
+    * a bare ``str`` — rejected. ``str`` satisfies ``Sequence[str]``, so
+      ``algs="ES256"`` type-checks under pyright strict and then ``" ".join``
+      iterates it into ``algs="E S 2 5 6"``: a challenge advertising
+      algorithms that do not exist, from which a conforming client concludes
+      it cannot sign a proof at all. ``schemes`` is protected against the same
+      slip by accident (``_normalize_schemes`` rejects ``'B'``).
+    * ``None`` — the default set, the same meaning
+      :class:`~authplane.dpop.InboundDPoPOptions` gives it. This is what makes
+      the documented ``algs=options.allowed_proof_algorithms`` call correct on
+      an options object built from defaults, where that attribute *is* ``None``:
+      it used to advertise nothing at all, and briefly raised ``TypeError``
+      from inside the 401 handler, which turns an unauthenticated request into
+      a 500.
+    * a sequence — validated, not sanitized. These are bare RFC 7235 tokens,
+      the same shape as ``schemes``, so they get the same treatment: an
+      unusable value is refused rather than quietly rewritten. Escaping alone
+      let a comma through, and a comma is the one character the surrounding
+      code works to keep out of parameter text so that a lenient client-side
+      parser has nothing to split on.
+
+    An empty sequence stays "omit the parameter", which is the parameter's own
+    default and what every caller that does not pass it relies on.
+    """
+    # Imported here, not at module scope: `dpop` imports this module, so a
+    # top-level import would be circular.
+    from .dpop import SUPPORTED_DPOP_ALGORITHMS
+
+    if isinstance(algs, str):
+        raise TypeError(
+            f"algs must be a sequence of algorithm names, not a bare str ({algs!r}); "
+            f"pass ({algs!r},) to advertise a single algorithm"
+        )
+    if algs is None:
+        return tuple(SUPPORTED_DPOP_ALGORITHMS)
+    normalized = tuple(algs)
+    unsupported = [alg for alg in normalized if alg not in SUPPORTED_DPOP_ALGORITHMS]
+    if unsupported:
+        raise ValueError(
+            f"Unsupported DPoP proof algorithms {unsupported!r}; only "
+            f"{list(SUPPORTED_DPOP_ALGORITHMS)} can be advertised"
+        )
+    return normalized
+
+
+def _build_challenge(
+    error: AuthplaneError,
+    scheme: str,
+    *,
+    realm: str,
+    resource_metadata_url: str | None,
+    scope: Sequence[str] | None,
+    algs: Sequence[str],
+    verbose_description: bool,
+) -> str:
+    """Assemble one ``WWW-Authenticate`` header value for a single scheme."""
+    error_code = _error_code_for(error, scheme)
+
+    parts: list[str] = []
+    if realm:
+        parts.append(f'realm="{_sanitize_header_value(realm)}"')
+    parts.append(f'error="{error_code}"')
+    parts.append(f'error_description="{_description_for(error, error_code, verbose_description)}"')
+    if scope:
+        parts.append(f'scope="{_sanitize_header_value(" ".join(scope))}"')
+    if resource_metadata_url:
+        parts.append(f'resource_metadata="{_sanitize_header_value(resource_metadata_url)}"')
+    # RFC 9449 §7.1 defines `algs` for the DPoP challenge only, so a Bearer
+    # challenge in the same set never carries it.
+    if scheme == "DPoP" and algs:
+        # No escaping: `_normalize_algs` has already refused anything that is
+        # not one of the supported bare tokens, so there is nothing to escape.
+        parts.append(f'algs="{" ".join(algs)}"')
+    return f"{scheme} " + ", ".join(parts)
+
+
+def _resolved_scope(error: AuthplaneError, scope: Sequence[str] | None) -> Sequence[str] | None:
+    """Fall back to ``InsufficientScopeError.required_scopes`` when no scope was passed."""
+    if scope is None and isinstance(error, InsufficientScopeError) and error.required_scopes:
+        return list(error.required_scopes)
+    return scope
+
+
 def www_authenticate(
     error: AuthplaneError,
     *,
     realm: str = "",
     resource_metadata_url: str | None = None,
-    scope: list[str] | None = None,
+    scope: Sequence[str] | None = None,
+    verbose_description: bool = False,
 ) -> str:
     """Build an RFC 6750 §3 ``WWW-Authenticate`` header value.
 
@@ -302,6 +541,18 @@ def www_authenticate(
       ``DPoP`` scheme with ``invalid_token``
     - All other ``AuthplaneError`` → ``Bearer`` scheme with ``invalid_token``
 
+    ``error_description`` is a fixed, caller-safe sentence chosen by the error
+    code — the exception's own message is never placed on the wire, because the
+    challenge is served to a caller who has not authenticated. The message stays
+    on the exception for the resource server to log, and is also emitted here at
+    ``DEBUG`` on the ``authplane.errors`` logger.
+
+    ``verbose_description=True`` restores the previous behaviour of copying the
+    exception message into the challenge. It is a development aid: it discloses
+    SDK-internal detail (the unknown ``kid``, the claim that failed, the
+    expected audience) to unauthenticated callers, so do not enable it in
+    production.
+
     If ``scope`` is provided (or the error is an :class:`InsufficientScopeError`
     carrying ``required_scopes``), an RFC 6750 §3 ``scope="…"`` challenge
     parameter is included. An explicit ``scope`` argument takes precedence.
@@ -312,39 +563,117 @@ def www_authenticate(
 
     Every interpolated value is sanitized to prevent header injection.
 
+    A resource that accepts more than one scheme — ``inbound_dpop`` in optional
+    mode accepts both ``Bearer`` and ``DPoP`` — cannot be described by a single
+    header value; use :func:`www_authenticate_challenges` for that.
+
     Returns:
         A header value like ``Bearer error="invalid_token", error_description="..."``
     """
-    if isinstance(error, InsufficientScopeError):
-        error_code = "insufficient_scope"
-    elif isinstance(error, DPoPMultipleProofsError):
-        # RFC 9449 §7.1 prescribes `invalid_dpop_proof` for §4.3
-        # cardinality rejections, not the SDK's historical `invalid_token`
-        # used by the other `DPoPError` shapes. Scoped to this error;
-        # a broader sweep is a separate change.
-        error_code = "invalid_dpop_proof"
-    else:
-        error_code = "invalid_token"
-
-    scheme = (
-        "DPoP"
-        if isinstance(error, DPoPError) and not isinstance(error, DPoPNotSupportedError)
-        else "Bearer"
+    scheme = _scheme_for(error)
+    if not verbose_description:
+        _LOGGER.debug(
+            "www_authenticate: %s: %s",
+            type(error).__name__,
+            error,
+            extra={"scheme": scheme, "error_code": _error_code_for(error, scheme)},
+        )
+    return _build_challenge(
+        error,
+        scheme,
+        realm=realm,
+        resource_metadata_url=resource_metadata_url,
+        scope=_resolved_scope(error, scope),
+        algs=(),
+        verbose_description=verbose_description,
     )
 
-    if scope is None and isinstance(error, InsufficientScopeError) and error.required_scopes:
-        scope = list(error.required_scopes)
 
-    parts: list[str] = []
-    if realm:
-        parts.append(f'realm="{_sanitize_header_value(realm)}"')
-    parts.append(f'error="{error_code}"')
-    parts.append(f'error_description="{_sanitize_header_value(str(error))}"')
-    if scope:
-        parts.append(f'scope="{_sanitize_header_value(" ".join(scope))}"')
-    if resource_metadata_url:
-        parts.append(f'resource_metadata="{_sanitize_header_value(resource_metadata_url)}"')
-    return f"{scheme} " + ", ".join(parts)
+def www_authenticate_challenges(
+    error: AuthplaneError,
+    *,
+    schemes: Sequence[str] | None = None,
+    algs: Sequence[str] | None = (),
+    realm: str = "",
+    resource_metadata_url: str | None = None,
+    scope: Sequence[str] | None = None,
+    verbose_description: bool = False,
+) -> list[str]:
+    """Build one RFC 6750 §3 challenge per authentication scheme the resource accepts.
+
+    :func:`www_authenticate` picks the scheme from the error's type, so it can
+    only ever name one. A resource running ``inbound_dpop`` in optional mode
+    accepts both ``Bearer`` and ``DPoP`` and should advertise both, so that a
+    DPoP-capable client can discover that sender-constrained tokens are taken
+    here (RFC 9449 §7.1; §7.2 covers running the two schemes side by side).
+
+    Two challenges cannot be joined with a comma: the comma is also the
+    separator *between parameters inside* a challenge, so the result cannot be
+    parsed unambiguously. RFC 7235 §4.1 permits the comma-joined form but
+    warns about parsing it, so separate ``WWW-Authenticate`` header values are
+    the interoperable choice: this returns a list and the caller emits one header value
+    per element::
+
+        for challenge in www_authenticate_challenges(error, schemes=("Bearer", "DPoP")):
+            response.headers.add("WWW-Authenticate", challenge)
+
+    Args:
+        error: The error the challenge responds to. It selects the error code
+            the same way :func:`www_authenticate` does, per scheme:
+            ``invalid_dpop_proof`` is DPoP-specific, so a ``Bearer`` challenge
+            emitted alongside a DPoP one keeps ``invalid_token``.
+        schemes: The schemes to advertise, in the order they should appear.
+            ``Bearer`` and ``DPoP`` are recognized, case-insensitively;
+            duplicates collapse. Omit it to derive the single scheme from the
+            error's type, which returns exactly what
+            :func:`www_authenticate` would, in a one-element list.
+        algs: JOSE ``alg`` values accepted for DPoP proofs, emitted as the
+            RFC 9449 §7.1 ``algs`` parameter on the ``DPoP`` challenge only,
+            and ignored when ``DPoP`` is not among ``schemes``. Pass
+            ``options.allowed_proof_algorithms`` straight through: ``None``
+            there means "the default set", and means the same here, so an
+            options object built from defaults advertises the
+            algorithms it actually accepts rather than nothing. The default ``()``
+            omits the parameter. Values are validated against the supported
+            set, so an unusable one raises rather than reaching the wire.
+        realm: RFC 7235 ``realm``, emitted on every challenge when non-empty.
+        resource_metadata_url: RFC 9728 §5.1 ``resource_metadata``, emitted on
+            every challenge when provided.
+        scope: RFC 6750 §3 ``scope``, emitted on every challenge. Falls back to
+            :attr:`InsufficientScopeError.required_scopes` when not passed.
+        verbose_description: Development-only. See :func:`www_authenticate`.
+
+    Returns:
+        One header value per scheme, in the order given.
+
+    Raises:
+        ValueError: If ``schemes`` is empty or names a scheme this SDK cannot
+            advertise.
+        TypeError: If ``algs`` is a bare ``str`` rather than a sequence of
+            algorithm names.
+    """
+    resolved_schemes = [_scheme_for(error)] if schemes is None else _normalize_schemes(schemes)
+    resolved_algs = _normalize_algs(algs)
+    if not verbose_description:
+        _LOGGER.debug(
+            "www_authenticate_challenges: %s: %s",
+            type(error).__name__,
+            error,
+            extra={"schemes": resolved_schemes},
+        )
+    resolved_scope = _resolved_scope(error, scope)
+    return [
+        _build_challenge(
+            error,
+            scheme,
+            realm=realm,
+            resource_metadata_url=resource_metadata_url,
+            scope=resolved_scope,
+            algs=resolved_algs,
+            verbose_description=verbose_description,
+        )
+        for scheme in resolved_schemes
+    ]
 
 
 def http_status(error: AuthplaneError) -> int:
@@ -384,14 +713,20 @@ def response_headers_for(
     *,
     realm: str = "",
     resource_metadata_url: str | None = None,
-    scope: list[str] | None = None,
+    scope: Sequence[str] | None = None,
+    verbose_description: bool = False,
 ) -> tuple[int, dict[str, str]]:
     """Return ``(status, {"WWW-Authenticate": challenge})`` for an Authplane error.
 
     One call replaces the parallel use of :func:`http_status` and
     :func:`www_authenticate`. Forwards keyword arguments to
     :func:`www_authenticate` so callers can include ``realm``,
-    ``resource_metadata_url``, and ``scope`` without re-deriving the mapping.
+    ``resource_metadata_url``, ``scope``, and ``verbose_description`` without
+    re-deriving the mapping.
+
+    A dict holds one value per header name, so this helper is single-scheme by
+    construction. A resource advertising both ``Bearer`` and ``DPoP`` pairs
+    :func:`http_status` with :func:`www_authenticate_challenges` instead.
     """
     return (
         http_status(error),
@@ -401,6 +736,7 @@ def response_headers_for(
                 realm=realm,
                 resource_metadata_url=resource_metadata_url,
                 scope=scope,
+                verbose_description=verbose_description,
             )
         },
     )
@@ -446,6 +782,8 @@ def map_oauth_error(
         "invalid_grant": InvalidGrantError,
         "unsupported_grant_type": UnsupportedGrantTypeError,
         "invalid_request": InvalidRequestError,
+        "access_denied": AccessDeniedError,
+        "invalid_target": InvalidTargetError,
     }
 
     if status_code >= 500:

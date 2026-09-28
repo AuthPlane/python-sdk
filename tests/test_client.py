@@ -6,8 +6,13 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from authplane import ASCredentials, AuthplaneClient
-from authplane.errors import CircuitOpenError, ServerError
-from authplane.oauth.types import IntrospectionResponse, TokenResponse
+from authplane.errors import (
+    AccessDeniedError,
+    CircuitOpenError,
+    InvalidTargetError,
+    ServerError,
+)
+from authplane.oauth.types import IntrospectionResponse, TokenExchangeOptions, TokenResponse
 
 
 async def make_client(**kwargs: Any):
@@ -109,6 +114,35 @@ async def test_circuit_breaker_opens_on_server_errors():
 
         with pytest.raises(CircuitOpenError):
             await client.client_credentials()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        AccessDeniedError("not allowlisted", code="access_denied", status_code=403),
+        InvalidTargetError("unknown resource", code="invalid_target", status_code=400),
+    ],
+    ids=["access_denied", "invalid_target"],
+)
+async def test_circuit_breaker_ignores_policy_rejections(error: Exception):
+    """A 403 access_denied or 400 invalid_target is the AS answering, not failing.
+
+    Neither counts toward the breaker: past the threshold the next exchange
+    must still reach the AS and surface the same typed error, not
+    CircuitOpenError.
+    """
+    client = await make_client(circuit_breaker_threshold=2)
+
+    with patch(
+        "authplane.client.exchange_token",
+        new_callable=AsyncMock,
+        side_effect=error,
+    ) as mock_exchange:
+        for _ in range(3):
+            with pytest.raises(type(error)):
+                await client.exchange(TokenExchangeOptions(subject_token="subject"))
+        assert mock_exchange.await_count == 3
 
 
 @pytest.mark.asyncio

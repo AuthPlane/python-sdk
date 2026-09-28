@@ -159,7 +159,7 @@ The end-to-end demo exercises FastMCP and MCP adapters against a local Authplane
 
 Prerequisites:
 
-1. OAuth server running locally on `:9000`/`:9001` with client credentials, token exchange, and DPoP enabled.
+1. OAuth server running locally on `:9000`/`:9001` (client credentials, token exchange, and DPoP are on by default since authserver 0.2.0).
 2. Demo client registration with required grant types and scopes.
 3. Adapter demo server (`authplane-fastmcp/demo/run.sh` or `authplane-mcp/demo/run.sh`).
 4. Demo client execution (Python or TypeScript matrix client).
@@ -187,12 +187,13 @@ bash scripts/manual-e2e-smoke.sh --adapter fastmcp --skip-setup
 Optional overrides:
 
 - `AUTHSERVER_DIR=/path/to/authserver`
+- `AUTHSERVER_REF=v0.2.0` — check out that ref of the authserver repo before building (default: leave the checkout as is)
 - `ISSUER_URL=http://localhost:9000`
 - `RESOURCE_URL=http://localhost:8080/mcp`
 
 ### Common demo failures
 
-- `client_credentials grant is not enabled` — OAuth server is missing `AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true`.
+- `access_denied` on a token exchange — the exchanging client is not in the target Resource's `policy.exchange.allowed_client_ids`; `PATCH /admin/resources/{id}` to add it.
 - `client is not authorized for this grant type` — client registration is missing `urn:ietf:params:oauth:grant-type:token-exchange`.
 - `requested scope is invalid or not allowed` — requested scopes are not registered or assigned to the demo client.
 - `invalid API key` — admin API requests are using a different key than the server startup key.

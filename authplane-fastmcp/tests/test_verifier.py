@@ -1,12 +1,18 @@
 """Unit tests for AuthplaneTokenVerifier."""
 
 import logging
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
 import pytest
 from authplane import AuthplaneError, TokenExpiredError, VerifiedClaims
 
 from authplane_fastmcp import AuthplaneTokenVerifier
+
+# Type-only, and below the first-party import for the reason
+# ``test_auth_factory.py`` spells out: ruff sorts contiguous blocks only.
+if TYPE_CHECKING:
+    from conftest import TokenVerifierFactory
 
 
 @pytest.mark.asyncio
@@ -145,3 +151,26 @@ async def test_verify_token_failure_silent_above_debug(
 
     assert result is None
     assert not [r for r in caplog.records if r.name == "authplane_fastmcp.verifier"]
+
+
+def test_resource_metadata_url_delegates_to_the_resource(
+    token_verifier_factory: "TokenVerifierFactory",
+) -> None:
+    """The accessor answers from the wrapped resource, not from a rebuild.
+
+    Middleware composing its own challenge reads one value; FastMCP's own
+    401/403 does not pass through here (no upstream parameter accepts a
+    metadata URL — see the factory's docstring).
+    """
+    verifier = token_verifier_factory(
+        base_url="https://api.example.com",
+        resource="https://api.example.com/mcp",
+    )
+    verifier.verifier.resource_metadata_url.return_value = (  # type: ignore[attr-defined]
+        "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    )
+
+    assert (
+        verifier.resource_metadata_url()
+        == "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    )

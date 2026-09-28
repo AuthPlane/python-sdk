@@ -5,6 +5,7 @@ and configures all the components needed to add Authplane JWT validation
 to an official MCP Python SDK server in a single call.
 """
 
+import contextlib
 import warnings
 from collections.abc import Iterator
 from typing import Any
@@ -17,6 +18,8 @@ from authplane import (
     InboundDPoPOptions,
     IntrospectionRevocation,
     RevocationChecker,
+    validate_prm_resource_identifier,
+    validate_resource_metadata_url,
 )
 from authplane.oauth import TokenExchangeOptions, TokenResponse
 from mcp.server.auth.middleware.auth_context import get_access_token as _get_access_token
@@ -320,6 +323,7 @@ async def authplane_mcp_auth(
     inbound_dpop: InboundDPoPOptions | None = None,
     revocation_checker: IntrospectionRevocation | RevocationChecker | None = None,
     fail_closed: bool = False,
+    resource_metadata_url: str | None = None,
 ) -> AuthplaneAuthResult:
     """Build the kwargs to enable Authplane auth on a FastMCP server.
 
@@ -420,21 +424,46 @@ async def authplane_mcp_auth(
             - ``IntrospectionRevocation()``: calls the AS
               ``introspection_endpoint`` (RFC 7662) discovered from AS
               metadata. Raises ``TokenRevokedError`` if ``active=false``.
-              Pass ``as_credentials`` for authenticated introspection.
-              Fails open if the endpoint is unavailable, unless
-              ``fail_closed=True``.
+              ``as_credentials`` is required: authserver >= 0.1.2 answers
+              ``active=false`` to an unauthenticated call, or to a client
+              that is neither the issuing client nor a runtime-client of
+              the resource, so every token would be rejected as revoked.
+              An introspection error lets the token through unless
+              ``fail_closed=True`` is passed.
             - async callable: custom checker called with
               ``(VerifiedClaims, raw_token)``; return ``True`` to reject
               the token (raises ``TokenRevokedError``).
         fail_closed: Policy applied when the configured
             ``revocation_checker`` itself fails (e.g. the introspection
             endpoint is unreachable). ``False`` (default) accepts the
-            token — offline signature/claims validation still applies.
-            ``True`` rejects it with ``TokenRevokedError``, trading
-            availability during an AS outage for a hard revocation
-            guarantee. Only consulted when a ``revocation_checker`` is
-            configured; note that once the client's circuit breaker
-            opens, every request is rejected until the cooldown elapses.
+            token — offline signature/claims validation still applies —
+            and logs at INFO on construction so the posture is visible
+            in startup output. ``True`` rejects it with
+            ``TokenRevokedError``, trading availability during an AS
+            outage for a hard revocation guarantee. Only consulted when a
+            ``revocation_checker`` is configured; note that once the
+            client's circuit breaker opens, every request is rejected
+            until the cooldown elapses.
+        resource_metadata_url: URL to advertise as RFC 9728 §5.1
+            ``resource_metadata`` instead of the §3.1 derivation of
+            ``resource``. For a deployment where the PRM document is served
+            by the authorization server — authserver >= 0.2.0 serves one per
+            registered Resource — rather than by this server. Forwarded to
+            ``AuthplaneClient.resource(...)`` and surfaced by
+            :meth:`AuthplaneTokenVerifier.resource_metadata_url`.
+
+            **It does not reach the challenge the MCP SDK emits.**
+            ``mcp.server.auth.settings.AuthSettings`` has no metadata-URL
+            field: its only resource parameter is ``resource_server_url``, a
+            resource *identifier*, and
+            ``mcp.server.fastmcp.server.FastMCP.streamable_http_app()``
+            derives the challenge URL from it through
+            ``mcp.server.auth.routes.build_resource_metadata_url`` before
+            handing it to ``RequireAuthMiddleware``. So the 401 and the 403
+            ``insufficient_scope`` that middleware sends always carry the
+            derived, resource-hosted URL. Middleware of your own that calls
+            ``response_headers_for`` carries this value; the upstream one
+            cannot until it accepts a URL.
 
     Returns:
         ``AuthplaneAuthResult`` with ``token_verifier`` (``AuthplaneTokenVerifier``),
@@ -444,10 +473,38 @@ async def authplane_mcp_auth(
         for RFC 8693 token exchange via ``result.client.exchange()``.
 
     Raises:
+        InvalidResourceError: If ``resource`` carries a fragment component,
+            contains whitespace or a control character, is not an absolute
+            URL with a scheme and a host, carries a userinfo subcomponent
+            (RFC 9110 §4.2.4 — the identifier becomes the DPoP ``htu``
+            origin and the advertised PRM ``resource``, so embedded
+            credentials are rejected outright), or carries a port that does
+            not parse (RFC 3986 §3.2.3). Raised before metadata
+            discovery, so the server fails at startup with the configuration
+            error rather than after a network round trip — or, worse, at
+            first request. Subclasses ``ValueError``. Also raised, before
+            discovery and for the same reason, when ``resource_metadata_url``
+            is not an absolute ``http`` / ``https`` URL or carries any of the
+            same defects.
         ValueError: If configuration is invalid (bad algorithms, etc.).
         JWKSFetchError: If metadata discovery or JWKS fetching fails.
     """
     resolved_scopes = scopes or []
+
+    # Gate the resource before AuthplaneClient.create(). The authoritative
+    # check is AuthplaneResource.__init__, reached through client.resource()
+    # below — but by then metadata discovery has already run, and the raise
+    # path would strand a client whose caches this function never aclose()s.
+    # A misconfigured resource must not need a reachable AS to be diagnosed,
+    # and the verifier's htu origin is reconstructed from this identifier, so
+    # a non-absolute one would also leave DPoP-bound requests unverifiable.
+    validate_prm_resource_identifier(resource)
+
+    # The override travels to the same challenge parameter the derived URL
+    # would, so it is gated in the same place and for the same reason. The
+    # authoritative call is AuthplaneResource.__init__, past create().
+    if resource_metadata_url is not None:
+        validate_resource_metadata_url(resource_metadata_url)
 
     # Prepare client-level kwargs, filtering out None to use SDK defaults
     client_kwargs_raw: dict[str, Any] = {
@@ -469,6 +526,7 @@ async def authplane_mcp_auth(
         "allowed_algorithms": allowed_algorithms,
         "clock_skew_seconds": clock_skew_seconds,
         "inbound_dpop": inbound_dpop,
+        "resource_metadata_url": resource_metadata_url,
     }
     verifier_kwargs: dict[str, Any] = {
         k: v for k, v in verifier_kwargs_raw.items() if v is not None
@@ -481,45 +539,60 @@ async def authplane_mcp_auth(
         **client_kwargs,
     )
 
-    # Translate ConsentRequiredError → MCP UrlElicitationRequiredError at the
-    # client boundary, before user tool code sees it.  Tool authors don't need
-    # to wrap handlers or import elicitation primitives — the MCP wire-format
-    # mapping is owned by the adapter that constructs the client.
-    client = _wrap_client_for_elicitation(client)
+    # Everything between create() and the return runs with a live client whose
+    # caches this function owns. Any raise on this path — client.resource()'s
+    # ValueError for an out-of-range allowed_algorithms, an upstream
+    # constructor's — would otherwise strand it un-aclose()d, so close it and
+    # re-raise rather than leak the metadata/JWKS caches behind an exception
+    # the operator sees as a plain configuration error.
+    try:
+        # Translate ConsentRequiredError → MCP UrlElicitationRequiredError at the
+        # client boundary, before user tool code sees it.  Tool authors don't need
+        # to wrap handlers or import elicitation primitives — the MCP wire-format
+        # mapping is owned by the adapter that constructs the client.
+        client = _wrap_client_for_elicitation(client)
 
-    # Create the resource from the client
-    verifier = client.resource(
-        resource=resource,
-        scopes=resolved_scopes,
-        revocation_checker=revocation_checker,
-        fail_closed=fail_closed,
-        **verifier_kwargs,
-    )
+        # Create the resource from the client
+        verifier = client.resource(
+            resource=resource,
+            scopes=resolved_scopes,
+            revocation_checker=revocation_checker,
+            fail_closed=fail_closed,
+            **verifier_kwargs,
+        )
 
-    # Wrap in AuthplaneTokenVerifier.  The verbatim issuer / resource ride
-    # along on the verifier so ``install_request_context`` can advertise them
-    # unchanged in the served PRM — the MCP SDK builds that document from
-    # ``AuthSettings`` ``AnyHttpUrl`` fields, which normalize an empty-path
-    # authority with a trailing slash (RFC 8414 §3.3, RFC 9728 §3.3).
-    token_verifier = AuthplaneTokenVerifier(
-        verifier,
-        verbatim_issuer=issuer,
-        verbatim_resource=resource,
-    )
+        # Wrap in AuthplaneTokenVerifier.  The verbatim issuer / resource ride
+        # along on the verifier so ``install_request_context`` can advertise them
+        # unchanged in the served PRM — the MCP SDK builds that document from
+        # ``AuthSettings`` ``AnyHttpUrl`` fields, which normalize an empty-path
+        # authority with a trailing slash (RFC 8414 §3.3, RFC 9728 §3.3).
+        token_verifier = AuthplaneTokenVerifier(
+            verifier,
+            verbatim_issuer=issuer,
+            verbatim_resource=resource,
+        )
 
-    # Create AuthSettings for FastMCP.
-    #
-    # The MCP SDK's AuthSettings has no separate "supported" field — it uses
-    # ``required_scopes`` for both PRM ``scopes_supported`` advertisement
-    # AND RequireAuthMiddleware enforcement.  See the docstring on
-    # ``enforce_scopes_on_all_requests`` above for the trade-off and why
-    # this flag exists.  Per-tool ``require_scope()`` is the intended
-    # granular pattern in either mode.
-    auth_settings = AuthSettings(
-        issuer_url=AnyHttpUrl(issuer),
-        resource_server_url=AnyHttpUrl(resource),
-        required_scopes=resolved_scopes if enforce_scopes_on_all_requests else None,
-    )
+        # Create AuthSettings for FastMCP.
+        #
+        # The MCP SDK's AuthSettings has no separate "supported" field — it uses
+        # ``required_scopes`` for both PRM ``scopes_supported`` advertisement
+        # AND RequireAuthMiddleware enforcement.  See the docstring on
+        # ``enforce_scopes_on_all_requests`` above for the trade-off and why
+        # this flag exists.  Per-tool ``require_scope()`` is the intended
+        # granular pattern in either mode.
+        auth_settings = AuthSettings(
+            issuer_url=AnyHttpUrl(issuer),
+            resource_server_url=AnyHttpUrl(resource),
+            required_scopes=resolved_scopes if enforce_scopes_on_all_requests else None,
+        )
+    except Exception:
+        # Suppressed close: if aclose() itself raises, the operator would see
+        # the close failure and the configuration error this block exists to
+        # surface would survive only as __context__ — the opposite of the
+        # block's intent.
+        with contextlib.suppress(Exception):
+            await client.aclose()
+        raise
 
     return AuthplaneAuthResult(
         token_verifier=token_verifier,

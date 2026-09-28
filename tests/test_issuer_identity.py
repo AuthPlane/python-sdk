@@ -14,7 +14,7 @@ import pytest
 import respx
 
 from authplane import AuthplaneClient, AuthplaneResource, FetchSettings
-from authplane.errors import InvalidClaimsError, MetadataFetchError
+from authplane.errors import InvalidClaimsError, InvalidResourceError, MetadataFetchError
 from authplane.internal.fetch_result import FetchResult
 from authplane.internal.metadata import MetadataCache
 from authplane.internal.urls import build_metadata_url, build_prm_url
@@ -262,7 +262,7 @@ async def test_client_resource_rejects_fragment_at_construction(
     # still happen with the factory's own call deleted — just one frame deeper,
     # pointing at the constructor rather than at the line the operator wrote.
     # That is the whole reason the duplicate call is kept, so pin it: the raise
-    # itself is always in urls.py (validate_resource_indicator), and what this
+    # itself is always in urls.py (validate_prm_resource_identifier), and what this
     # asserts is which frame invoked it.
     # ``TracebackEntry.path`` is typed ``Path | str``, hence the round-trip.
     #
@@ -314,3 +314,94 @@ async def test_client_resource_accepts_query(client: AuthplaneClient) -> None:
     # is legal on a resource indicator; only the fragment is forbidden.
     resource = client.resource("https://api.example.com/mcp?tenant=a")
     assert resource is not None
+
+
+# Each of the three shapes is missing a different half of "scheme and host",
+# which is why they are pinned independently rather than as one representative:
+# a relative reference has neither, the scheme-relative form has a host but no
+# scheme (an "opaque or authority-less" guard would wrongly admit it), and the
+# URN has a scheme but no host (it used to derive
+# "urn:/.well-known/oauth-protected-resource/example:api", and in the MCP
+# adapters an htu origin of the literal "://").
+NON_ABSOLUTE_RESOURCES = pytest.mark.parametrize(
+    "resource",
+    ["/mcp", "//api.example.com/mcp", "urn:example:api"],
+    ids=["relative", "scheme-relative", "opaque-urn"],
+)
+
+
+@NON_ABSOLUTE_RESOURCES
+async def test_client_resource_rejects_non_absolute_at_construction(
+    client: AuthplaneClient, resource: str
+) -> None:
+    # Same gate, same site, same exception as the fragment rejection above:
+    # a resource that cannot derive a metadata URL (RFC 9728 §3) or an htu
+    # origin must fail at client.resource(...), not at first use.
+    with pytest.raises(InvalidResourceError, match="absolute URL with a scheme and a host"):
+        client.resource(resource)
+
+
+@NON_ABSOLUTE_RESOURCES
+async def test_authplane_resource_rejects_non_absolute_when_constructed_directly(
+    client: AuthplaneClient, resource: str
+) -> None:
+    # The authoritative gate is the constructor — direct construction of the
+    # package-root export must reject the same three shapes the factory does.
+    with pytest.raises(InvalidResourceError, match="absolute URL with a scheme and a host"):
+        AuthplaneResource(
+            client,
+            resource=resource,
+            scopes=[],
+            allowed_algorithms=["RS256"],
+        )
+
+
+async def test_client_resource_accepts_http_localhost(client: AuthplaneClient) -> None:
+    # Deliberate profile relaxation: absoluteness is required, https is not —
+    # a plain-http identifier keeps local development working.
+    resource = client.resource("http://localhost:8080/mcp")
+    assert resource.resource == "http://localhost:8080/mcp"
+
+
+# A userinfo-bearing identifier passes the scheme+host check (both present) but
+# feeds three sinks that reassemble the authority from netloc, not hostname:
+# build_prm_url → prm_url() → the resource_metadata parameter of a 401
+# WWW-Authenticate challenge; the MCP adapters' DPoP htu origin; and the
+# fail_closed warning's log record. RFC 9110 §4.2.4 forbids generating the
+# subcomponent, so it is rejected at the same construction-time gate.
+CREDENTIALED_RESOURCE = "https://svc:s3cr3t@api.example.com/mcp"
+
+
+async def test_client_resource_rejects_userinfo_at_construction(
+    client: AuthplaneClient,
+) -> None:
+    with pytest.raises(InvalidResourceError, match="userinfo") as exc:
+        client.resource(CREDENTIALED_RESOURCE)
+    assert "s3cr3t" not in str(exc.value)
+
+
+async def test_authplane_resource_rejects_userinfo_when_constructed_directly(
+    client: AuthplaneClient,
+) -> None:
+    # The authoritative gate: with construction rejected, prm_url() — the
+    # 401-challenge sink — is unreachable for a credential-bearing identifier.
+    with pytest.raises(InvalidResourceError, match="userinfo"):
+        AuthplaneResource(
+            client,
+            resource=CREDENTIALED_RESOURCE,
+            scopes=[],
+            allowed_algorithms=["RS256"],
+        )
+
+
+async def test_userinfo_rejection_keeps_credentials_out_of_log_records(
+    client: AuthplaneClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The fail_closed warning attaches extra={"resource": resource} to a log
+    # record. The gate fires before that logger call, so a credential-bearing
+    # identifier can no longer reach it.
+    with caplog.at_level("DEBUG"), pytest.raises(InvalidResourceError):
+        client.resource(CREDENTIALED_RESOURCE, fail_closed=True)
+    for record in caplog.records:
+        assert "s3cr3t" not in record.getMessage()
+        assert "s3cr3t" not in str(getattr(record, "resource", ""))

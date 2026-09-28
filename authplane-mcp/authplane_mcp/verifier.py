@@ -127,6 +127,18 @@ class AuthplaneTokenVerifier(TokenVerifier):
             raise TypeError(
                 f"verifier.resource must be a str URI, got {type(verifier.resource).__name__}"
             )
+        # Well-formed by construction: ``AuthplaneResource.__init__`` rejects
+        # a resource without a scheme and a host, so this origin — the fixed
+        # half of every ``htu`` this verifier checks proofs against — cannot
+        # degrade to the literal ``"://"`` a relative or opaque identifier
+        # used to produce (against which no honest proof could ever verify).
+        # The same gate rejects a userinfo subcomponent (RFC 9110 §4.2.4), so
+        # reassembling from ``netloc`` cannot put credentials into the origin
+        # either — an ``htu`` no honest proof could match, which was the
+        # "://" failure mode on an input the scheme+host check alone admits.
+        # That gate is what makes the docstring's claim true that the origin
+        # comes from operator configuration rather than from anything an
+        # upstream can influence.
         split = urlsplit(verifier.resource)
         self._resource_origin = f"{split.scheme}://{split.netloc}"
 
@@ -153,6 +165,17 @@ class AuthplaneTokenVerifier(TokenVerifier):
         if self._verbatim_issuer is None or self._verbatim_resource is None:
             return None
         return self._verbatim_issuer, self._verbatim_resource
+
+    def resource_metadata_url(self) -> str:
+        """Return the URL to advertise as RFC 9728 §5.1 ``resource_metadata``.
+
+        Delegates to the wrapped resource, so middleware composing its own
+        challenge reads the configured override — or, with none configured,
+        the RFC 9728 §3.1 derivation — instead of rebuilding either. The MCP
+        SDK's own 401/403 does not go through here; see the user guide's
+        "Where the PRM document lives".
+        """
+        return self._verifier.resource_metadata_url()
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Validate a JWT and return an MCP ``AccessToken``.

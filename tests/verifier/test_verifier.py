@@ -1,8 +1,9 @@
 """Tests for AuthplaneResource core validation logic."""
 
+import asyncio
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 import pytest
@@ -11,12 +12,33 @@ from respx.models import Route
 
 from authplane import AuthplaneClient, AuthplaneResource, FetchSettings, InboundDPoPOptions
 from authplane.errors import (
+    InsufficientScopeError,
     InvalidClaimsError,
+    InvalidResourceError,
     InvalidSignatureError,
     JWKSFetchError,
     MetadataFetchError,
     TokenExpiredError,
+    response_headers_for,
 )
+
+
+class SigningKey(Protocol):
+    """Shape of the keys minted by the ``signing_key_factory`` fixture.
+
+    Declared structurally here for the same reason ``TokenFactory`` is declared
+    in ``tests/conftest.py``: test modules are not a package, so the fixture's
+    concrete type cannot be imported.
+    """
+
+    @property
+    def jwks(self) -> dict[str, Any]:
+        """The single-key JWKS document publishing this key."""
+        ...
+
+    def sign(self, **overrides: Any) -> str:
+        """Sign an otherwise-valid access token for the default test resource."""
+        ...
 
 
 async def test_valid_token(verifier: AuthplaneResource, token_factory: Callable[..., str]) -> None:
@@ -436,6 +458,70 @@ async def test_prm_url_for_path_resource(client: AuthplaneClient) -> None:
     assert resource.prm_url() == "https://api.example.com/.well-known/oauth-protected-resource/mcp"
 
 
+async def test_resource_metadata_url_defaults_to_the_derivation(
+    client: AuthplaneClient,
+) -> None:
+    # No option set: the advertised URL is what prm_url() derives, byte for
+    # byte — the guarantee every existing deployment relies on.
+    resource = client.resource(resource="https://api.example.com/mcp", scopes=["read:data"])
+    assert resource.resource_metadata_url() == resource.prm_url()
+    assert (
+        resource.resource_metadata_url()
+        == "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+    )
+
+
+async def test_resource_metadata_url_override_is_returned(client: AuthplaneClient) -> None:
+    # The AS-hosted topology: authserver >= 0.2.0 serves the document for the
+    # registered Resource, and the SDK only points at it. prm_url() keeps
+    # naming the document this SDK itself builds.
+    as_hosted = "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    resource = client.resource(
+        resource="https://api.example.com/mcp",
+        scopes=["read:data"],
+        resource_metadata_url=as_hosted,
+    )
+    assert resource.resource_metadata_url() == as_hosted
+    assert resource.prm_url() == "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+
+
+async def test_resource_metadata_url_override_reaches_401_and_403_challenges(
+    client: AuthplaneClient,
+) -> None:
+    # Both challenge paths the RFC 9728 §5.1 parameter appears on: the 401 for
+    # an unusable token and the 403 for insufficient scope.
+    as_hosted = "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    resource = client.resource(
+        resource="https://api.example.com/mcp",
+        scopes=["read:data"],
+        resource_metadata_url=as_hosted,
+    )
+
+    for error, expected_status in (
+        (TokenExpiredError("expired"), 401),
+        (InsufficientScopeError("nope", required_scopes=("read:data",)), 403),
+    ):
+        status, headers = response_headers_for(
+            error,
+            resource_metadata_url=resource.resource_metadata_url(),
+        )
+        assert status == expected_status
+        assert f'resource_metadata="{as_hosted}"' in headers["WWW-Authenticate"]
+        assert "api.example.com" not in headers["WWW-Authenticate"]
+
+
+async def test_resource_rejects_an_invalid_resource_metadata_url(client: AuthplaneClient) -> None:
+    # Construction-time, like the identifier itself: the value is advertised to
+    # an unauthenticated caller from a 401 path, which is the worst place to
+    # discover it is unusable.
+    with pytest.raises(InvalidResourceError, match="absolute URL with a scheme and a host"):
+        client.resource(
+            resource="https://api.example.com/mcp",
+            scopes=["read:data"],
+            resource_metadata_url="/.well-known/oauth-protected-resource/mcp",
+        )
+
+
 async def test_prm_omits_dpop_fields_when_inbound_dpop_not_configured(
     client: AuthplaneClient,
 ) -> None:
@@ -787,21 +873,33 @@ async def test_discovery_properties_before_initialization() -> None:
 
 
 @respx.mock
-async def test_jwks_cache_restarts_on_uri_change(
-    jwks_keypair: dict[str, Any], token_factory: Callable[..., str]
+async def test_verification_traffic_follows_a_rotated_jwks_uri(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
 ) -> None:
-    """Should restart JWKS cache when metadata jwks_uri changes."""
-    import asyncio
+    """Verification alone must re-read AS metadata and follow a rotated jwks_uri.
 
-    old_jwks_uri = "https://auth.example.com/old-jwks"
-    new_jwks_uri = "https://auth.example.com/new-jwks"
+    A resource server that only verifies tokens never calls an AS endpoint, so
+    ``verify()`` is the only thing that can keep metadata warm. Nothing here
+    forces a refresh: the test brings the refresh interval forward and then
+    sends ordinary verification traffic carrying a token signed by a key
+    published *only* at the new URI. Unless the SDK re-read metadata and
+    resolved the key set against it on that call, the key is unreachable and
+    the verification fails.
+    """
+    old_jwks_uri = "https://auth.example.com/jwks-v1.json"
+    new_jwks_uri = "https://auth.example.com/jwks-v2.json"
 
-    # Track metadata fetch calls
-    metadata_call_count: dict[str, int] = {"count": 0}
+    old_key = signing_key_factory("key-v1")
+    new_key = signing_key_factory("key-v2")
+
+    metadata_calls = 0
 
     def metadata_response(request: httpx.Request) -> httpx.Response:
-        metadata_call_count["count"] += 1
-        uri = new_jwks_uri if metadata_call_count["count"] > 1 else old_jwks_uri
+        nonlocal metadata_calls
+        metadata_calls += 1
+        # The AS rotates: every read after the first advertises the new URI.
+        uri = old_jwks_uri if metadata_calls == 1 else new_jwks_uri
         return httpx.Response(
             200,
             json={
@@ -809,113 +907,566 @@ async def test_jwks_cache_restarts_on_uri_change(
                 "jwks_uri": uri,
                 "token_endpoint": "https://auth.example.com/token",
             },
-            headers={"Cache-Control": "max-age=1"},  # Short TTL for testing
         )
 
     respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
         side_effect=metadata_response
     )
+    old_route = respx.get(old_jwks_uri).mock(
+        return_value=respx.MockResponse(200, json=old_key.jwks)
+    )
+    new_route = respx.get(new_jwks_uri).mock(
+        return_value=respx.MockResponse(200, json=new_key.jwks)
+    )
 
-    # Mock JWKS responses for both URIs
-    old_jwks: Any = jwks_keypair["jwks"]
-    new_key: dict[str, Any] = {**jwks_keypair["jwks"]["keys"][0], "kid": "new-key-id"}
-    new_jwks: dict[str, list[dict[str, Any]]] = {"keys": [new_key]}
-
-    respx.get(old_jwks_uri).mock(return_value=respx.MockResponse(status_code=200, json=old_jwks))
-    respx.get(new_jwks_uri).mock(return_value=respx.MockResponse(status_code=200, json=new_jwks))
-
-    # Create client with discovery and short metadata refresh
-    _no_ssrf = FetchSettings(ssrf_protection=False)
     client = await AuthplaneClient.create(
         issuer="https://auth.example.com",
-        metadata_refresh_seconds=1,  # Very short for testing
-        fetch_settings=_no_ssrf,
+        fetch_settings=FetchSettings(ssrf_protection=False),
     )
-    verifier = client.resource(
-        resource="https://api.example.com",
-        scopes=["read:data"],
-    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
 
     try:
-        # Initial JWKS URI should be old
-        assert client._jwks_uri == old_jwks_uri  # pyright: ignore[reportPrivateUsage]
+        # Construction read metadata once and fetched keys from the URI it named.
+        assert metadata_calls == 1
+        assert new_route.call_count == 0
 
-        # Verify token works with old JWKS
-        token = token_factory()
-        claims = await verifier.verify(token)
-        assert claims.kid == "test-key-1"
+        claims = await verifier.verify(old_key.sign())
+        assert claims.kid == "key-v1"
+        # Still inside the refresh interval, so no second read: the hop on the
+        # verify path is TTL-gated, not a fetch per verification.
+        assert metadata_calls == 1
 
-        # Force metadata refresh to get new URI
-        await client.metadata_cache.get(force_refresh=True)  # pyright: ignore[reportOptionalMemberAccess]
+        expire_metadata_interval(client)
+        old_route_calls_at_rotation = old_route.call_count
 
-        # Give callback time to run
-        await asyncio.sleep(0.1)
+        # Ordinary verification traffic. The token is signed by a key the old
+        # URI never served, so this can only pass off the rotated document.
+        claims = await verifier.verify(new_key.sign())
+        assert claims.kid == "key-v2"
 
-        # JWKS URI should have changed
-        assert client._jwks_uri == new_jwks_uri  # pyright: ignore[reportPrivateUsage]
+        assert metadata_calls >= 2
+        assert new_route.call_count >= 1
+        # The withdrawn URI was not fetched again once the rotation was read.
+        assert old_route.call_count == old_route_calls_at_rotation
 
-        # Verify JWKS cache was restarted with new URI
-        jwks = await client.jwks_cache.get()  # pyright: ignore[reportOptionalMemberAccess]
-        assert jwks["keys"][0]["kid"] == "new-key-id"
-
+        # Steady state stays on the new URI rather than drifting back.
+        claims = await verifier.verify(new_key.sign(jti="second-call"))
+        assert claims.kid == "key-v2"
+        assert old_route.call_count == old_route_calls_at_rotation
     finally:
         await client.aclose()
 
 
 @respx.mock
-async def test_metadata_change_without_jwks_uri_change(
-    jwks_keypair: dict[str, Any], token_factory: Callable[..., str]
+async def test_verification_refresh_keeps_jwks_cache_when_uri_is_unchanged(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
 ) -> None:
-    """Should not restart JWKS cache when metadata changes but jwks_uri stays same."""
-    import asyncio
+    """A metadata re-read that leaves jwks_uri alone must not churn the JWKS cache.
 
-    jwks_uri = "https://auth.example.com/jwks"
+    Same production path as the rotation test — the refresh is driven by the
+    elapsed interval and ordinary ``verify()`` calls — but here only
+    ``token_endpoint`` moves, so the JWKS cache instance must survive and the
+    key set must not be refetched.
+    """
+    jwks_uri = "https://auth.example.com/jwks.json"
+    key = signing_key_factory("stable-key")
 
-    # Track metadata fetch calls
-    metadata_call_count: dict[str, int] = {"count": 0}
+    metadata_calls = 0
 
     def metadata_response(request: httpx.Request) -> httpx.Response:
-        metadata_call_count["count"] += 1
-        # Only token_endpoint changes, jwks_uri stays same
+        nonlocal metadata_calls
+        metadata_calls += 1
+        # jwks_uri is constant; only the token endpoint moves.
         endpoint = (
-            "https://auth.example.com/token-v2"
-            if metadata_call_count["count"] > 1
-            else "https://auth.example.com/token"
+            "https://auth.example.com/token"
+            if metadata_calls == 1
+            else "https://auth.example.com/token-v2"
         )
         return httpx.Response(
             200,
             json={
                 "issuer": "https://auth.example.com",
-                "jwks_uri": jwks_uri,  # Same URI both times
-                "token_endpoint": endpoint,  # Different endpoint
+                "jwks_uri": jwks_uri,
+                "token_endpoint": endpoint,
             },
         )
 
     respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
         side_effect=metadata_response
     )
+    jwks_route = respx.get(jwks_uri).mock(return_value=respx.MockResponse(200, json=key.jwks))
 
-    # Mock JWKS
-    jwks: Any = jwks_keypair["jwks"]
-    respx.get(jwks_uri).mock(return_value=respx.MockResponse(status_code=200, json=jwks))
-
-    _no_ssrf = FetchSettings(ssrf_protection=False)
     client = await AuthplaneClient.create(
         issuer="https://auth.example.com",
-        fetch_settings=_no_ssrf,
+        fetch_settings=FetchSettings(ssrf_protection=False),
     )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
 
     try:
-        # Capture original JWKS cache instance
         original_jwks_cache = client.jwks_cache
+        assert await verifier.verify(key.sign()) is not None
 
-        # Force metadata refresh
-        await client.metadata_cache.get(force_refresh=True)  # pyright: ignore[reportOptionalMemberAccess]
-        await asyncio.sleep(0.1)
+        expire_metadata_interval(client)
+        jwks_calls_before_refresh = jwks_route.call_count
 
-        # JWKS cache should NOT have been replaced (same instance)
+        assert await verifier.verify(key.sign(jti="second-call")) is not None
+
+        # The refresh did happen on the verify path...
+        assert metadata_calls == 2
+        # ...but an unchanged jwks_uri leaves the cache instance and its
+        # document exactly where they were.
         assert client.jwks_cache is original_jwks_cache
-        assert client._jwks_uri == jwks_uri  # pyright: ignore[reportPrivateUsage]
+        assert jwks_route.call_count == jwks_calls_before_refresh
+    finally:
+        await client.aclose()
 
+
+@respx.mock
+async def test_a_rejected_metadata_document_does_not_repoint_key_retrieval(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """A document that fails validation must not decide where keys come from.
+
+    Putting the metadata read on the verification path makes this reachable on
+    every request a verify-only resource server serves, so the rejection has to
+    happen before the document is cached. Validating on the way out instead
+    leaves a rejected document naming the key set: a token minted by the key it
+    advertises then verifies, and the token's own ``iss`` claim does not help,
+    because whoever supplied the document also mints the token.
+    """
+    honest_jwks_uri = "https://auth.example.com/jwks.json"
+    rogue_jwks_uri = "https://auth.example.com/jwks-rogue.json"
+    honest_key = signing_key_factory("key-honest")
+    rogue_key = signing_key_factory("key-rogue")
+
+    serve_rogue = False
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        if serve_rogue:
+            # RFC 8414 §3.3: the issuer is not the configured one, so this
+            # document is not about this authorization server at all.
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://elsewhere.example.com",
+                    "jwks_uri": rogue_jwks_uri,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": honest_jwks_uri},
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    respx.get(honest_jwks_uri).mock(return_value=respx.MockResponse(200, json=honest_key.jwks))
+    rogue_route = respx.get(rogue_jwks_uri).mock(
+        return_value=respx.MockResponse(200, json=rogue_key.jwks)
+    )
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(honest_key.sign())).kid == "key-honest"
+
+        serve_rogue = True
+        expire_metadata_interval(client)
+
+        # Minted by the key the rejected document names, but carrying the real
+        # issuer — the shape a client presents once the metadata endpoint is
+        # under someone else's control.
+        with pytest.raises(InvalidSignatureError):
+            await verifier.verify(rogue_key.sign())
+        assert rogue_route.call_count == 0
+
+        # And the honest key still verifies: rejecting the document left the
+        # last accepted one in place rather than emptying anything.
+        assert (await verifier.verify(honest_key.sign(jti="after-rejection"))).kid == "key-honest"
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_rotation_to_an_unreachable_uri_keeps_the_working_key_set(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """Reading a rotation must not cost the keys that were already verifying.
+
+    The newly advertised URI is dead. Nothing is swapped in on the strength of
+    a document alone, so the key set the cache already holds keeps serving and
+    tokens that verified a moment ago still verify.
+    """
+    old_jwks_uri = "https://auth.example.com/jwks-v1.json"
+    dead_jwks_uri = "https://auth.example.com/jwks-v2.json"
+    old_key = signing_key_factory("key-v1")
+
+    metadata_calls = 0
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        uri = old_jwks_uri if metadata_calls == 1 else dead_jwks_uri
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": uri},
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    respx.get(old_jwks_uri).mock(return_value=respx.MockResponse(200, json=old_key.jwks))
+    respx.get(dead_jwks_uri).mock(return_value=respx.MockResponse(503))
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(old_key.sign())).kid == "key-v1"
+
+        expire_metadata_interval(client)
+
+        assert (await verifier.verify(old_key.sign(jti="after-rotation"))).kid == "key-v1"
+        assert metadata_calls >= 2
+
+        # Even a forced refetch, which has only the dead URI to go to, leaves
+        # the cached key set intact rather than emptying it.
+        jwks_cache = client.jwks_cache
+        assert jwks_cache is not None
+        assert await jwks_cache.contains_kid("key-v1", force_refresh=True) is True
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_concurrent_verifications_straddling_a_rotation_all_succeed(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """A rotation read by one caller must not break the others in flight.
+
+    Ten verifications are in flight when the rotation becomes visible. One of
+    them wins the metadata read and the key-set refetch that follows it; the
+    other nine must be served what that one committed rather than each
+    repeating the fetch behind it. None of their tokens has been withdrawn, so
+    all ten must verify.
+
+    The rotated location publishes the retired key alongside the new one,
+    because that is what an authorization server moving its ``jwks_uri`` has to
+    do: the new document is the only one clients will discover from now on, so
+    a key still signing live tokens has to be in it. An AS that drops such a
+    key from the new document has withdrawn it, and no verifier can be expected
+    to keep honouring a key set the AS has stopped publishing —
+    ``test_a_key_only_at_the_withdrawn_location_stops_verifying`` pins that
+    direction.
+    """
+    old_jwks_uri = "https://auth.example.com/jwks-v1.json"
+    new_jwks_uri = "https://auth.example.com/jwks-v2.json"
+    old_key = signing_key_factory("key-v1")
+    new_key = signing_key_factory("key-v2")
+
+    metadata_calls = 0
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        uri = old_jwks_uri if metadata_calls == 1 else new_jwks_uri
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": uri},
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    old_route = respx.get(old_jwks_uri).mock(
+        return_value=respx.MockResponse(200, json=old_key.jwks)
+    )
+    new_route = respx.get(new_jwks_uri).mock(
+        return_value=respx.MockResponse(
+            200, json={"keys": [old_key.jwks["keys"][0], new_key.jwks["keys"][0]]}
+        )
+    )
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(old_key.sign())).kid == "key-v1"
+
+        expire_metadata_interval(client)
+        old_route_calls_at_rotation = old_route.call_count
+
+        # Ten in-flight verifications of tokens the AS has not withdrawn. One
+        # of them observes the rotation; none of them may be broken by it.
+        results = await asyncio.gather(
+            *(verifier.verify(old_key.sign(jti=f"burst-{n}")) for n in range(10))
+        )
+        assert [claims.kid for claims in results] == ["key-v1"] * 10
+        assert metadata_calls >= 2
+        # The rotation was followed, and the refetch it triggered was paid for
+        # once by the burst rather than ten times. Asserted, not assumed:
+        # without the in-lock re-check every one of the ten would refetch.
+        assert new_route.call_count == 1
+        # And the withdrawn location was not touched again once the rebind
+        # happened.
+        assert old_route.call_count == old_route_calls_at_rotation
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_a_key_only_at_the_withdrawn_location_stops_verifying(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """The cost of following a rotation, stated rather than left to be found.
+
+    Once the rotation is observed, the key set is the rotated document's and
+    only its. A key the AS published at the old location and left out of the
+    new one no longer verifies anything — the AS stopped publishing it, which
+    is what withdrawing a key is, and continuing to honour it would mean
+    trusting a document the AS has replaced. Rotating ``jwks_uri`` is therefore
+    not a way to move keys gradually: whatever is still signing live tokens has
+    to appear at the new location.
+    """
+    old_jwks_uri = "https://auth.example.com/jwks-v1.json"
+    new_jwks_uri = "https://auth.example.com/jwks-v2.json"
+    retired_key = signing_key_factory("retired-key")
+    new_key = signing_key_factory("new-key")
+
+    rotated = False
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        uri = new_jwks_uri if rotated else old_jwks_uri
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": uri},
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    # Still reachable, still serving the retired key: the point is that it is
+    # no longer consulted, not that it became unreachable.
+    respx.get(old_jwks_uri).mock(return_value=respx.MockResponse(200, json=retired_key.jwks))
+    respx.get(new_jwks_uri).mock(return_value=respx.MockResponse(200, json=new_key.jwks))
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(retired_key.sign())).kid == "retired-key"
+
+        rotated = True
+        expire_metadata_interval(client)
+
+        # The new location's key works.
+        assert (await verifier.verify(new_key.sign())).kid == "new-key"
+        # The one left behind at the withdrawn location does not.
+        with pytest.raises(InvalidSignatureError):
+            await verifier.verify(retired_key.sign(jti="after-rotation"))
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_a_kid_miss_re_reads_metadata_before_forcing_the_key_set_refresh(
+    signing_key_factory: Callable[[str], SigningKey],
+) -> None:
+    """A kid the cache cannot satisfy makes the cached document suspect too.
+
+    The refresh interval is left at its default and never elapses here, so the
+    rotation can only be followed because the miss re-read the document. Were
+    the location resolved from the cached document alone, the forced refetch
+    would go straight back to the withdrawn URI and the token would be rejected
+    until the next interval boundary.
+    """
+    old_jwks_uri = "https://auth.example.com/jwks-v1.json"
+    new_jwks_uri = "https://auth.example.com/jwks-v2.json"
+    old_key = signing_key_factory("key-v1")
+    new_key = signing_key_factory("key-v2")
+
+    rotated = False
+    metadata_calls = 0
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://auth.example.com",
+                "jwks_uri": new_jwks_uri if rotated else old_jwks_uri,
+            },
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    respx.get(old_jwks_uri).mock(return_value=respx.MockResponse(200, json=old_key.jwks))
+    new_route = respx.get(new_jwks_uri).mock(
+        return_value=respx.MockResponse(200, json=new_key.jwks)
+    )
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(old_key.sign())).kid == "key-v1"
+        metadata_calls_before_rotation = metadata_calls
+
+        rotated = True
+        # No interval is brought forward: the only thing that can reveal the
+        # rotation is the token itself, whose kid the cached key set lacks.
+        assert (await verifier.verify(new_key.sign())).kid == "key-v2"
+        assert metadata_calls > metadata_calls_before_rotation
+        assert new_route.call_count >= 1
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_a_failed_metadata_refresh_does_not_fail_verification(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """The metadata hop must not turn an AS outage into a verification outage.
+
+    Token-level issuer identity is checked against the configured issuer, not
+    against the document, so a key set that can still satisfy the token is
+    enough. The refresh error is logged and verification continues.
+    """
+    jwks_uri = "https://auth.example.com/jwks.json"
+    key = signing_key_factory("stable-key")
+
+    metadata_broken = False
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        if metadata_broken:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": jwks_uri},
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    respx.get(jwks_uri).mock(return_value=respx.MockResponse(200, json=key.jwks))
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(key.sign())).kid == "stable-key"
+
+        metadata_broken = True
+        expire_metadata_interval(client)
+
+        assert (await verifier.verify(key.sign(jti="during-outage"))).kid == "stable-key"
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_a_rejected_metadata_refresh_displaces_neither_the_document_nor_the_key_source(
+    signing_key_factory: Callable[[str], SigningKey],
+    expire_metadata_interval: Callable[[AuthplaneClient], None],
+) -> None:
+    """A metadata document that fails validation must decide nothing.
+
+    RFC 8414 §3.3 issuer identity is the sharpest case: a refresh that answers
+    with another issuer's document, pointing ``jwks_uri`` at a key set that
+    issuer controls. Checking the document on the way *out* of the cache rather
+    than on the way in would let it be committed first and steer key retrieval
+    while it sat there — and a token signed by the substituted key set would
+    then verify against the configured issuer, which is forgery, not a stale
+    read. Rejecting before the commit leaves both the cached document and the
+    key source where they were.
+    """
+    genuine_key = signing_key_factory("genuine-key")
+    attacker_key = signing_key_factory("attacker-key")
+
+    hijacked = False
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        if hijacked:
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://evil.example.com",
+                    "jwks_uri": "https://evil.example.com/jwks.json",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "issuer": "https://auth.example.com",
+                "jwks_uri": "https://auth.example.com/jwks.json",
+            },
+        )
+
+    respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
+        side_effect=metadata_response
+    )
+    genuine_route = respx.get("https://auth.example.com/jwks.json").mock(
+        return_value=respx.MockResponse(200, json=genuine_key.jwks)
+    )
+    attacker_route = respx.get("https://evil.example.com/jwks.json").mock(
+        return_value=respx.MockResponse(200, json=attacker_key.jwks)
+    )
+
+    client = await AuthplaneClient.create(
+        issuer="https://auth.example.com",
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    verifier = client.resource(resource="https://api.example.com", scopes=["read:data"])
+
+    try:
+        assert (await verifier.verify(genuine_key.sign())).kid == "genuine-key"
+
+        hijacked = True
+        expire_metadata_interval(client)
+
+        # The key source is untouched, so the genuine key still verifies.
+        assert (await verifier.verify(genuine_key.sign(jti="after-rejection"))).kid == "genuine-key"
+        assert not attacker_route.called
+
+        # And a token signed by the substituted key set does not verify. The
+        # unknown kid drives a forced re-read of both documents, which is the
+        # path that would reach that key set had the rejected document been
+        # committed.
+        with pytest.raises(InvalidSignatureError):
+            await verifier.verify(attacker_key.sign())
+        assert not attacker_route.called
+
+        # The document still cached is the last one that passed validation.
+        metadata_cache = client.metadata_cache
+        assert metadata_cache is not None
+        assert await metadata_cache.get_jwks_uri() == "https://auth.example.com/jwks.json"
+        assert genuine_route.called
     finally:
         await client.aclose()

@@ -134,9 +134,25 @@ After each run, two reports are generated in the project root:
 | `test_jwt_and_dpop_conformance.py` | RFC 9068, RFC 8725, RFC 9449, RFC 9728 |
 | `test_oauth_protocol_conformance.py` | RFC 6749, RFC 7009, RFC 7662, RFC 8693, RFC 8707 |
 | `test_rfc8414_conformance.py` | RFC 8414 |
-| `test_catalog_alignment.py` | Meta-test: ensures every catalog case has a `@pytest.mark.conformance` marker |
+| `test_catalog_alignment.py` | Meta-test: catalog and `@pytest.mark.conformance` markers agree in both directions |
 | `conftest.py` | Harness: marker extraction, result collection, report generation |
 
 ## Catalog Alignment
 
-`test_catalog_alignment.py` uses AST parsing to verify that every case ID in the shared catalog has a corresponding `@pytest.mark.conformance("case-id")` marker somewhere in the suite. If a new case is added to the catalog without a matching test, this check fails.
+`test_catalog_alignment.py` uses AST parsing to compare the case IDs in the
+shared catalog against the `@pytest.mark.conformance("case-id")` markers in the
+suite, and asserts that they agree in **both** directions:
+
+| Test | Fails when |
+|------|------------|
+| `test_catalog_case_ids_are_represented_in_conformance_tests` | A catalog case has no marker — the SDK does not cover it, and the report carries it as `not_run`. |
+| `test_conformance_markers_name_only_catalog_case_ids` | A marker names a case ID the catalog does not carry — a typo, a renamed case, or a case dropped from the catalog. |
+
+Neither direction implies the other. The report in `conftest.py` is built by
+iterating the *catalog's* case IDs, so a marker naming an unknown ID is dropped
+from it silently: without the second check the run stays green while the catalog
+case that marker was meant to cover has no coverage at all.
+
+Together they are what makes a `.conformance-catalog-ref` bump safe in both
+directions — bumping the pin without adding markers goes red on the first check,
+and adding markers without bumping the pin goes red on the second.

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from authplane.errors import MetadataFetchError
+from authplane.errors import MetadataFetchError, MissingMetadataEndpointError
 from authplane.internal.fetch_result import FetchResult
 from authplane.internal.metadata import MetadataCache
 
@@ -314,3 +314,262 @@ async def test_malformed_endpoint_url_raises_the_sdk_error(bad_url: str) -> None
 
     with pytest.raises(MetadataFetchError):
         await cache.get_jwks_uri()
+
+
+# ---------------------------------------------------------------------------
+# Forced-read floor, retry floor, and required jwks_uri
+# ---------------------------------------------------------------------------
+
+
+async def test_forced_reads_are_capped_at_one_per_floor() -> None:
+    """A `kid` miss must not cost the AS a discovery fetch per request.
+
+    The caller that reaches a forced read has had only its token *header*
+    decoded, so the `kid` is attacker-controlled and the forced read bypasses
+    `refresh_seconds` by design. Without a floor, invalid tokens drive AS
+    discovery traffic one-for-one.
+    """
+    fetcher = TrackingFetcher()
+    cache = MetadataCache(fetcher, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=3600)
+
+    await cache.get()
+    assert fetcher.calls["count"] == 1
+
+    # First miss after boot: admitted, so a real rotation is followed at once.
+    await cache.get(force_refresh=True)
+    assert fetcher.calls["count"] == 2
+
+    # A flood of misses inside the floor costs the AS nothing more.
+    for _ in range(20):
+        await cache.get(force_refresh=True)
+    assert fetcher.calls["count"] == 2
+
+    # Past the floor — min(refresh_seconds, 60) — the next miss re-reads.
+    cache._last_forced_read = time.time() - 61  # pyright: ignore[reportPrivateUsage]
+    await cache.get(force_refresh=True)
+    assert fetcher.calls["count"] == 3
+
+    await cache.aclose()
+
+
+async def test_no_forced_read_floor_when_refresh_seconds_is_zero() -> None:
+    """`refresh_seconds=0` means "re-read every time" and opts out of the floor."""
+    fetcher = TrackingFetcher()
+    cache = MetadataCache(fetcher, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=0)
+
+    await cache.get()
+    await cache.get(force_refresh=True)
+    await cache.get(force_refresh=True)
+    assert fetcher.calls["count"] == 3
+
+    await cache.aclose()
+
+
+async def test_failed_refresh_is_not_retried_on_every_read() -> None:
+    """An unreachable AS must not cost a full fetch per verification.
+
+    A failed fetch does not advance `_cache_time`, so the document reads as
+    expired forever and every caller takes the synchronous refetch branch —
+    serialized behind the fetch lock, one HTTP timeout each.
+    """
+    calls = {"count": 0}
+
+    async def flaky() -> FetchResult:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return FetchResult(document=SAMPLE_METADATA)
+        raise MetadataFetchError("endpoint down")
+
+    cache = MetadataCache(flaky, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=1)
+    assert await cache.get() == SAMPLE_METADATA
+
+    cache._cache_time = 0  # pyright: ignore[reportPrivateUsage]
+    assert await cache.get() == SAMPLE_METADATA
+    assert calls["count"] == 2
+
+    # Still expired, but inside the floor: served from cache, no second attempt.
+    for _ in range(5):
+        assert await cache.get() == SAMPLE_METADATA
+    assert calls["count"] == 2
+
+    await cache.aclose()
+
+
+async def test_refresh_without_jwks_uri_does_not_displace_the_good_document() -> None:
+    """The one field the whole mechanism runs on.
+
+    A document that has dropped `jwks_uri` used to validate, commit with a fresh
+    timestamp and displace the good one, after which every JWKS fetch raised for
+    the rest of the interval and the first genuinely new `kid` failed.
+    """
+    calls = {"count": 0}
+
+    async def withdrawing() -> FetchResult:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return FetchResult(document=SAMPLE_METADATA)
+        return FetchResult(document={"issuer": SAMPLE_METADATA["issuer"]})
+
+    cache = MetadataCache(withdrawing, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=1)
+    assert await cache.get() == SAMPLE_METADATA
+
+    cache._cache_time = 0  # pyright: ignore[reportPrivateUsage]
+    assert await cache.get_jwks_uri() == SAMPLE_METADATA["jwks_uri"]
+    assert calls["count"] == 2
+
+    await cache.aclose()
+
+
+async def test_background_refresh_is_not_gated_by_the_forced_read_floor() -> None:
+    """The floor is an anti-abuse gate on an externally triggered read.
+
+    A refresh the cache schedules for itself at 80% of its own TTL is not that
+    caller. Routing it through the floored override makes it a silent no-op
+    whenever 0.8 * refresh_seconds falls below the floor — the downgraded read
+    takes the fast path on a document that is by definition still valid, returns,
+    and logs a refresh that never happened.
+    """
+    fetcher = TrackingFetcher()
+    cache = MetadataCache(fetcher, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=10)
+
+    await cache.get()
+    assert fetcher.calls["count"] == 1
+
+    # Consume the forced-read slot the way a kid miss would.
+    await cache.get(force_refresh=True)
+    assert fetcher.calls["count"] == 2
+
+    # Past 80% of a 10 s TTL, and inside the 10 s floor. The background refresh
+    # must still reach the network.
+    cache._cache_time = time.time() - 9  # pyright: ignore[reportPrivateUsage]
+    await cache.get()
+    refresh_task = cache._refresh_task  # pyright: ignore[reportPrivateUsage]
+    assert refresh_task is not None
+    await refresh_task
+    assert fetcher.calls["count"] == 3
+
+    await cache.aclose()
+
+
+async def test_missing_jwks_uri_keeps_its_documented_error_type() -> None:
+    """`MissingMetadataEndpointError` is a package-root export.
+
+    Moving the check from read time to fetch time must not change what an
+    operator's `except` clause catches.
+    """
+    cache = MetadataCache(
+        TrackingFetcher({"issuer": SAMPLE_METADATA["issuer"]}),
+        expected_issuer=SAMPLE_METADATA["issuer"],
+        refresh_seconds=1,
+    )
+
+    with pytest.raises(MissingMetadataEndpointError):
+        await cache.get()
+
+    await cache.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Validation precedes the commit — the ordering, per rejectable field
+# ---------------------------------------------------------------------------
+
+
+_GOOD_JWKS_URI = "https://auth.example.com/.well-known/jwks.json"
+_DISCOVERY_URL = "https://auth.example.com/.well-known/oauth-authorization-server"
+
+
+@pytest.mark.parametrize(
+    ("rejected_document", "why"),
+    [
+        (
+            {"issuer": "https://auth.example.com", "jwks_uri": "http://auth.example.com/jwks.json"},
+            "jwks_uri is not HTTPS",
+        ),
+        (
+            {"issuer": "https://auth.example.com", "jwks_uri": "/relative-jwks"},
+            "jwks_uri is not absolute",
+        ),
+        (
+            {
+                "issuer": "https://evil.example.com",
+                "jwks_uri": "https://evil.example.com/jwks.json",
+            },
+            "issuer does not match the configured one",
+        ),
+        (
+            {"issuer": "https://auth.example.com"},
+            "jwks_uri is absent",
+        ),
+        (
+            {"jwks_uri": "https://auth.example.com/jwks.json"},
+            "issuer is absent",
+        ),
+    ],
+)
+async def test_a_rejected_refresh_moves_neither_the_document_nor_the_key_source(
+    rejected_document: dict[str, Any], why: str
+) -> None:
+    """A document that fails validation must decide nothing, for every field.
+
+    The location key retrieval fetches from is read out of the cached document,
+    so committing first and validating afterwards would let a rejected document
+    name it for as long as it sat there. The recorded source is checked
+    alongside the contents because that is the value a dependent cache compares
+    against to decide whether it is still correctly bound: a rejected document
+    that moved it would leave that cache believing it was bound to a location
+    this cache had refused.
+    """
+    calls = {"count": 0}
+
+    async def then_rejected() -> FetchResult:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return FetchResult(document=SAMPLE_METADATA, source=_DISCOVERY_URL)
+        return FetchResult(document=rejected_document, source="https://elsewhere.example.com/meta")
+
+    cache = MetadataCache(
+        then_rejected, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=1
+    )
+    assert await cache.get() == SAMPLE_METADATA
+    assert cache._cache_source == _DISCOVERY_URL  # pyright: ignore[reportPrivateUsage]
+
+    # Expire the interval so the next read refetches and is rejected.
+    cache._cache_time = 0  # pyright: ignore[reportPrivateUsage]
+
+    assert await cache.get_jwks_uri() == _GOOD_JWKS_URI, why
+    assert calls["count"] == 2, "the rejected document was never fetched"
+    assert await cache.get() == SAMPLE_METADATA, why
+    assert cache._cache_source == _DISCOVERY_URL, why  # pyright: ignore[reportPrivateUsage]
+
+    await cache.aclose()
+
+
+async def test_a_rejected_refresh_surfaces_no_partial_document_to_a_concurrent_reader() -> None:
+    """Ten readers straddling a rejected refresh all see the accepted document.
+
+    One of them takes the refetch and is rejected; the rest must be served the
+    document that was last accepted, never the one in the middle of being
+    checked.
+    """
+    calls = {"count": 0}
+
+    async def then_rejected() -> FetchResult:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return FetchResult(document=SAMPLE_METADATA, source=_DISCOVERY_URL)
+        await asyncio.sleep(0)
+        return FetchResult(
+            document={"issuer": "https://evil.example.com", "jwks_uri": "https://evil/jwks.json"},
+            source=_DISCOVERY_URL,
+        )
+
+    cache = MetadataCache(
+        then_rejected, expected_issuer=SAMPLE_METADATA["issuer"], refresh_seconds=1
+    )
+    assert await cache.get() == SAMPLE_METADATA
+
+    cache._cache_time = 0  # pyright: ignore[reportPrivateUsage]
+    results = await asyncio.gather(*(cache.get_jwks_uri() for _ in range(10)))
+    assert results == [_GOOD_JWKS_URI] * 10
+
+    await cache.aclose()

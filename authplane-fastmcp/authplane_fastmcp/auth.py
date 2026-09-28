@@ -5,6 +5,7 @@ configures all the components needed to add Authplane JWT validation to a
 FastMCP server in a single call.
 """
 
+import contextlib
 from collections.abc import Iterator
 from typing import Any
 
@@ -16,6 +17,8 @@ from authplane import (
     InboundDPoPOptions,
     IntrospectionRevocation,
     RevocationChecker,
+    validate_prm_resource_identifier,
+    validate_resource_metadata_url,
 )
 from authplane.oauth import TokenExchangeOptions, TokenResponse
 from fastmcp.server.auth import RemoteAuthProvider
@@ -173,6 +176,7 @@ async def authplane_auth(
     mcp_path: str = "/mcp",
     revocation_checker: IntrospectionRevocation | RevocationChecker | None = None,
     fail_closed: bool = False,
+    resource_metadata_url: str | None = None,
 ) -> AuthplaneAuthResult:
     """Build the kwargs to enable Authplane auth on a FastMCP server.
 
@@ -260,21 +264,48 @@ async def authplane_auth(
             - ``IntrospectionRevocation()``: calls the AS
               ``introspection_endpoint`` (RFC 7662) discovered from AS
               metadata. Raises ``TokenRevokedError`` if ``active=false``.
-              Pass ``as_credentials`` for authenticated introspection.
-              Fails open if the endpoint is unavailable, unless
-              ``fail_closed=True``.
+              ``as_credentials`` is required: authserver >= 0.1.2 answers
+              ``active=false`` to an unauthenticated call, or to a client
+              that is neither the issuing client nor a runtime-client of
+              the resource, so every token would be rejected as revoked.
+              An introspection error lets the token through unless
+              ``fail_closed=True`` is passed.
             - async callable: custom checker called with
               ``(VerifiedClaims, raw_token)``; return ``True`` to reject
               the token (raises ``TokenRevokedError``).
         fail_closed: Policy applied when the configured
             ``revocation_checker`` itself fails (e.g. the introspection
             endpoint is unreachable). ``False`` (default) accepts the
-            token — offline signature/claims validation still applies.
-            ``True`` rejects it with ``TokenRevokedError``, trading
-            availability during an AS outage for a hard revocation
-            guarantee. Only consulted when a ``revocation_checker`` is
-            configured; note that once the client's circuit breaker
-            opens, every request is rejected until the cooldown elapses.
+            token — offline signature/claims validation still applies —
+            and logs at INFO on construction so the posture is visible
+            in startup output. ``True`` rejects it with
+            ``TokenRevokedError``, trading availability during an AS
+            outage for a hard revocation guarantee. Only consulted when a
+            ``revocation_checker`` is configured; note that once the
+            client's circuit breaker opens, every request is rejected
+            until the cooldown elapses.
+        resource_metadata_url: URL to advertise as RFC 9728 §5.1
+            ``resource_metadata`` instead of the §3.1 derivation of the
+            resource. For a deployment where the PRM document is served by
+            the authorization server — authserver >= 0.2.0 serves one per
+            registered Resource — rather than by this server. Forwarded to
+            ``AuthplaneClient.resource(...)`` and surfaced by
+            :meth:`AuthplaneTokenVerifier.resource_metadata_url`.
+
+            **It does not reach the challenge FastMCP emits.** No upstream
+            parameter accepts a metadata URL: ``AuthProvider`` takes
+            ``base_url`` and ``resource_base_url``, both resource
+            *identifiers*, and ``fastmcp.server.http`` derives the challenge
+            URL from ``AuthProvider._get_resource_url(path)`` through
+            ``mcp.server.auth.routes.build_resource_metadata_url`` before
+            handing it to ``fastmcp.server.auth.middleware.RequireAuthMiddleware``.
+            So the 401 and the 403 ``insufficient_scope`` that middleware
+            sends always carry the derived, resource-hosted URL — and
+            overriding ``_get_resource_url`` would move the PRM route this
+            adapter serves along with it, which is a different change.
+            Middleware of your own that calls ``response_headers_for``
+            carries this value; the upstream one cannot until it accepts a
+            URL.
 
     Returns:
         ``AuthplaneAuthResult`` with ``auth`` (``RemoteAuthProvider``),
@@ -285,12 +316,42 @@ async def authplane_auth(
         ``result.client.exchange()``.
 
     Raises:
+        InvalidResourceError: If the resource derived from ``base_url`` and
+            ``mcp_path`` carries a fragment component, contains whitespace or
+            a control character, is not an absolute URL with a scheme and a
+            host (e.g. a ``base_url`` of ``localhost:8000``, whose
+            ``localhost`` parses as the scheme), carries a userinfo
+            subcomponent (RFC 9110 §4.2.4 — the identifier becomes the DPoP
+            ``htu`` origin and the advertised PRM ``resource``, so embedded
+            credentials are rejected outright), or carries a port that does
+            not parse (RFC 3986 §3.2.3). Raised before metadata
+            discovery, so the server fails at startup with the configuration
+            error rather than after a network round trip — or, worse, at
+            first request. Subclasses ``ValueError``. Also raised, before
+            discovery and for the same reason, when ``resource_metadata_url``
+            is not an absolute ``http`` / ``https`` URL or carries any of the
+            same defects.
         ValueError: If configuration is invalid (bad algorithms, etc.).
         JWKSFetchError: If metadata discovery or JWKS fetching fails.
     """
     resolved_scopes = scopes or []
 
     resource = _derive_resource_url(base_url, mcp_path)
+
+    # Gate the resource before AuthplaneClient.create(). The authoritative
+    # check is AuthplaneResource.__init__, reached through client.resource()
+    # below — but by then metadata discovery has already run, and the raise
+    # path would strand a client whose caches this function never aclose()s.
+    # A misconfigured base_url must not need a reachable AS to be diagnosed,
+    # and the verifier's htu origin is reconstructed from this identifier, so
+    # a non-absolute one would also leave DPoP-bound requests unverifiable.
+    validate_prm_resource_identifier(resource)
+
+    # The override travels to the same challenge parameter the derived URL
+    # would, so it is gated in the same place and for the same reason. The
+    # authoritative call is AuthplaneResource.__init__, past create().
+    if resource_metadata_url is not None:
+        validate_resource_metadata_url(resource_metadata_url)
 
     # Prepare client-level kwargs, filtering out None to use SDK defaults
     client_kwargs_raw: dict[str, Any] = {
@@ -312,6 +373,7 @@ async def authplane_auth(
         "allowed_algorithms": allowed_algorithms,
         "clock_skew_seconds": clock_skew_seconds,
         "inbound_dpop": inbound_dpop,
+        "resource_metadata_url": resource_metadata_url,
     }
     verifier_kwargs: dict[str, Any] = {
         k: v for k, v in verifier_kwargs_raw.items() if v is not None
@@ -324,43 +386,58 @@ async def authplane_auth(
         **client_kwargs,
     )
 
-    # Translate ConsentRequiredError → MCP UrlElicitationRequiredError at the
-    # client boundary, before user tool code sees it.  Tool authors don't need
-    # to wrap handlers or import elicitation primitives — the MCP wire-format
-    # mapping is owned by the adapter that constructs the client.
-    client = _wrap_client_for_elicitation(client)
+    # Everything between create() and the return runs with a live client whose
+    # caches this function owns. Any raise on this path — client.resource()'s
+    # ValueError for an out-of-range allowed_algorithms, an upstream
+    # constructor's — would otherwise strand it un-aclose()d, so close it and
+    # re-raise rather than leak the metadata/JWKS caches behind an exception
+    # the operator sees as a plain configuration error.
+    try:
+        # Translate ConsentRequiredError → MCP UrlElicitationRequiredError at the
+        # client boundary, before user tool code sees it.  Tool authors don't need
+        # to wrap handlers or import elicitation primitives — the MCP wire-format
+        # mapping is owned by the adapter that constructs the client.
+        client = _wrap_client_for_elicitation(client)
 
-    # Create the resource from the client
-    verifier = client.resource(
-        resource=resource,
-        scopes=resolved_scopes,
-        revocation_checker=revocation_checker,
-        fail_closed=fail_closed,
-        **verifier_kwargs,
-    )
+        # Create the resource from the client
+        verifier = client.resource(
+            resource=resource,
+            scopes=resolved_scopes,
+            revocation_checker=revocation_checker,
+            fail_closed=fail_closed,
+            **verifier_kwargs,
+        )
 
-    # Wrap in AuthplaneTokenVerifier
-    # Note: FastMCP uses token_verifier.base_url for PRM generation if provided
-    token_verifier = AuthplaneTokenVerifier(verifier, base_url=base_url)
+        # Wrap in AuthplaneTokenVerifier
+        # Note: FastMCP uses token_verifier.base_url for PRM generation if provided
+        token_verifier = AuthplaneTokenVerifier(verifier, base_url=base_url)
 
-    # Wrap in RemoteAuthProvider to get PRM routes.
-    #
-    # ``authorization_servers`` and ``base_url`` must be ``AnyHttpUrl`` — the
-    # upstream framework requires the URL type internally. That construction
-    # normalizes an empty-path authority with a trailing slash, so the served
-    # PRM would otherwise advertise ``https://auth.example.com/`` for an issuer
-    # configured as ``https://auth.example.com``. ``VerbatimPRMRemoteAuthProvider``
-    # rewrites the served ``authorization_servers`` / ``resource`` back to the
-    # verbatim configured strings so they match the core SDK's byte-for-byte
-    # comparison (RFC 8414 §3.3, RFC 9728 §3.3).
-    auth_provider = VerbatimPRMRemoteAuthProvider(
-        token_verifier=token_verifier,
-        authorization_servers=[AnyHttpUrl(issuer)],
-        base_url=AnyHttpUrl(base_url),
-        scopes_supported=resolved_scopes,
-        verbatim_issuer=issuer,
-        verbatim_resource=resource,
-    )
+        # Wrap in RemoteAuthProvider to get PRM routes.
+        #
+        # ``authorization_servers`` and ``base_url`` must be ``AnyHttpUrl`` — the
+        # upstream framework requires the URL type internally. That construction
+        # normalizes an empty-path authority with a trailing slash, so the served
+        # PRM would otherwise advertise ``https://auth.example.com/`` for an issuer
+        # configured as ``https://auth.example.com``. ``VerbatimPRMRemoteAuthProvider``
+        # rewrites the served ``authorization_servers`` / ``resource`` back to the
+        # verbatim configured strings so they match the core SDK's byte-for-byte
+        # comparison (RFC 8414 §3.3, RFC 9728 §3.3).
+        auth_provider = VerbatimPRMRemoteAuthProvider(
+            token_verifier=token_verifier,
+            authorization_servers=[AnyHttpUrl(issuer)],
+            base_url=AnyHttpUrl(base_url),
+            scopes_supported=resolved_scopes,
+            verbatim_issuer=issuer,
+            verbatim_resource=resource,
+        )
+    except Exception:
+        # Suppressed close: if aclose() itself raises, the operator would see
+        # the close failure and the configuration error this block exists to
+        # surface would survive only as __context__ — the opposite of the
+        # block's intent.
+        with contextlib.suppress(Exception):
+            await client.aclose()
+        raise
 
     return AuthplaneAuthResult(
         auth=auth_provider,

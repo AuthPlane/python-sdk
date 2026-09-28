@@ -29,6 +29,7 @@ from authplane import (
     InsufficientScopeError,
     InvalidClaimsError,
     InvalidDPoPProofError,
+    InvalidResourceError,
     InvalidSignatureError,
     TokenExpiredError,
     www_authenticate,
@@ -1165,6 +1166,82 @@ async def test_rfc9728_well_known_path_must_derive_from_resource_uri() -> None:
         build_prm_url("https://api.example.com/v2/mcp")
         == "https://api.example.com/.well-known/oauth-protected-resource/v2/mcp"
     )
+    # The catalog's fourth resource: identifiers differing only by a
+    # terminating slash resolve to the same metadata document (RFC 9728 §3.1
+    # removes the slash following the host when a path is present).
+    assert (
+        build_prm_url("https://api.example.com/mcp/")
+        == "https://api.example.com/.well-known/oauth-protected-resource/mcp"
+    )
+
+
+@pytest.mark.conformance("rfc9728-well-known-url-must-preserve-the-resource-query-component")
+async def test_rfc9728_well_known_url_must_preserve_the_resource_query_component() -> None:
+    # RFC 9728 §3 inserts the well-known suffix between the host and "the path
+    # and/or query components", so the query survives onto the derived URL.
+    # Dropping it would collapse every tenant on a host onto one metadata
+    # document — the multi-tenant case RFC 8707 §2 names as the reason a query
+    # is permitted at all — and the client would then have to discard the
+    # response under §3.3 with a 200 and no server-side signal.
+    #
+    # The full URL rather than the path alone, because a path-only accessor
+    # cannot express a query; the sibling path-only case above stays unchanged.
+    assert {
+        resource: build_prm_url(resource)
+        for resource in (
+            "https://api.example.com/mcp?tenant=a",
+            "https://api.example.com/mcp?tenant=b",
+            "https://api.example.com?x=1",
+        )
+    } == {
+        "https://api.example.com/mcp?tenant=a": (
+            "https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=a"
+        ),
+        "https://api.example.com/mcp?tenant=b": (
+            "https://api.example.com/.well-known/oauth-protected-resource/mcp?tenant=b"
+        ),
+        "https://api.example.com?x=1": (
+            "https://api.example.com/.well-known/oauth-protected-resource?x=1"
+        ),
+    }
+
+
+@pytest.mark.conformance("rfc8707-resource-indicator-must-not-contain-a-fragment")
+async def test_rfc8707_resource_indicator_must_not_contain_a_fragment(
+    client: AuthplaneClient,
+) -> None:
+    # RFC 8707 §2 forbids a fragment in the resource indicator and RFC 9728 §1.2
+    # defines the resource identifier as carrying none. The catalog case puts the
+    # gate at construction: accepting the value and stripping the fragment later,
+    # while deriving the well-known URL, does not satisfy it — the served PRM
+    # would name a resource differing from the URL it was fetched from, which
+    # RFC 9728 §3.3 obliges the client to discard silently.
+    with pytest.raises(InvalidResourceError, match="must not contain a fragment"):
+        client.resource("https://api.example.com/mcp#section")
+
+
+@pytest.mark.conformance("rfc9728-resource-identifier-must-be-an-absolute-url-with-scheme-and-host")
+async def test_rfc9728_resource_identifier_must_be_an_absolute_url_with_scheme_and_host(
+    client: AuthplaneClient,
+) -> None:
+    # RFC 8707 §2 requires an absolute URI (RFC 3986 §4.3, whose grammar makes
+    # the scheme mandatory); RFC 9728 §3 requires a host to insert the well-known
+    # suffix after. Both shapes are rejected at construction, not at first use.
+    #
+    # Looped rather than parametrized: the harness maps one catalog case to
+    # exactly one test function, and parametrizing would declare the marker on
+    # several items. The two values are not redundant — a guard phrased as
+    # "opaque or authority-less" would admit the scheme-relative form, whose
+    # authority parses non-empty, so each must reject on its own.
+    for resource in ("/mcp", "//api.example.com/mcp"):
+        with pytest.raises(
+            InvalidResourceError, match="must be an absolute URL with a scheme and a host"
+        ):
+            client.resource(resource)
+
+    # The check is absoluteness, not https: the case explicitly keeps a loopback
+    # http identifier acceptable, so pin that this does not become https-only.
+    assert client.resource("http://localhost:8080/mcp").resource == "http://localhost:8080/mcp"
 
 
 @pytest.mark.conformance("rfc9728-prm-must-contain-required-fields")

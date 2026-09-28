@@ -93,7 +93,8 @@ twine check dist/*
 - `await client.revoke(token)` — RFC 7009
 - `await client.aclose()` — required on shutdown.
 - `resource.prm_response()` — RFC 9728 PRM document (dict body).
-- `resource.prm_url()` — the well-known URL where clients fetch that document; pass to `response_headers_for(... , resource_metadata_url=...)`.
+- `resource.prm_url()` — the RFC 9728 §3.1 derivation: where clients fetch the document this SDK builds.
+- `resource.resource_metadata_url()` — what to advertise as RFC 9728 §5.1 `resource_metadata`: the `resource_metadata_url=` configured on `client.resource(...)` (an AS-hosted document) or `prm_url()`; pass to `response_headers_for(..., resource_metadata_url=...)`.
 
 ### Errors (root export)
 
@@ -105,26 +106,71 @@ DPoP family (`DPoPError` and subclasses).
 
 AS-facing: `AuthError`, `InvalidClientError`, `InvalidGrantError`,
 `InvalidScopeError`, `UnauthorizedClientError`, `UnsupportedGrantTypeError`,
-`InvalidRequestError`, `ServerError`, `ConsentRequiredError`,
-`CircuitOpenError`. `client.exchange()` raises `InvalidGrantError` for RFC
-6749 `invalid_grant`, `ConsentRequiredError` for `consent_required` /
-`interaction_required`.
+`InvalidRequestError`, `AccessDeniedError`, `InvalidTargetError`,
+`ServerError`, `ConsentRequiredError`, `CircuitOpenError`. `client.exchange()`
+raises `InvalidGrantError` for RFC 6749 `invalid_grant`,
+`ConsentRequiredError` for `consent_required` / `interaction_required`,
+`AccessDeniedError` for `access_denied` (403 — the exchanging client is not in
+the target Resource's `policy.exchange.allowed_client_ids`; an operator fix,
+re-prompting the user does not clear it) and `InvalidTargetError` for
+`invalid_target` (400, RFC 8707 §2.2 — `resource` does not match a granted
+resource byte for byte). None of the four trips the circuit breaker.
+
+Introspection (`IntrospectionRevocation`): the RS client must be confidential
+and either the issuing client or a runtime-client of the Resource
+(`authserver admin resource runtime-client add --client-id <rs-client-id>
+--slug <resource-slug>`). authserver >= 0.1.2 answers `{"active": false}` to
+an unauthenticated or non-owner call, so a public client cannot introspect
+at all and a misconfigured one rejects every token. `ASCredentials` rejects
+empty fields at construction; `client.resource(...)` warns when
+`IntrospectionRevocation` is configured without `auth=`.
+
+Token exchange operator step: for each MCP server that exchanges for a
+downstream resource it does not act as, `PATCH /admin/resources/{id}` with
+`{"policy": {"exchange": {"allowed_client_ids": ["<exchanging-client-id>"]}}}`.
+Self-exchange, fronted exchanges and Broker resources need nothing.
+
+`VerifiedClaims.may_act` is deprecated (`DeprecationWarning`): authserver
+0.2.0 no longer issues `may_act`; removed in the next minor.
 
 `http_status(error)` maps any `AuthplaneError` to an HTTP status: 403 only
 for `InsufficientScopeError`; 503 for `JWKSFetchError`, `MetadataFetchError`,
 and `CircuitOpenError` (temporary AS unavailability); 401 for token failures;
 500 for `ProtocolError` / `VerifierRuntimeError` / unknown.
 
-`www_authenticate(error, *, realm="", resource_metadata_url=None, scope=None)`
-builds the matching `WWW-Authenticate` header. Scheme: `DPoP` for `DPoPError`
-subclasses except `DPoPNotSupportedError` (which stays `Bearer` because the
-resource is bearer-only); `Bearer` otherwise. When `scope=` is omitted, it
-auto-populates from `InsufficientScopeError.required_scopes`. Every
-interpolated value is sanitized (`\r\n"\\` stripped) so attacker-influenced
-error messages cannot break out of the quoted parameter or inject headers.
+`www_authenticate(error, *, realm="", resource_metadata_url=None, scope=None,
+verbose_description=False)` builds the matching `WWW-Authenticate` header.
+Scheme: `DPoP` for `DPoPError` subclasses except `DPoPNotSupportedError`
+(which stays `Bearer` because the resource is bearer-only); `Bearer`
+otherwise. When `scope=` is omitted, it auto-populates from
+`InsufficientScopeError.required_scopes`. Every interpolated value is
+sanitized (`\r\n"\\` stripped) so attacker-influenced error messages cannot
+break out of the quoted parameter or inject headers.
+
+`error_description` is a fixed sentence chosen by the error code, never the
+exception's message: the challenge is served to a caller who has not
+authenticated, and the SDK's messages name the unknown `kid`, the claim that
+failed, or the audience the resource expects. The message stays on the
+exception and is logged at `DEBUG` on the `authplane.errors` logger.
+`verbose_description=True` puts it back on the wire and is a development aid
+only.
+
+`www_authenticate_challenges(error, *, schemes=None, algs=(), realm="",
+resource_metadata_url=None, scope=None, verbose_description=False)` returns
+one challenge per acceptable scheme, so a resource running `inbound_dpop` in
+optional mode can advertise both `Bearer` and `DPoP` (RFC 9449 §7.1). Two
+challenges cannot be comma-joined — the comma also separates parameters
+inside a challenge — so RFC 7235 §4.1 advises separate header values and the
+caller emits one per element. `algs=` (pass
+`InboundDPoPOptions.allowed_proof_algorithms`) lands on the `DPoP` challenge
+only. Omitting `schemes=` derives the single scheme from the error, matching
+`www_authenticate`.
 
 `response_headers_for(error, *, realm="", resource_metadata_url=None,
-scope=None)` returns `(status, {"WWW-Authenticate": challenge})` in one call.
+scope=None, verbose_description=False)` returns
+`(status, {"WWW-Authenticate": challenge})` in one call. A dict holds one
+value per header name, so it is single-scheme by construction; pair
+`http_status` with `www_authenticate_challenges` to advertise two.
 
 Both adapter verifiers log a `logging.DEBUG` event
 `authplane.token_verification_failed` (logger `authplane_mcp.verifier` or
@@ -239,7 +285,7 @@ except AuthplaneError as e:
     status, headers = response_headers_for(
         e,
         realm="api.example.com",
-        resource_metadata_url=res.prm_url(),
+        resource_metadata_url=res.resource_metadata_url(),
     )
     return Response(status_code=status, headers=headers)
 ```
@@ -312,7 +358,8 @@ bash scripts/manual-e2e-smoke.sh --skip-setup
 bash scripts/manual-e2e-smoke.sh --adapter fastmcp --skip-setup
 ```
 
-Optional overrides: `AUTHSERVER_DIR`, `ISSUER_URL`, `RESOURCE_URL`.
+Optional overrides: `AUTHSERVER_DIR`, `AUTHSERVER_REF` (check out that ref
+of the authserver repo before building), `ISSUER_URL`, `RESOURCE_URL`.
 
 ### Python client demo example (DPoP + token exchange)
 
@@ -390,11 +437,10 @@ python path/to/demo_client.py
 
 ### Local OAuth server requirements for demos
 
-Run the Authplane authserver on `http://127.0.0.1:9000` with these flags enabled:
+Run the Authplane authserver 0.2.0 on `http://127.0.0.1:9000`. Client
+credentials, token exchange and DPoP are on by default since 0.2.0; the demo
+additionally needs:
 
-- `AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true`
-- `AUTHPLANE_TOKEN_EXCHANGE_ENABLED=true`
-- `AUTHPLANE_DPOP_ENABLED=true`
 - `AUTHPLANE_TOKEN_EXCHANGE_ALLOW_SELF_EXCHANGE=true`
 
 Register the demo client with:
@@ -408,8 +454,12 @@ Register the demo client with:
 
 ## Common Local Demo Pitfalls
 
-- `client_credentials grant is not enabled`
-  - `authserver` missing `AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true`
+- `access_denied` on a token exchange
+  - exchanging client not in the target Resource's
+    `policy.exchange.allowed_client_ids` (`PATCH /admin/resources/{id}`)
+- every token rejected as revoked with introspection on
+  - RS client is public, or is neither the issuing client nor a runtime-client
+    of the Resource (authserver >= 0.1.2 answers `active: false`)
 - `client is not authorized for this grant type`
   - client missing `urn:ietf:params:oauth:grant-type:token-exchange`
 - `requested scope is invalid or not allowed`

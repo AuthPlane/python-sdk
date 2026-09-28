@@ -345,7 +345,8 @@ def test_may_act_claim_present() -> None:
         kid="k",
         raw=freeze_value({"may_act": {"sub": "allowed-agent"}}),
     )
-    assert claims.may_act == {"sub": "allowed-agent"}
+    with pytest.warns(DeprecationWarning, match="authserver 0.2.0 no longer issues may_act"):
+        assert claims.may_act == {"sub": "allowed-agent"}
 
 
 def test_may_act_claim_absent() -> None:
@@ -362,4 +363,5 @@ def test_may_act_claim_absent() -> None:
         kid="k",
         raw=MappingProxyType({}),
     )
-    assert claims.may_act is None
+    with pytest.warns(DeprecationWarning):
+        assert claims.may_act is None

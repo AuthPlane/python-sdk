@@ -5,7 +5,13 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from authplane import DPoPProvider, FetchSettings, IntrospectionRevocation, VerifiedClaims
+from authplane import (
+    DPoPProvider,
+    FetchSettings,
+    IntrospectionRevocation,
+    InvalidResourceError,
+    VerifiedClaims,
+)
 from mcp.server.auth.provider import AccessToken
 from mcp.server.auth.settings import AuthSettings
 
@@ -186,6 +192,76 @@ async def test_authplane_mcp_auth_none_filtering():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource",
+    ["/mcp", "//api.example.com/mcp", "urn:example:api"],
+    ids=["relative", "scheme-relative", "opaque-urn"],
+)
+async def test_authplane_mcp_auth_rejects_non_absolute_resource_at_startup(resource: str):
+    """A non-absolute resource fails the factory before metadata discovery.
+
+    The raise comes from the core SDK's real construction-time gate — nothing
+    on that path is stubbed here. ``AuthplaneClient`` is patched only to pin
+    the *ordering* claim: the gate fires before ``create()``, so the operator
+    sees the configuration error without a reachable AS, and the factory never
+    strands a client whose caches its raise path would not ``aclose()``. With
+    the early gate deleted, the factory would sail through the mocked create
+    into a mocked ``client.resource`` — no gate anywhere — and this test's
+    ``InvalidResourceError`` expectation goes red.
+
+    A verifier built from such a resource would also reconstruct its DPoP
+    ``htu`` origin as the literal ``"://"``, leaving DPoP-bound requests
+    unverifiable at first request — the failure mode "at startup, not at first
+    request" is about.
+    """
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock()
+        with pytest.raises(InvalidResourceError, match="absolute URL with a scheme and a host"):
+            await authplane_mcp_auth(
+                issuer="https://auth.example.com",
+                resource=resource,
+            )
+        mock_client_cls.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_rejects_userinfo_resource_at_startup():
+    """A credential-bearing resource fails the factory before create().
+
+    Same gate, same ordering claim as the non-absolute rejection above. The
+    sink this closes here is the verifier's DPoP ``htu`` origin, which is
+    reassembled as ``scheme://netloc`` from this identifier — with userinfo
+    admitted, that origin is one no honest client proof can ever match. The
+    secret must not survive into the error message either.
+    """
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock()
+        with pytest.raises(InvalidResourceError, match="userinfo") as exc:
+            await authplane_mcp_auth(
+                issuer="https://auth.example.com",
+                resource="https://svc:s3cr3t@api.example.com/mcp",
+            )
+        mock_client_cls.create.assert_not_awaited()
+    assert "s3cr3t" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_accepts_http_localhost_resource():
+    """Absoluteness is required, https is not — local development keeps working."""
+    mock_client = MagicMock()
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="http://localhost:8080/mcp"))
+
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        result = await authplane_mcp_auth(
+            issuer="https://auth.example.com",
+            resource="http://localhost:8080/mcp",
+            dev_mode=True,
+        )
+    assert isinstance(result, AuthplaneAuthResult)
+
+
+@pytest.mark.asyncio
 async def test_authplane_mcp_auth_revocation_checker_default_is_none():
     """When revocation_checker is not passed, None is forwarded (no revocation checking)."""
     mock_client = MagicMock()
@@ -322,6 +398,53 @@ async def test_authplane_auth_result_aclose_idempotent():
     assert mock_client.aclose.await_count == 2
 
 
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_closes_client_when_resource_construction_raises():
+    """A raise after create() closes the client the factory owns.
+
+    The early resource gate fires before create(), but it is not the only
+    raise on the post-create path: client.resource() still raises ValueError
+    for an out-of-range allowed_algorithms, and any constructor after it can
+    raise too. The factory created the client, so its raise path — not the
+    operator's — must aclose() it; the operator only ever sees the exception.
+    """
+    mock_client = MagicMock()
+    mock_client.aclose = AsyncMock()
+    mock_client.resource = MagicMock(side_effect=ValueError("allowed_algorithms out of range"))
+
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        with pytest.raises(ValueError, match="allowed_algorithms"):
+            await authplane_mcp_auth(
+                issuer="https://auth.example.com",
+                resource="https://api.example.com/mcp",
+            )
+    mock_client.aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_close_failure_does_not_mask_the_configuration_error():
+    """aclose() raising in the handler must not replace the original exception.
+
+    The handler exists so "the operator only ever sees the exception" — if the
+    best-effort close itself fails, surfacing the close failure would bury the
+    configuration error as mere __context__, the opposite of the intent. The
+    close failure is suppressed; the close is still attempted.
+    """
+    mock_client = MagicMock()
+    mock_client.aclose = AsyncMock(side_effect=RuntimeError("close failed"))
+    mock_client.resource = MagicMock(side_effect=ValueError("allowed_algorithms out of range"))
+
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        with pytest.raises(ValueError, match="allowed_algorithms"):
+            await authplane_mcp_auth(
+                issuer="https://auth.example.com",
+                resource="https://api.example.com/mcp",
+            )
+    mock_client.aclose.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Scopes are NOT passed as required_scopes (MCP SDK enforces globally)
 # ---------------------------------------------------------------------------
@@ -374,3 +497,58 @@ async def test_verify_token_non_authplane_error_propagates():
     tv = AuthplaneTokenVerifier(mock_verifier)
     with pytest.raises(RuntimeError, match="unexpected"):
         await tv.verify_token("some_token")
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_resource_metadata_url_defaults_to_unset():
+    """Without the option, nothing is forwarded and the SDK derives the URL."""
+    mock_client = MagicMock()
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com"))
+
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        await authplane_mcp_auth(
+            issuer="https://auth.example.com",
+            resource="https://api.example.com",
+        )
+
+        verifier_kwargs = mock_client.resource.call_args.kwargs
+        assert "resource_metadata_url" not in verifier_kwargs
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_resource_metadata_url_forwarded():
+    """The AS-hosted PRM URL is forwarded to client.resource()."""
+    as_hosted = "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    mock_client = MagicMock()
+    mock_client.resource = MagicMock(return_value=MagicMock(resource="https://api.example.com/mcp"))
+
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
+        await authplane_mcp_auth(
+            issuer="https://auth.example.com",
+            resource="https://api.example.com/mcp",
+            resource_metadata_url=as_hosted,
+        )
+
+        verifier_kwargs = mock_client.resource.call_args.kwargs
+        assert verifier_kwargs["resource_metadata_url"] == as_hosted
+
+
+@pytest.mark.asyncio
+async def test_authplane_mcp_auth_rejects_invalid_resource_metadata_url_at_startup():
+    """A malformed override fails before create(), like the resource itself.
+
+    Same ordering claim as the resource gate above: the value is advertised to
+    an unauthenticated caller from a challenge path, so it is diagnosed at
+    startup without a reachable AS.
+    """
+    with patch("authplane_mcp.auth.AuthplaneClient") as mock_client_cls:
+        mock_client_cls.create = AsyncMock()
+        with pytest.raises(InvalidResourceError, match="absolute URL with a scheme and a host"):
+            await authplane_mcp_auth(
+                issuer="https://auth.example.com",
+                resource="https://api.example.com/mcp",
+                resource_metadata_url="/.well-known/oauth-protected-resource/mcp",
+            )
+        mock_client_cls.create.assert_not_awaited()
