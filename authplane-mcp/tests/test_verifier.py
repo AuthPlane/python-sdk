@@ -136,3 +136,23 @@ async def test_verify_token_failure_silent_above_debug(
 
     assert result is None
     assert not [r for r in caplog.records if r.name == "authplane_mcp.verifier"]
+
+
+def test_resource_metadata_url_delegates_to_the_resource() -> None:
+    """The accessor answers from the wrapped resource, not from a rebuild.
+
+    Middleware composing its own challenge reads one value; the MCP SDK's own
+    401/403 does not pass through here (``AuthSettings`` carries no
+    metadata-URL field — see the factory's docstring).
+    """
+    resource = _make_resource_mock("https://api.example.com/mcp")
+    resource.resource_metadata_url.return_value = (
+        "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    )
+
+    verifier = AuthplaneTokenVerifier(resource)
+
+    assert (
+        verifier.resource_metadata_url()
+        == "https://auth.example.com/.well-known/oauth-protected-resource/mcp"
+    )

@@ -62,8 +62,8 @@ class AuthplaneTokenVerifier(TokenVerifier):
     call's in-flight verify task is stashed on ``request.state`` keyed by
     the access token; any subsequent invocation within the same request
     awaits the same task instead of re-entering the inbound DPoP replay
-    store. The cache is defensive: it mirrors the TS adapter's
-    ``AsyncLocalStorage`` pattern and pre-empts a class of regressions
+    store. The cache is defensive: it stashes the in-flight verify task on
+    ``request.state`` and pre-empts a class of regressions
     where a future framework change (transport rewrite, custom auth
     provider, ASGI wrapper) would silently double-call ``verify_token``
     and the second call's proof would be rejected as
@@ -111,6 +111,15 @@ class AuthplaneTokenVerifier(TokenVerifier):
             raise TypeError(
                 f"verifier.resource must be a str URI, got {type(verifier.resource).__name__}"
             )
+        # Well-formed by construction: ``AuthplaneResource.__init__`` rejects
+        # a resource without a scheme and a host, so this origin — the fixed
+        # half of every ``htu`` this verifier checks proofs against — cannot
+        # degrade to the literal ``"://"`` a relative or opaque identifier
+        # used to produce (against which no honest proof could ever verify).
+        # The same gate rejects a userinfo subcomponent (RFC 9110 §4.2.4), so
+        # reassembling from ``netloc`` cannot put credentials into the origin
+        # either — an ``htu`` no honest proof could match, which was the
+        # "://" failure mode on an input the scheme+host check alone admits.
         split = urlsplit(verifier.resource)
         self._resource_origin = f"{split.scheme}://{split.netloc}"
 
@@ -128,6 +137,17 @@ class AuthplaneTokenVerifier(TokenVerifier):
         ``/.well-known/oauth-protected-resource``.
         """
         return list(self._verifier.scopes)
+
+    def resource_metadata_url(self) -> str:
+        """Return the URL to advertise as RFC 9728 §5.1 ``resource_metadata``.
+
+        Delegates to the wrapped resource, so middleware composing its own
+        challenge reads the configured override — or, with none configured,
+        the RFC 9728 §3.1 derivation — instead of rebuilding either. FastMCP's
+        own 401/403 does not go through here; see the user guide's "Where the
+        PRM document lives".
+        """
+        return self._verifier.resource_metadata_url()
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Validate a JWT and return a FastMCP ``AccessToken``.
@@ -205,18 +225,16 @@ class AuthplaneTokenVerifier(TokenVerifier):
         not configured for inbound DPoP, the verifier's Mode-3 path
         rejects any DPoP signal regardless of what is passed here.
 
-        Cross-SDK note: the TS sibling ``buildDpopRequestContext``
-        returns ``undefined`` when no ``DPoP`` header is present;
-        Python intentionally always builds the context with
-        ``proof=None``. Both shapes are behaviorally equivalent in
-        the core verifier (Mode 3 path treats absent and ``None``
-        proofs the same), but a DPoP-bound token with no proof
-        yields a more specific ``DPoPProofMissingError`` here
-        instead of ``DPoPBindingMismatchError``. The error-type
-        contract is pinned per language by design.
+        Note: the context is always built, with ``proof=None`` when no
+        ``DPoP`` header is present, rather than omitted. Both shapes are
+        behaviorally equivalent in the core verifier (the Mode 3 path
+        treats absent and ``None`` proofs the same), but building it
+        unconditionally means a DPoP-bound token with no proof yields the
+        more specific ``DPoPProofMissingError`` instead of
+        ``DPoPBindingMismatchError``.
         """
-        # ``raw_request_path`` reads ``scope["raw_path"]`` to preserve
-        # percent-encoding for DPoP ``htu`` parity with the TS sibling.
+        # ``raw_request_path`` reads ``scope["raw_path"]`` so percent-encoding
+        # is preserved in the DPoP ``htu`` (RFC 9449 §4.3, RFC 3986 §6.2.2.2).
         # ``request.url.query`` is sourced from ``scope["query_string"]``
         # without percent-decoding, so it is already on-wire-safe.
         url = f"{self._resource_origin}{raw_request_path(request)}"

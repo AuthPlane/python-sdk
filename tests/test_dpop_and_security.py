@@ -307,9 +307,11 @@ async def test_verify_dpop_proof_rejects_wrong_nonce_under_policy(
             expected_jkt=dpop_provider.key_material.thumbprint,
             expected_nonce="server-nonce-abc",
         )
-    # The rejection reaches an unauthenticated caller via error_description in
-    # the WWW-Authenticate challenge, so it must not echo the nonce the server
-    # is expecting — that would supply a valid nonce without the round trip.
+    # The nonce must stay out of the message itself: `error_description` holds
+    # a fixed sentence by default, but `verbose_description=True` puts the
+    # message on the wire, and a resource server may log or surface it either
+    # way. Echoing the expected nonce would supply a valid one without the
+    # round trip.
     assert "server-nonce-abc" not in www_authenticate(excinfo.value)
     assert "stale" not in str(excinfo.value)
 

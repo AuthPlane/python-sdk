@@ -367,103 +367,12 @@ async def test_background_refresh_uses_effective_ttl() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Change detection and callbacks
+# Rotation of the served document
 # ---------------------------------------------------------------------------
 
 
-async def test_change_callback_fires_when_document_changes() -> None:
-    """Test that on_change callback is invoked when document content changes."""
-    doc_v1: dict[str, Any] = {"keys": [{"kid": "key-1"}]}
-    doc_v2: dict[str, Any] = {"keys": [{"kid": "key-2"}]}
-
-    change_events: list[dict[str, Any]] = []
-
-    async def on_change(old_doc: dict[str, Any], new_doc: dict[str, Any]) -> None:
-        change_events.append({"old": old_doc, "new": new_doc})
-
-    # Fetcher returns different docs on successive calls
-    call_count: dict[str, int] = {"count": 0}
-
-    async def fetcher() -> FetchResult:
-        call_count["count"] += 1
-        doc = doc_v2 if call_count["count"] > 1 else doc_v1
-        return FetchResult(document=doc, expires_at=None)
-
-    cache = JWKSCache(fetcher, document_type="jwks", on_change=on_change)
-
-    # First fetch: no callback (no previous cache)
-    await cache.get()
-    await asyncio.sleep(0.05)  # Allow callback task to run
-    assert len(change_events) == 0
-
-    # Second fetch: document changed, callback should fire
-    await cache.get(force_refresh=True)
-    await asyncio.sleep(0.05)  # Allow callback task to run
-    assert len(change_events) == 1
-    assert change_events[0]["old"] == doc_v1
-    assert change_events[0]["new"] == doc_v2
-
-    await cache.aclose()
-
-
-async def test_change_callback_not_fired_when_document_unchanged() -> None:
-    """Test that on_change callback is NOT invoked when document is identical."""
-    doc: dict[str, Any] = {"keys": [{"kid": "key-1"}]}
-    change_events: list[dict[str, Any]] = []
-
-    async def on_change(old_doc: dict[str, Any], new_doc: dict[str, Any]) -> None:
-        change_events.append({"old": old_doc, "new": new_doc})
-
-    # Fetcher returns same doc every time
-    async def fetcher() -> FetchResult:
-        return FetchResult(document=doc, expires_at=None)
-
-    cache = JWKSCache(fetcher, document_type="jwks", on_change=on_change)
-
-    # First fetch
-    await cache.get()
-    await asyncio.sleep(0.05)
-    assert len(change_events) == 0
-
-    # Second fetch: same document, callback should NOT fire
-    await cache.get(force_refresh=True)
-    await asyncio.sleep(0.05)
-    assert len(change_events) == 0
-
-    await cache.aclose()
-
-
-async def test_change_callback_error_does_not_fail_fetch() -> None:
-    """Test that errors in on_change callback don't break cache operation."""
-    doc_v1: dict[str, Any] = {"keys": [{"kid": "key-1"}]}
-    doc_v2: dict[str, Any] = {"keys": [{"kid": "key-2"}]}
-
-    async def broken_callback(_old_doc: dict[str, Any], _new_doc: dict[str, Any]) -> None:
-        raise RuntimeError("Callback failed!")
-
-    call_count: dict[str, int] = {"count": 0}
-
-    async def fetcher() -> FetchResult:
-        call_count["count"] += 1
-        doc = doc_v2 if call_count["count"] > 1 else doc_v1
-        return FetchResult(document=doc, expires_at=None)
-
-    cache = JWKSCache(fetcher, document_type="jwks", on_change=broken_callback)
-
-    # First fetch
-    result1 = await cache.get()
-    assert result1 == doc_v1
-
-    # Second fetch: callback will error but fetch should succeed
-    result2 = await cache.get(force_refresh=True)
-    await asyncio.sleep(0.05)  # Allow callback task to run
-    assert result2 == doc_v2  # Fetch succeeded despite callback error
-
-    await cache.aclose()
-
-
-async def test_no_callback_when_on_change_is_none() -> None:
-    """Test that cache works normally when on_change is not provided."""
+async def test_refresh_serves_the_rotated_key_set() -> None:
+    """A refresh that returns a different key set replaces the served one."""
     doc_v1: dict[str, Any] = {"keys": [{"kid": "key-1"}]}
     doc_v2: dict[str, Any] = {"keys": [{"kid": "key-2"}]}
 
@@ -474,13 +383,27 @@ async def test_no_callback_when_on_change_is_none() -> None:
         doc = doc_v2 if call_count["count"] > 1 else doc_v1
         return FetchResult(document=doc, expires_at=None)
 
-    # No on_change parameter
     cache = JWKSCache(fetcher, document_type="jwks")
 
-    result1 = await cache.get()
-    assert result1 == doc_v1
+    assert await cache.get() == doc_v1
+    assert await cache.get(force_refresh=True) == doc_v2
+    assert await cache.contains_kid("key-2") is True
+    assert await cache.contains_kid("key-1") is False
 
-    result2 = await cache.get(force_refresh=True)
-    assert result2 == doc_v2
+    await cache.aclose()
+
+
+async def test_refresh_returning_the_same_key_set_is_a_no_op() -> None:
+    """An unchanged key set leaves the cache serving exactly what it served."""
+    doc: dict[str, Any] = {"keys": [{"kid": "key-1"}]}
+
+    async def fetcher() -> FetchResult:
+        return FetchResult(document=doc, expires_at=None)
+
+    cache = JWKSCache(fetcher, document_type="jwks")
+
+    assert await cache.get() == doc
+    assert await cache.get(force_refresh=True) == doc
+    assert await cache.contains_kid("key-1") is True
 
     await cache.aclose()

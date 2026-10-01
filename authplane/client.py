@@ -14,15 +14,18 @@ from .dpop import DPoPProvider, InboundDPoPOptions
 from .errors import CircuitOpenError, DPoPError, MetadataFetchError, ServerError
 from .internal import (
     DocumentFetcher,
+    FetchResult,
     JWKSCache,
     MetadataCache,
     build_metadata_url,
-    validate_resource_indicator,
+    validate_prm_resource_identifier,
+    validate_resource_metadata_url,
 )
 from .net import FetchSettings
 from .net.ssrf import SSRFError
 from .oauth import (
     IntrospectionResponse,
+    IntrospectionRevocation,
     TokenExchangeOptions,
     TokenResponse,
     client_credentials_grant,
@@ -32,7 +35,6 @@ from .oauth import (
 )
 
 if TYPE_CHECKING:
-    from .oauth.types import IntrospectionRevocation
     from .verifier import AuthplaneResource
     from .verifier.verifier import RevocationChecker
 
@@ -76,7 +78,6 @@ class AuthplaneClient:
         self._circuit_breaker: CircuitBreaker = CircuitBreaker()
         self._dev_mode: bool = False
         self._dpop: DPoPProvider | None = None
-        self._jwks_uri: str | None = None
         self._jwks_refresh_seconds: int = 300
         self._metadata_refresh_seconds: int = 3600
 
@@ -99,7 +100,9 @@ class AuthplaneClient:
     ) -> Self:
         """Create and initialize the client.
 
-        Discovers AS metadata and starts JWKS background refresh.
+        Discovers AS metadata and primes the JWKS cache. Refreshes are driven by
+        traffic, not by a task started here: the first background refresh is
+        spawned by a read that finds the document past 80% of its TTL.
 
         Args:
             issuer: Authorization-server issuer URL (the prefix RFC 8414 metadata
@@ -116,8 +119,10 @@ class AuthplaneClient:
             fetch_settings: Explicit :class:`FetchSettings` override. When None,
                 derived from ``dev_mode``.
             jwks_refresh_seconds: Background JWKS refresh interval (must be > 0).
-            metadata_refresh_seconds: Background metadata refresh interval
-                (must be > 0).
+            metadata_refresh_seconds: AS metadata re-read interval (must be > 0).
+                Governs verification traffic as well as outbound AS calls: once
+                the interval has elapsed, the next ``verify()`` re-reads
+                metadata and follows a rotated ``jwks_uri``.
             cache_ttl_buffer_seconds: Safety margin subtracted from each token's
                 lifetime before the entry is considered expired. Default 30s.
             default_ttl_seconds: Fallback lifetime applied when the AS omits
@@ -133,8 +138,18 @@ class AuthplaneClient:
                 circuit trips. Default 30s.
 
         Raises:
-            InvalidIssuerError: If ``issuer`` carries a query or fragment
-                component (RFC 8414 §2 forbids both). This fails fast at
+            InvalidIssuerError: If ``issuer`` carries a query or a fragment
+                component (RFC 8414 §2 forbids both), contains whitespace or
+                a control character (RFC 3986 §2 — ``urlsplit`` removes tab,
+                CR and LF from anywhere in the input, so the derived fetch
+                target would differ from the identifier the AS-metadata
+                comparison is seeded with), is not an absolute URL
+                with a scheme and a host (RFC 8414 §2 requires a URL; §3.1
+                inserts the well-known suffix after the host, so without one
+                there is no derivable metadata URL), or carries a userinfo
+                subcomponent (RFC 9110 §4.2.4 — the issuer is published to
+                unauthenticated callers in the PRM document's
+                ``authorization_servers`` member). This fails fast at
                 construction, before any network fetch. Subclasses ``ValueError``,
                 so an existing ``except ValueError`` still catches it.
         """
@@ -218,83 +233,68 @@ class AuthplaneClient:
             allow_http=self._fetch_settings.allow_http,
             refresh_seconds=self._metadata_refresh_seconds,
             document_type="metadata",
-            on_change=self._on_metadata_changed,
         )
 
         # Security-first: JWKS location is always discovery-derived; we do not
-        # fall back to a synthesized default path anymore.
-        self._jwks_uri = await self._metadata_cache.get_jwks_uri()
+        # fall back to a synthesized default path anymore. Read once here so a
+        # metadata document that is unreachable, rejected, or silent about
+        # ``jwks_uri`` fails ``create()`` as a metadata problem, rather than
+        # reaching the operator wrapped in whatever the first key-set fetch
+        # happened to raise. The value is not retained: every fetch resolves it
+        # again from the document current at that moment.
+        jwks_uri = await self._metadata_cache.get_jwks_uri()
         logger.info(
             "JWKS URI discovered from AS metadata",
-            extra={"jwks_uri": self._jwks_uri},
+            extra={"jwks_uri": jwks_uri},
         )
 
-        # Start JWKS cache
-        jwks_fetcher = DocumentFetcher(
-            self._jwks_uri,
-            document_type="jwks",
-            settings=self._fetch_settings,
-            max_size=65536,  # 64KB for JWKS
-        )
         self._jwks_cache = JWKSCache(
-            fetcher=jwks_fetcher.fetch,
+            fetcher=self._fetch_jwks,
             refresh_seconds=self._jwks_refresh_seconds,
             document_type="jwks",
+            # The key set's TTL says when its *contents* may have changed. It
+            # says nothing about the AS having published them somewhere else,
+            # which is what a `jwks_uri` rotation is — so the cache is given the
+            # means to compare where its keys came from against where metadata
+            # currently says they live.
+            source_resolver=self._metadata_cache.get_jwks_uri,
         )
         # Prime the cache
         await self._jwks_cache.get()
 
-    async def _on_metadata_changed(
-        self,
-        old_metadata: dict[str, object],
-        new_metadata: dict[str, object],
-    ) -> None:
-        """Handle metadata changes (e.g., JWKS URI rotation)."""
-        # Log introspection_endpoint changes
-        old_introspection = old_metadata.get("introspection_endpoint")
-        new_introspection = new_metadata.get("introspection_endpoint")
-        if old_introspection != new_introspection:
-            logger.info(
-                "introspection_endpoint changed in AS metadata",
-                extra={
-                    "old_introspection_endpoint": old_introspection,
-                    "new_introspection_endpoint": new_introspection,
-                },
-            )
+    async def _fetch_jwks(self) -> FetchResult:
+        """Fetch the key set from wherever the current AS metadata says it lives.
 
-        new_jwks_uri = new_metadata.get("jwks_uri")
-        if self._jwks_uri == new_jwks_uri:
-            return
+        The location is resolved per fetch instead of being captured at
+        construction and rebound when the document changes. There is then no
+        second cache object to swap: a rotation takes effect on the next key-set
+        fetch, whichever path reaches it first.
 
-        logger.warning(
-            "JWKS URI changed in AS metadata, restarting JWKS cache",
-            extra={"old_jwks_uri": self._jwks_uri, "new_jwks_uri": new_jwks_uri},
+        Resolving the URI and committing the key set are separate awaits, so a
+        metadata refresh that commits a rotated document in between still
+        leaves a key set fetched from the withdrawn URI in the cache. What no
+        longer follows is that it keeps being served: :class:`JWKSCache` is
+        given the means to compare where its key set came from against where
+        metadata currently says the keys live, and refetches when the two
+        disagree rather than waiting out its own TTL. Recovery is therefore not
+        contingent on the rotation also introducing a new `kid` — a re-key
+        under a stable `kid` produces no miss to recover on.
+
+        The URI comes from the validated document, so a metadata response that
+        fails validation cannot redirect key retrieval; and if the newly
+        advertised URI is unreachable, the fetch fails and :class:`JWKSCache`
+        keeps serving the keys it already had rather than being left empty.
+        """
+        if self._metadata_cache is None:  # pragma: no cover - set before this is reachable
+            raise MetadataFetchError("authplane: AS metadata cache is not initialized")
+        jwks_uri = await self._metadata_cache.get_jwks_uri()
+        jwks_fetcher = DocumentFetcher(
+            jwks_uri,
+            document_type="jwks",
+            settings=self._fetch_settings,
+            max_size=65536,  # 64KB for JWKS
         )
-
-        # Rotation is applied eagerly so subsequent verifications fetch from the
-        # newly advertised key set rather than silently continuing on stale metadata.
-        if self._jwks_cache is not None:
-            await self._jwks_cache.aclose()
-
-        # Update URI and restart JWKS cache
-        self._jwks_uri = str(new_jwks_uri) if new_jwks_uri else None
-        if self._jwks_uri is not None:
-            jwks_fetcher = DocumentFetcher(
-                self._jwks_uri,
-                document_type="jwks",
-                settings=self._fetch_settings,
-                max_size=65536,
-            )
-            self._jwks_cache = JWKSCache(
-                fetcher=jwks_fetcher.fetch,
-                refresh_seconds=self._jwks_refresh_seconds,
-                document_type="jwks",
-            )
-            await self._jwks_cache.get()
-            logger.info(
-                "JWKS cache restarted with new URI",
-                extra={"jwks_uri": self._jwks_uri},
-            )
+        return await jwks_fetcher.fetch()
 
     # ----- Public API: Token operations -----
 
@@ -413,14 +413,27 @@ class AuthplaneClient:
         revocation_checker: "RevocationChecker | IntrospectionRevocation | None" = None,
         fail_closed: bool = False,
         inbound_dpop: InboundDPoPOptions | None = None,
+        resource_metadata_url: str | None = None,
     ) -> "AuthplaneResource":
         """Create a resource scoped to a URI.
 
         The resource uses this client's JWKS cache and metadata.
 
-        When *fail_closed* is True, the verifier rejects tokens when the
-        revocation checker raises an exception instead of the default
-        fail-open behaviour.
+        When a *revocation_checker* is configured and the check itself fails
+        — introspection unreachable, an error response, a custom checker
+        raising — **the token is let through** and a warning is logged. Pass
+        ``fail_closed=True`` to refuse it instead. The default keeps the
+        resource server answering while the AS is unreachable, which is what
+        local JWT validation is for; ``fail_closed=True`` trades that
+        availability for never honouring a token it could not confirm. See
+        :class:`~authplane.IntrospectionRevocation` for the trade-off in
+        full.
+
+        ``fail_closed`` is only consulted when a revocation check actually
+        runs. Both halves of that pairing are logged at construction when
+        they point the surprising way: setting the flag without a checker
+        (nothing to fail), and configuring a checker while leaving the
+        fail-open default in place.
 
         Inbound DPoP enforcement (RFC 9449 § 7) is configured per-resource
         via :class:`InboundDPoPOptions` per RFC 9728 § 2. Passing any
@@ -430,14 +443,45 @@ class AuthplaneClient:
         ``dpop_bound_access_tokens_required``; omitting the argument keeps
         DPoP fields out of PRM entirely.
 
+        ``resource_metadata_url`` overrides the URL advertised as RFC 9728
+        §5.1 ``resource_metadata``, for a deployment where the Protected
+        Resource Metadata document is served by the authorization server
+        rather than by this resource — authserver >= 0.2.0 serves one per
+        registered Resource. It changes what
+        :meth:`~authplane.verifier.AuthplaneResource.resource_metadata_url`
+        returns, and nothing else: the resource identifier, the token
+        ``aud`` check, and the document :meth:`prm_response
+        <authplane.verifier.AuthplaneResource.prm_response>` builds are
+        untouched. Leave it unset — the default — and the advertised URL is
+        the RFC 9728 §3.1 derivation of the resource identifier, byte for
+        byte what it was before this option existed.
+
         Raises:
-            InvalidResourceError: If *resource* carries a fragment component.
-                RFC 8707 §2 forbids one in a resource indicator. Rejected here,
-                at construction, for the same reason ``create()`` rejects a
-                malformed issuer — the alternative is surfacing it from
-                ``prm_url()`` while composing an RFC 9728 challenge, i.e. from
-                inside a 401 response path. Subclasses ``ValueError``, so an
-                existing ``except ValueError`` still catches it.
+            InvalidResourceError: If *resource* carries a fragment component
+                (RFC 8707 §2 forbids one in a resource indicator), contains
+                whitespace or a control character (RFC 3986 §2; parsing would
+                strip it, diverging from the identifier stored verbatim,
+                RFC 9728 §3.3), is not an absolute URL with a scheme and a
+                host (RFC 8707 §2 requires an absolute URI; RFC 9728 §3
+                derives the metadata URL by inserting the well-known suffix
+                after the host), carries a userinfo subcomponent
+                (RFC 9110 §4.2.4 — the identifier reaches a 401 challenge, an
+                ``htu`` origin, and log records, so embedded credentials are
+                rejected outright), or carries a port that does not parse
+                (RFC 3986 §3.2.3). Rejected here, at construction, for the
+                same reason ``create()`` rejects a malformed issuer — the
+                alternative is surfacing it from ``prm_url()`` while composing
+                an RFC 9728 challenge, i.e. from inside a 401 response path.
+                Subclasses ``ValueError``, so an existing ``except
+                ValueError`` still catches it. Also raised when
+                *resource_metadata_url* is not an absolute ``http`` /
+                ``https`` URL, or carries a fragment, whitespace or a control
+                character, a userinfo subcomponent, a ``"`` or a ``\\``, or a
+                port that does not parse — see
+                :func:`~authplane.validate_resource_metadata_url`. Same
+                reasoning: the value is advertised in a challenge served to an
+                unauthenticated caller, so a bad one is a startup failure, not
+                a 401-path one.
             ValueError: If *allowed_algorithms* contains an algorithm outside
                 ``("RS256", "ES256")``. Raised by
                 :class:`~authplane.verifier.AuthplaneResource`'s constructor,
@@ -454,7 +498,14 @@ class AuthplaneClient:
         # test_client_resource_rejects_fragment_at_construction, which asserts
         # the invoking frame — deleting this line turns that test red rather
         # than changing behaviour.
-        validate_resource_indicator(resource)
+        validate_prm_resource_identifier(resource)
+
+        # Same pairing, same reason, for the override: redundant for the
+        # guarantee (the constructor gates it too) and load-bearing for the
+        # traceback. Kept on the same line of defence as the identifier so the
+        # two configured URLs of this factory are diagnosed together.
+        if resource_metadata_url is not None:
+            validate_resource_metadata_url(resource_metadata_url)
 
         # fail_closed is only consulted when a revocation check runs; setting
         # it without a checker means no revocation check happens at all, which
@@ -466,6 +517,33 @@ class AuthplaneClient:
                 extra={"resource": resource},
             )
 
+        # The mirror image, and the more surprising of the two: an operator who
+        # configured a revocation checker asked for a stricter posture, and the
+        # default answers an unanswerable "is this token still valid?" with yes.
+        # Say so at startup rather than only per failed check, where it arrives
+        # after the token was already accepted.
+        #
+        # INFO, not WARNING, and the difference is deliberate: the mirror case
+        # above is a mistake — the flag does nothing — while this one is a
+        # documented, defensible choice. `fail_closed=False` is the default and
+        # the user guide recommends keeping it when availability matters, so an
+        # operator who read that section and chose it would have no way to
+        # acknowledge a WARNING short of filtering this logger — the same logger
+        # carrying the mistake above and the per-check fail-open warning. The
+        # realistic outcome is that they filter it and lose all three.
+        if revocation_checker is not None and not fail_closed:
+            logger.info(
+                "Revocation checking is fail-open: a failed revocation check accepts "
+                "the token. Pass fail_closed=True to reject instead",
+                extra={"resource": resource},
+            )
+
+        # The introspection-credentials warning is not duplicated here the way
+        # validate_prm_resource_identifier is: that one raises, so the extra
+        # frame buys a traceback at the operator's own line, while this one
+        # logs and a second copy would just be a duplicate record at startup.
+        # It lives on AuthplaneResource.__init__, which every path reaches.
+
         return AuthplaneResource(
             client=self,
             resource=resource,
@@ -475,6 +553,7 @@ class AuthplaneClient:
             revocation_checker=revocation_checker,
             fail_closed=fail_closed,
             inbound_dpop=inbound_dpop,
+            resource_metadata_url=resource_metadata_url,
         )
 
     # ----- Internal: endpoint resolution -----
@@ -509,7 +588,10 @@ class AuthplaneClient:
         if isinstance(exc, SSRFError):
             return
         # Transport failures and server-side failures are the outage signals the
-        # breaker should react to.
+        # breaker should react to. Every other AuthError — including the 403
+        # `access_denied` a non-allowlisted cross-client exchange gets and the
+        # 400 `invalid_target` for a resource indicator that matches nothing —
+        # is the AS answering, not the AS failing, and stays out of the count.
         if isinstance(exc, (ServerError, httpx.RequestError)):
             self._circuit_breaker.record_failure()
 
@@ -538,6 +620,11 @@ class AuthplaneClient:
     @property
     def dev_mode(self) -> bool:
         return self._dev_mode
+
+    @property
+    def can_authenticate(self) -> bool:
+        """True when the client holds AS credentials it can introspect with."""
+        return self._auth is not None
 
     @property
     def dpop(self) -> DPoPProvider | None:

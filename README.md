@@ -56,6 +56,10 @@ Adapter packages depend on `authplane-sdk`, so installing one adapter brings the
 
 Requires Python 3.11+.
 
+## Compatibility
+
+Tested against authserver 0.2.0. Introspection-based revocation (`IntrospectionRevocation`) requires authserver ≥ 0.1.2 and a confidential resource-server client that is either the issuing client or a runtime-client of the Resource — see the [user guide](authplane/docs/user-guide.md#5-revocation-checking).
+
 ## Capabilities
 
 ### Standards and RFCs

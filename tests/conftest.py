@@ -1,8 +1,9 @@
 """Shared test fixtures for Authplane SDK tests."""
 
 import time
-from collections.abc import AsyncGenerator, Generator
-from typing import Any, Protocol
+from collections.abc import AsyncGenerator, Callable, Generator
+from dataclasses import dataclass
+from typing import Any, Protocol, cast
 
 import pytest
 import respx
@@ -38,6 +39,72 @@ JWKSKeypair = dict[str, Any]
 MockASMetadata = dict[str, Route]
 
 
+@dataclass(frozen=True)
+class SigningKey:
+    """An ES256 signing key: its public JWK, its PEMs, and a token signer."""
+
+    kid: str
+    jwk: dict[str, Any]
+    private_pem: bytes
+    public_pem: bytes
+
+    @property
+    def jwks(self) -> dict[str, Any]:
+        """The single-key JWKS document publishing this key."""
+        return {"keys": [self.jwk]}
+
+    def sign(self, **overrides: Any) -> str:
+        """Sign an otherwise-valid access token for the default test resource.
+
+        Keyword arguments override individual claims.
+        """
+        from authlib.jose import jwt
+
+        now = int(time.time())
+        claims: dict[str, Any] = {
+            "iss": "https://auth.example.com",
+            "aud": "https://api.example.com",
+            "sub": "user123",
+            "client_id": "client456",
+            "scope": "read:data write:data",
+            "exp": now + 3600,
+            "nbf": now,
+            "iat": now,
+            "jti": f"token-id-{self.kid}",
+        }
+        claims.update(overrides)
+        header = {"alg": "ES256", "typ": "at+jwt", "kid": self.kid}
+        token: bytes = jwt.encode(header, claims, self.private_pem)  # pyright: ignore[reportUnknownMemberType]
+        return token.decode("utf-8")
+
+
+def _make_es256_key(kid: str) -> SigningKey:
+    """Generate an ES256 keypair and export its public half as a JWK."""
+    private_key = ec.generate_private_key(ec.SECP256R1())
+
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    # Convert to authlib JsonWebKey
+    jwk = JsonWebKey.import_key(public_pem, {"kty": "EC"})  # pyright: ignore[reportArgumentType]
+    # cast, not just an annotation: `as_dict()` is untyped, and the resulting
+    # value now flows into a typed constructor rather than into a dict literal
+    # that used to absorb the Unknown.
+    jwk_dict = cast("dict[str, Any]", jwk.as_dict())  # pyright: ignore[reportUnknownMemberType]
+    jwk_dict["kid"] = kid
+    jwk_dict["alg"] = "ES256"
+    jwk_dict["use"] = "sig"
+
+    return SigningKey(kid=kid, jwk=jwk_dict, private_pem=private_pem, public_pem=public_pem)
+
+
 @pytest.fixture
 def jwks_keypair() -> JWKSKeypair:
     """Generate an ES256 keypair and export as JWKS.
@@ -45,40 +112,24 @@ def jwks_keypair() -> JWKSKeypair:
     Returns:
         dict with 'private_key', 'public_key', and 'jwks' (JWKS JSON dict)
     """
-    # Generate ES256 private key
-    private_key = ec.generate_private_key(ec.SECP256R1())
-
-    # Get public key
-    public_key = private_key.public_key()
-
-    # Export private key as PEM
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-
-    # Export public key as PEM
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-
-    # Convert to authlib JsonWebKey
-    jwk = JsonWebKey.import_key(public_pem, {"kty": "EC"})  # pyright: ignore[reportArgumentType]
-    jwk_dict: dict[str, Any] = jwk.as_dict()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    jwk_dict["kid"] = "test-key-1"
-    jwk_dict["alg"] = "ES256"
-    jwk_dict["use"] = "sig"
-
-    # Build JWKS document
-    jwks: dict[str, Any] = {"keys": [jwk_dict]}
-
+    key = _make_es256_key("test-key-1")
     return {
-        "private_key": private_pem,
-        "public_key": public_pem,
-        "jwks": jwks,
+        "private_key": key.private_pem,
+        "public_key": key.public_pem,
+        "jwks": key.jwks,
     }
+
+
+@pytest.fixture
+def signing_key_factory() -> Callable[[str], SigningKey]:
+    """Mint an independent ES256 signing key under a caller-chosen ``kid``.
+
+    ``jwks_keypair`` and ``token_factory`` cover the single-key case. This is
+    for tests that need a *second*, unrelated key set — a rotated ``jwks_uri``
+    publishing a key the previous URI never served, say — where the point is
+    that a token is unverifiable unless the SDK fetched the right document.
+    """
+    return _make_es256_key
 
 
 @pytest.fixture
@@ -277,3 +328,29 @@ async def verifier_with_discovery(
         scopes=["read:data", "write:data"],
     )
     yield v
+
+
+def _expire_metadata_interval(client: AuthplaneClient) -> None:
+    """Bring the metadata refresh interval forward instead of sleeping through it.
+
+    Only the cache's notion of when it last fetched is moved; ``verify()`` still
+    drives the refresh through the production path, and no caller passes
+    ``force_refresh``. Sleeping for a real interval both costs wall clock and
+    races the background refresh that opens at 80% of it, which makes exact
+    fetch-count assertions unreliable on a loaded runner.
+    """
+    metadata_cache = client.metadata_cache
+    assert metadata_cache is not None
+    metadata_cache._cache_time = 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.fixture
+def expire_metadata_interval() -> Callable[[AuthplaneClient], None]:
+    """The documented seam for driving a metadata refresh without sleeping.
+
+    Exposed as a fixture rather than a module-level function so the conformance
+    suite can re-export it alongside the others: the poke then has one
+    definition and one docstring, instead of being repeated inline wherever a
+    rotation is driven.
+    """
+    return _expire_metadata_interval

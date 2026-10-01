@@ -1,7 +1,10 @@
 """RFC 8414 conformance tests."""
 
+import asyncio
+from collections.abc import Callable
 from typing import Any
 
+import httpx
 import pytest
 import respx
 
@@ -215,45 +218,107 @@ async def test_rfc8414_discovery_url_must_insert_well_known_before_issuer_path(
 
 @pytest.mark.conformance("rfc8414-jwks-uri-rotation-must-reconfigure-jwks-cache")
 async def test_rfc8414_jwks_uri_rotation_must_reconfigure_jwks_cache(
-    jwks_keypair: dict[str, Any],
+    signing_key_factory: Callable[[str], Any],
 ) -> None:
+    """Follow a ``jwks_uri`` rotation on nothing but ordinary verify() traffic.
+
+    Every mechanism here is one a deployment already has: the refresh interval
+    is shortened through the documented constructor argument, real time is
+    allowed to elapse, and the rotation is then followed by a second
+    ``verify()``. No force-refresh argument, no test-only hook, no reflection
+    into cache internals, and no assertion against a locally built metadata
+    object — the case rules all four out, and they are the reason it was
+    written: a verify-only resource server repeats no discovery of its own, so
+    a rotation it cannot follow from the verification path is a rotation it
+    never follows in production.
+
+    Both key sets publish the **same** ``kid`` deliberately. Were the rotated
+    key introduced under a new ``kid``, the unknown-``kid`` refresh would
+    follow the rotation on its own and this would silently become a test of
+    that separate requirement instead. Holding the ``kid`` fixed removes that
+    explanation: a verifier still bound to the withdrawn URI finds the retired
+    key under exactly the id it is looking for, uses it, and fails on the
+    signature. Only a genuine rebind to the rotated URI can make this pass.
+    """
+    # Two seconds rather than one. `DocumentCache.get` spawns a background
+    # refresh once 80% of the effective TTL has elapsed, so the
+    # inside-the-interval assertion below requires `create()` and the two
+    # `verify()` calls that follow it to finish within that window — 0.8s at a
+    # one-second interval, which is a non-deterministic failure on a loaded CI
+    # runner rather than a clean one. Two seconds buys 1.6s of slack and the
+    # rotation is still driven well inside the case's two-interval bound.
+    metadata_refresh_seconds = 2
+    kid = "rotating-key"
+    old_key = signing_key_factory(kid)
+    new_key = signing_key_factory(kid)
+
+    rotated = False
+    metadata_calls = 0
+
+    def metadata_response(request: httpx.Request) -> httpx.Response:
+        nonlocal metadata_calls
+        metadata_calls += 1
+        uri = (
+            "https://auth.example.com/jwks-v2.json"
+            if rotated
+            else "https://auth.example.com/jwks-v1.json"
+        )
+        return httpx.Response(
+            200,
+            json={"issuer": "https://auth.example.com", "jwks_uri": uri},
+        )
+
     with respx.mock:
         respx.get("https://auth.example.com/.well-known/oauth-authorization-server").mock(
-            return_value=respx.MockResponse(
-                200,
-                json={
-                    "issuer": "https://auth.example.com",
-                    "jwks_uri": "https://auth.example.com/jwks-v1.json",
-                },
-            )
+            side_effect=metadata_response
         )
-        respx.get("https://auth.example.com/jwks-v1.json").mock(
-            return_value=respx.MockResponse(200, json=jwks_keypair["jwks"])
+        # The withdrawn URI stays reachable and keeps serving the retired key.
+        # A 404 there would let the case pass on the fetch failing rather than
+        # on the rotation being followed.
+        old_route = respx.get("https://auth.example.com/jwks-v1.json").mock(
+            return_value=respx.MockResponse(200, json=old_key.jwks)
         )
-        respx.get("https://auth.example.com/jwks-v2.json").mock(
-            return_value=respx.MockResponse(200, json=jwks_keypair["jwks"])
+        new_route = respx.get("https://auth.example.com/jwks-v2.json").mock(
+            return_value=respx.MockResponse(200, json=new_key.jwks)
         )
 
         client = await AuthplaneClient.create(
             issuer="https://auth.example.com",
             fetch_settings=_NO_SSRF,
+            metadata_refresh_seconds=metadata_refresh_seconds,
+            # Deliberately far longer than the metadata interval. If the key set
+            # could fall out of cache on its own, the rotation would be followed
+            # by that expiry rather than by the rotation being noticed, and the
+            # case would pass without demonstrating the requirement.
+            jwks_refresh_seconds=3600,
         )
+        verifier = client.resource(resource="https://api.example.com")
         try:
-            old_metadata: dict[str, object] = {
-                "issuer": "https://auth.example.com",
-                "jwks_uri": "https://auth.example.com/jwks-v1.json",
-            }
-            new_metadata: dict[str, object] = {
-                "issuer": "https://auth.example.com",
-                "jwks_uri": "https://auth.example.com/jwks-v2.json",
-            }
+            assert (await verifier.verify(old_key.sign())).kid == kid
 
-            # Drive the rotation directly via the internal hook. A full end-to-
-            # end test would simulate a metadata-refresh tick, but the SDK
-            # exposes no public seam for that yet; using the private hook here
-            # is a deliberate trade-off. Follow-up: lift this to a public
-            # test seam when the metadata-cache lifecycle is refactored.
-            await client._on_metadata_changed(old_metadata, new_metadata)  # pyright: ignore[reportPrivateUsage]
-            assert client._jwks_uri == "https://auth.example.com/jwks-v2.json"  # pyright: ignore[reportPrivateUsage]
+            # Ordinary traffic inside the interval must not re-read metadata.
+            # The interval is the SDK's side of the contract the case's bound is
+            # written against, and following a rotation promptly is worth
+            # nothing if the price is a discovery fetch per verification.
+            # Exact equality, not a tolerance: the 80%-of-TTL background
+            # refresh is the only other thing that could move this counter,
+            # and the interval above is sized so it cannot have fired yet.
+            metadata_calls_inside_interval = metadata_calls
+            assert (await verifier.verify(old_key.sign(jti="inside-interval"))).kid == kid
+            assert metadata_calls == metadata_calls_inside_interval
+
+            # The AS begins serving the rotated document.
+            rotated = True
+            await asyncio.sleep(metadata_refresh_seconds + 0.2)
+            old_route_calls_at_rotation = old_route.call_count
+
+            assert (await verifier.verify(new_key.sign())).kid == kid
+            # Metadata re-fetched once the interval elapsed, with no explicit
+            # refresh call anywhere...
+            assert metadata_calls > metadata_calls_inside_interval
+            # ...JWKS fetched from the rotated location...
+            assert new_route.called
+            # ...and the withdrawn one not touched again once the rebind happened.
+            assert old_route.call_count == old_route_calls_at_rotation
         finally:
             await client.aclose()

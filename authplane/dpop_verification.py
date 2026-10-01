@@ -152,11 +152,13 @@ async def verify_dpop_proof(
 
     # RFC 9449 §9 (Resource Server-Provided Nonce). Opt-in: an empty
     # expected_nonce means no policy, so a proof carrying an AS-issued nonce
-    # still verifies. The message carries no values on purpose — errors on this
-    # path reach an unauthenticated caller through the `error_description` of a
-    # `WWW-Authenticate` challenge (see `www_authenticate` in errors.py), and
-    # echoing the server's expected nonce there would hand out a currently
-    # valid nonce without the challenge round trip the freshness proof rests on.
+    # still verifies. The message carries no values on purpose. `www_authenticate`
+    # no longer copies it into `error_description` by default, but it does under
+    # `verbose_description=True`, and the value would still reach any resource
+    # server that surfaces the exception message itself — so keeping the nonce
+    # out of the message is defence in depth, not a redundant precaution:
+    # echoing the server's expected nonce hands out a currently valid nonce
+    # without the challenge round trip the freshness proof rests on.
     if expected_nonce and str(claims.get("nonce", "")) != expected_nonce:
         raise InvalidDPoPProofError("DPoP proof nonce mismatch")
 

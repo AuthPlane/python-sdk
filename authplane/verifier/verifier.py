@@ -30,15 +30,23 @@ from ..errors import (
     InvalidClaimsError,
     InvalidSignatureError,
     JWKSFetchError,
+    MetadataFetchError,
     TokenExpiredError,
     TokenMissingError,
     TokenRevokedError,
     VerifierRuntimeError,
 )
 from ..internal.jwt import decode_jwt_header
-from ..internal.urls import build_prm_url, validate_resource_indicator
+from ..internal.urls import (
+    build_prm_url,
+    validate_prm_resource_identifier,
+    validate_resource_metadata_url,
+)
 from ..oauth.prm import build_prm
-from ..oauth.types import IntrospectionRevocation
+from ..oauth.types import (
+    IntrospectionRevocation,
+    warn_unauthenticated_introspection,
+)
 from .claims import VerifiedClaims, freeze_value
 
 if TYPE_CHECKING:
@@ -59,12 +67,23 @@ class AuthplaneResource:
     construction-time guarantee does not depend on which path was taken.
 
     Raises:
-        InvalidResourceError: If *resource* carries a fragment component.
-            RFC 8707 §2 forbids one in a resource indicator. Rejected here, at
-            construction, rather than from ``prm_url()`` while composing an
-            RFC 9728 challenge — i.e. from inside a 401 response path.
-            Subclasses ``ValueError``, so an existing ``except ValueError``
-            still catches it.
+        InvalidResourceError: If *resource* carries a fragment component
+            (RFC 8707 §2 forbids one in a resource indicator), contains
+            whitespace or a control character (RFC 3986 §2; parsing would
+            strip it, diverging from the identifier stored verbatim,
+            RFC 9728 §3.3), is not an absolute URL with a scheme and a host
+            (RFC 8707 §2 requires an absolute URI; RFC 9728 §3 derives the
+            metadata URL by inserting the well-known suffix after the host),
+            carries a userinfo subcomponent (RFC 9110 §4.2.4), or carries a
+            port that does not parse (RFC 3986 §3.2.3). Rejected
+            here, at construction, rather than from ``prm_url()`` while
+            composing an RFC 9728 challenge — i.e. from inside a 401 response
+            path. Subclasses ``ValueError``, so an existing ``except
+            ValueError`` still catches it. Also raised when
+            *resource_metadata_url* is not an absolute ``http`` / ``https``
+            URL, or carries a fragment, whitespace or a control character, a
+            userinfo subcomponent, a ``"`` or a ``\\``, or a port that does not
+            parse — see :func:`validate_resource_metadata_url`.
         ValueError: If *allowed_algorithms* contains an algorithm outside
             ``("RS256", "ES256")``.
     """
@@ -79,6 +98,7 @@ class AuthplaneResource:
         revocation_checker: RevocationChecker | IntrospectionRevocation | None = None,
         fail_closed: bool = False,
         inbound_dpop: InboundDPoPOptions | None = None,
+        resource_metadata_url: str | None = None,
     ) -> None:
         # THIS is the authoritative resource gate — every construction path
         # goes through it. The class is exported from the package root, so
@@ -93,7 +113,15 @@ class AuthplaneResource:
         # by test_client_resource_rejects_fragment_at_construction, which
         # asserts the invoking frame — do not dedupe the pair without reading
         # it. build_prm_url's call is the third, a defensive backstop.
-        validate_resource_indicator(resource)
+        validate_prm_resource_identifier(resource)
+
+        # Same argument, one sink further along: the override is advertised in
+        # the same challenge parameter the derived URL would be, so it is gated
+        # at construction rather than on the 401 path. The derived URL gets its
+        # guarantees from the identifier gate above; a configured one has none
+        # until this call.
+        if resource_metadata_url is not None:
+            validate_resource_metadata_url(resource_metadata_url)
 
         invalid = [alg for alg in allowed_algorithms if alg not in _ALLOWED_ALGORITHMS]
         if invalid:
@@ -103,6 +131,7 @@ class AuthplaneResource:
 
         self._client = client
         self._resource = resource
+        self._resource_metadata_url = resource_metadata_url
         self._scopes = tuple(scopes)
         self._allowed_algorithms = allowed_algorithms
         self._clock_skew_seconds = clock_skew_seconds
@@ -134,6 +163,15 @@ class AuthplaneResource:
             self._revocation_checker: RevocationChecker | None = self._introspection_checker
         else:
             self._revocation_checker = revocation_checker
+
+        # Authoritative site for the same reason the identifier gate above is:
+        # direct construction is supported, and a check living only in
+        # AuthplaneClient.resource() would leave that path silent about the one
+        # misconfiguration that produces no error anywhere — `active: false` on
+        # every token. The factory keeps a copy for the traceback.
+        warn_unauthenticated_introspection(client, revocation_checker, resource)
+        # Once per resource: see _introspection_checker.
+        self._introspection_ownership_warned = False
 
     @property
     def scopes(self) -> tuple[str, ...]:
@@ -304,6 +342,39 @@ class AuthplaneResource:
             allowed_algorithms=self._dpop_allowed_proof_algorithms,
         )
 
+    async def _refresh_metadata(self, *, force: bool = False) -> None:
+        """Keep the AS metadata document warm from the verification path.
+
+        Verification is the one path through the SDK that never calls an AS
+        endpoint, so on a resource server that only verifies tokens nothing
+        else re-enters the metadata cache after the client is created. Without
+        this hop ``metadata_refresh_seconds`` would never elapse into a fetch
+        and a rotated ``jwks_uri`` would never be followed — the key set would
+        keep being fetched from the URI the document named at construction.
+
+        :meth:`MetadataCache.get` is TTL-gated, so ordinary traffic pays a
+        comparison until the interval is up and one fetch after that.
+
+        A metadata problem must not fail a verification the cached key set can
+        still satisfy: token-level issuer identity is checked against the
+        configured issuer, not against metadata, and the cache keeps serving
+        the last document it accepted when a refresh fails. So a refresh error
+        is logged and verification continues.
+        """
+        metadata_cache = self._client.metadata_cache
+        if metadata_cache is None:
+            return
+        try:
+            await metadata_cache.get(force_refresh=force)
+        except MetadataFetchError as exc:
+            # The only error the metadata cache raises: its error factory wraps
+            # transport, parse and validation failures alike.
+            logger.warning(
+                "AS metadata refresh failed during verification, "
+                "continuing with the cached key set",
+                extra={"issuer": self._client.issuer, "error": str(exc)},
+            )
+
     async def _verify_token_core(self, token: str) -> VerifiedClaims:
         jwks_cache = self._client.jwks_cache
         if not jwks_cache:
@@ -325,11 +396,21 @@ class AuthplaneResource:
         if header.get("typ") != "at+jwt":
             raise InvalidClaimsError(f"Token type must be 'at+jwt', got '{header.get('typ')}'")
 
+        # After the header checks above, so a structurally invalid token from an
+        # unauthenticated caller is rejected without reaching network I/O.
+        await self._refresh_metadata()
+
         key_dict = await jwks_cache.get_key_by_kid(kid, algorithm=alg)
         if key_dict is None:
             logger.info("Kid not found in JWKS, forcing refresh", extra={"kid": kid})
-            # A single forced refresh covers normal key rotation without letting
-            # an attacker turn every unknown kid into repeated network churn.
+            # A kid miss says the cached answer is stale, and the cached
+            # metadata document that names where keys live is no more current
+            # than the key set it produced. Re-read it first, so a rotation is
+            # followed on the request that first needs the new key instead of
+            # at the next interval boundary. A single forced refresh of each
+            # covers normal key rotation without letting an attacker turn every
+            # unknown kid into repeated network churn.
+            await self._refresh_metadata(force=True)
             key_dict = await jwks_cache.get_key_by_kid(kid, force_refresh=True, algorithm=alg)
             if key_dict is None:
                 raise InvalidSignatureError(f"Token kid '{kid}' not found in JWKS after refresh")
@@ -427,7 +508,27 @@ class AuthplaneResource:
         policy configured via the ``fail_closed`` parameter.
         """
         result = await self._client.introspect(raw_token)
-        return not result.active
+        if result.active:
+            return False
+        # The token already passed local verification, so `active: false` is
+        # either a real revocation or the AS declining to answer: authserver
+        # >= 0.1.2 returns it to any introspecting client that is neither the
+        # issuing client nor a runtime-client of the Resource in `aud`. The two
+        # are indistinguishable on the wire, and the second rejects every token
+        # with no error anywhere — so name the cause once, on the first
+        # rejection, rather than on each of the thousands that follow.
+        if not self._introspection_ownership_warned:
+            self._introspection_ownership_warned = True
+            logger.warning(
+                "Introspection returned active=false for a token that passed local "
+                "verification. If this is not a revocation, the AS does not recognise "
+                "this resource server as the token's owner: the introspecting client "
+                "must be confidential and either the issuing client or a runtime-client "
+                "of the resource (authserver admin resource runtime-client add "
+                "--client-id <rs-client-id> --slug <resource-slug>)",
+                extra={"jti": claims.jti, "resource": self._resource},
+            )
+        return True
 
     def prm_response(self) -> dict[str, object]:
         """Build protected resource metadata for this verifier scope."""
@@ -447,9 +548,40 @@ class AuthplaneResource:
     def prm_url(self) -> str:
         """Return the RFC 9728 well-known PRM discovery URL for this resource.
 
-        Symmetric with :meth:`prm_response`: this is the URL clients can fetch
-        to retrieve that document, suitable for the ``resource_metadata``
-        challenge parameter (:func:`authplane.www_authenticate`,
-        :func:`authplane.response_headers_for`).
+        Symmetric with :meth:`prm_response`: this is the URL a client fetches
+        to retrieve *that* document — the one this SDK builds — derived from
+        the resource identifier per RFC 9728 §3.1.
+
+        This is the derivation, not the advertisement. Use
+        :meth:`resource_metadata_url` for the ``resource_metadata`` challenge
+        parameter (:func:`authplane.www_authenticate`,
+        :func:`authplane.response_headers_for`): the two differ exactly when
+        the resource was configured to point clients at a PRM document it does
+        not host itself.
         """
         return build_prm_url(self._resource)
+
+    def resource_metadata_url(self) -> str:
+        """Return the URL to advertise as RFC 9728 §5.1 ``resource_metadata``.
+
+        The configured ``resource_metadata_url`` when the resource was built
+        with one, and :meth:`prm_url` otherwise — so a caller composing a
+        challenge reads one accessor and gets whichever topology the resource
+        is deployed in.
+
+        .. warning::
+
+           RFC 9728 §3.3 binds the served document's ``resource`` member to the
+           URL the document was fetched from, not to the API URL the client
+           called: the value "MUST be identical to the protected resource's
+           resource identifier value into which the well-known URI path suffix
+           was inserted to create the URL used to retrieve the metadata", and
+           otherwise "MUST NOT be used". Those coincide only when the metadata
+           URL is the §3.1 derivation of the resource identifier. Nothing in
+           §5.1 exempts a challenge-supplied URL from that rule, so an
+           override pointing at a document on a different origin is usable
+           only against clients that do not enforce §3.3 — and that check is
+           what stops a resource server from pointing a client at metadata
+           describing somebody else's resource. Prefer the derived URL.
+        """
+        return self._resource_metadata_url or self.prm_url()

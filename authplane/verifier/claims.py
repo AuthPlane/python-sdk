@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -72,8 +73,10 @@ class VerifiedClaims:
         requested tuple on ``required_scopes`` (not just the missing ones, so
         adapters that surface ``scope="…"`` in the WWW-Authenticate challenge
         keep emitting the complete required set), and its message names every
-        missing scope plus the scopes the token carries — rendered verbatim
-        into the RFC 6750 ``error_description``.
+        missing scope plus the scopes the token carries. That message stays on
+        the exception for the resource server to log; the RFC 6750
+        ``error_description`` carries a fixed, caller-safe sentence instead,
+        unless the challenge is built with ``verbose_description=True``.
         """
         # Materialise once: the caller may pass any iterable (generator, set,
         # frozenset, etc.). We need to iterate twice — once to find missing
@@ -112,7 +115,19 @@ class VerifiedClaims:
 
     @property
     def may_act(self) -> Mapping[str, Any] | None:
-        """Return the ``may_act`` claim, or None if absent (RFC 8693 Section 4.4)."""
+        """Return the ``may_act`` claim, or None if absent (RFC 8693 Section 4.4).
+
+        .. deprecated::
+            authserver 0.2.0 no longer issues ``may_act``; removed in the next
+            minor. The claim is still read when present, so the accessor keeps
+            working against a server that emits it.
+        """
+        warnings.warn(
+            "VerifiedClaims.may_act is deprecated: authserver 0.2.0 no longer issues "
+            "may_act; removed in the next minor",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         v: object = self.raw.get("may_act")
         if not isinstance(v, Mapping):
             return None

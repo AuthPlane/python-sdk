@@ -26,28 +26,18 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       # AuthPlane/conformance is the public sibling repo carrying the shared
-      # oauth-sdk-conformance-catalog.yaml. Cloned to $RUNNER_TEMP — outside
-      # $GITHUB_WORKSPACE — so the catalog stays out of the working tree,
-      # matching release.yml's invariant. Plain git clone is enough:
-      # actions/checkout disallows paths outside the workspace, and we don't
-      # need its auth/persist-credentials features for a public read-only repo.
+      # oauth-sdk-conformance-catalog.yaml, pinned by SHA in the tracked
+      # .conformance-catalog-ref (read from the checked-out workspace, so the
+      # Checkout step above must precede this one).
+      #
+      # The read/guard/fetch sequence lives in the script rather than inline
+      # here: release.yml and the drift workflow need the same three lines, and
+      # inline in each the 40-hex-SHA guard could be tightened in one copy and
+      # not the others. The script clones to $RUNNER_TEMP — outside
+      # $GITHUB_WORKSPACE — so the catalog stays out of the working tree.
       - name: Clone shared conformance catalog (out of tree)
         if: matrix.package == 'root'
-        run: |
-          # Conformance catalog pinned by SHA, single-sourced from the tracked
-          # .conformance-catalog-ref at the repo root (read from the checked-out
-          # workspace, so the Checkout step above must precede this one). Bump
-          # that file when adopting new catalog cases, together with the SDK-side
-          # conformance coverage, so a catalog change can never break CI on its
-          # own. Source: github.com/AuthPlane/conformance.
-          CONFORMANCE_CATALOG_REF="$(cat "$GITHUB_WORKSPACE/.conformance-catalog-ref")"
-          grep -Eq '^[0-9a-f]{40}$' <<<"$CONFORMANCE_CATALOG_REF" \
-            || { echo "::error::.conformance-catalog-ref must be a 40-hex commit SHA"; exit 1; }
-          git init -q "$RUNNER_TEMP/conformance"
-          git -C "$RUNNER_TEMP/conformance" \
-            fetch --depth=1 https://github.com/AuthPlane/conformance.git "$CONFORMANCE_CATALOG_REF" \
-            || { echo "::error::Pinned conformance catalog ref $CONFORMANCE_CATALOG_REF is unreachable"; exit 1; }
-          git -C "$RUNNER_TEMP/conformance" checkout -q FETCH_HEAD
+        run: .github/scripts/fetch-conformance-catalog.sh
 
       - name: Setup Python
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0

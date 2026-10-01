@@ -9,12 +9,14 @@ import respx
 
 from authplane import FetchSettings
 from authplane.errors import (
+    AccessDeniedError,
     AuthError,
     AuthplaneError,
     ConsentRequiredError,
     InvalidClientError,
     InvalidGrantError,
     InvalidScopeError,
+    InvalidTargetError,
     ServerError,
 )
 from authplane.net.http import build_basic_auth_header
@@ -372,6 +374,59 @@ async def test_exchange_invalid_client() -> None:
             make_auth_header(),
             _NO_SSRF,
         )
+
+
+@respx.mock
+async def test_exchange_access_denied_maps_to_access_denied_error() -> None:
+    """403 access_denied maps to AccessDeniedError, not ConsentRequiredError.
+
+    authserver 0.2.0 answers this when the exchanging client is not in the
+    target Resource's exchange allowlist; the caller has to tell it apart
+    from consent_required because re-prompting the user cannot fix it.
+    """
+    respx.post(TOKEN_ENDPOINT).mock(
+        return_value=httpx.Response(
+            403,
+            json={
+                "error": "access_denied",
+                "error_description": "client not allowed to exchange for this resource",
+            },
+        )
+    )
+    with pytest.raises(AccessDeniedError, match="not allowed to exchange") as exc:
+        await exchange_token(
+            TOKEN_ENDPOINT,
+            TokenExchangeOptions(subject_token=SUBJECT_TOKEN),
+            make_auth_header(),
+            _NO_SSRF,
+        )
+
+    assert exc.value.code == "access_denied"
+    assert exc.value.status_code == 403
+    assert not isinstance(exc.value, ConsentRequiredError)
+
+
+@respx.mock
+async def test_exchange_invalid_target_maps_to_invalid_target_error() -> None:
+    """400 invalid_target (RFC 8707 §2.2) maps to InvalidTargetError."""
+    respx.post(TOKEN_ENDPOINT).mock(
+        return_value=httpx.Response(
+            400,
+            json={"error": "invalid_target", "error_description": "unknown resource"},
+        )
+    )
+    with pytest.raises(InvalidTargetError, match="unknown resource") as exc:
+        await exchange_token(
+            TOKEN_ENDPOINT,
+            TokenExchangeOptions(
+                subject_token=SUBJECT_TOKEN, resources=("https://downstream.example/",)
+            ),
+            make_auth_header(),
+            _NO_SSRF,
+        )
+
+    assert exc.value.code == "invalid_target"
+    assert exc.value.status_code == 400
 
 
 @respx.mock

@@ -12,6 +12,8 @@ Usage:
 
 Environment (optional):
   AUTHSERVER_DIR Path to local authserver repo (default: ../authserver)
+  AUTHSERVER_REF Git ref of authserver to check out before building
+                 (default: leave the checkout as is)
 EOF
 }
 
@@ -25,9 +27,15 @@ if [ ! -d "${AUTHSERVER_DIR}" ]; then
   exit 1
 fi
 
-echo "==> Starting authserver demo server (client_credentials enabled)"
+echo "==> Starting authserver demo server"
 (
   cd "${AUTHSERVER_DIR}"
+  if [ -n "${AUTHSERVER_REF:-}" ]; then
+    echo "==> Checking out authserver ${AUTHSERVER_REF}"
+    git fetch --tags
+    git checkout "${AUTHSERVER_REF}"
+    rm -f bin/authserver
+  fi
   if [ ! -x "bin/authserver" ]; then
     if [ -d "cmd/authserver" ]; then
       go build -o bin/authserver ./cmd/authserver
@@ -40,7 +48,7 @@ echo "==> Starting authserver demo server (client_credentials enabled)"
     echo "ERROR: authserver binary is not executable at ${AUTHSERVER_DIR}/bin/authserver" >&2
     exit 1
   fi
-  AUTHPLANE_CLIENT_CREDENTIALS_ENABLED=true ./demo/mcp-demo-server-start.sh
+  ./demo/mcp-demo-server-start.sh
 )
 
 echo ""

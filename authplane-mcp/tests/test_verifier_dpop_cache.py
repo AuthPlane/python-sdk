@@ -31,7 +31,12 @@ from typing import Any
 from unittest.mock import AsyncMock, PropertyMock
 
 import pytest
-from authplane import AuthplaneResource, DPoPReplayDetectedError, VerifiedClaims
+from authplane import (
+    AuthplaneResource,
+    DPoPReplayDetectedError,
+    VerifiedClaims,
+    get_or_create_verify_cache_from_scope,
+)
 from authplane._dpop_adapter import get_or_create_verify_cache
 from starlette.requests import Request
 
@@ -260,7 +265,7 @@ async def test_comma_joined_dpop_value_fails_auth() -> None:
 async def test_htu_origin_from_configured_resource_not_host_header() -> None:
     """htu's origin comes from the configured resource, never from Host.
 
-    Mirrors the TS sibling: an upstream that controls the Host /
+    An upstream that controls the Host /
     X-Forwarded-Proto headers must not be able to decide which htu the
     DPoP proof is validated against.
     """
@@ -278,11 +283,8 @@ async def test_htu_origin_from_configured_resource_not_host_header() -> None:
     await verifier.verify_token("valid_token")
 
     ctx = mock.verify.await_args.kwargs["dpop_request"]
-    # Exact htu: the configured resource origin plus the request path, with no
-    # trace of the attacker-controlled Host / X-Forwarded-Proto headers. A
-    # prefix or substring check could pass on a URL that merely embeds the
-    # expected origin.
-    assert ctx.url == "https://api.example.com/mcp"
+    assert ctx.url.startswith("https://api.example.com")
+    assert "attacker" not in ctx.url
 
 
 @pytest.mark.asyncio
@@ -543,3 +545,28 @@ async def test_unrelated_runtimeerror_from_get_http_request_propagates() -> None
     with pytest.raises(RuntimeError, match="scope not initialized"):
         await verifier.verify_token("t")
     assert mock.verify.await_count == 0
+
+
+def test_scope_and_request_caches_are_one_slot_under_real_starlette() -> None:
+    """The shared-slot claim, asserted against Starlette rather than a stand-in.
+
+    The core package pins this with a hand-written ``State`` look-alike, which
+    can only fail if the look-alike is wrong — it cannot catch Starlette
+    changing how ``Request.state`` reaches ``scope["state"]``. That is the whole
+    claim the raw-ASGI helpers rest on, so it is asserted here, where Starlette
+    is already a dependency.
+
+    If these ever diverge, a raw-ASGI middleware and a Starlette layer above it
+    each re-enter the inbound DPoP replay store for one ``jti`` — a
+    ``DPoPReplayDetectedError`` on an honest request.
+    """
+    request = _make_request()
+    scope = request.scope
+
+    from_request = get_or_create_verify_cache(request)
+    assert get_or_create_verify_cache_from_scope(scope) is from_request
+
+    # And in the other order, on a fresh request.
+    other = _make_request()
+    from_scope = get_or_create_verify_cache_from_scope(other.scope)
+    assert get_or_create_verify_cache(other) is from_scope

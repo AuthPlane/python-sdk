@@ -5,10 +5,19 @@ name: Release tooling
 # fails. The shell scripts under scripts/ are in the same category — a
 # break in them surfaces only when someone reaches for them after a
 # release, which is the worst moment to discover it — so they are linted
-# and tested here too. Scoped to those two paths to keep CI overhead off
+# and tested here too. Scoped to a few paths to keep CI overhead off
 # unrelated PRs.
 #
-# The scripts trigger is `scripts/**`, not `scripts/*.sh`: a single-level
+# `.github/scripts/**` is in scope on the same argument. Those scripts stopped
+# being thin fetch wrappers once the conformance case-body drift check landed
+# there, and they run only on a weekly schedule, so a break in them surfaces
+# late and quietly. The trigger stays narrow: it matches PRs touching those
+# scripts, not every PR touching `.github/**`.
+#
+# Linting alone would not have been enough for them, so they carry their own
+# tests here as well, next to backport-fixes.test.sh.
+#
+# Every scripts trigger is `<dir>/**`, not `<dir>/*.sh`: a single-level
 # glob would leave a future scripts/lib/*.sh both untriggered here and
 # unlinted below, in each case silently.
 
@@ -16,12 +25,14 @@ on:
   pull_request:
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - "scripts/**"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/**"
+      - ".github/scripts/**"
       - "scripts/**"
 
 permissions:
@@ -92,9 +103,34 @@ jobs:
           printf 'shellcheck: %s\n' "${sh_files[@]}"
           shellcheck "${sh_files[@]}"
 
+      - name: Shellcheck the workflow support scripts
+        # A second step rather than a second root on the find above, so an
+        # empty result names the directory that went missing. Merged, a renamed
+        # .github/scripts/ would still be covered by whatever scripts/ returned.
+        run: |
+          mapfile -d '' -t sh_files < <(find .github/scripts -type f -name '*.sh' -print0)
+          if [[ ${#sh_files[@]} -eq 0 ]]; then
+            echo "error: no shell scripts found under .github/scripts/" >&2
+            exit 1
+          fi
+          printf 'shellcheck: %s\n' "${sh_files[@]}"
+          shellcheck "${sh_files[@]}"
+
       # backport-fixes.sh accepts a branch or a tag as --from, and only the
       # branch form has a remote-tracking ref. The tag form is what the release
       # flow tells you to use once release.yml has deleted the branch, so it is
       # the form least likely to be exercised before it is needed.
       - name: Test backport-fixes.sh
         run: scripts/backport-fixes.test.sh
+
+      # Shellcheck above is the only other gate on the conformance drift
+      # scripts, and it cannot see the way they break: a loosened id regex that
+      # drops cases, or a `diff` whose exit code stops being read, is valid
+      # shell. The result is a check that reports green while guarding nothing,
+      # on a weekly schedule where nobody is watching — and it would stay
+      # unnoticed until a real re-tightening slipped through, which is the
+      # failure that check exists to prevent. These controls pin the detection
+      # itself. They need neither the catalog clone nor the SDK's dependencies,
+      # so they run here.
+      - name: Test conformance-case-body-drift.sh
+        run: .github/scripts/conformance-case-body-drift.test.sh

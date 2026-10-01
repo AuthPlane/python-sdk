@@ -205,8 +205,7 @@ class TokenVerifierFactory(Protocol):
 
     def __call__(
         self, base_url: str, resource: str, *, scopes: list[str] | None = None
-    ) -> AuthplaneTokenVerifier:
-        """Build a verifier for ``resource`` against the server at ``base_url``."""
+    ) -> AuthplaneTokenVerifier: ...
 
 
 @pytest.fixture

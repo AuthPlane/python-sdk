@@ -54,8 +54,6 @@ if [ "${RESOURCE_BASE}" = "${RESOURCE_URL}" ]; then
   exit 1
 fi
 PRM_URL="${RESOURCE_BASE}/.well-known/oauth-protected-resource/mcp"
-ADMIN_URL="${ADMIN_URL:-http://localhost:9001}"
-ADMIN_KEY="${ADMIN_KEY:-b480b9760e730abe43b98d0ba01418961df392de0fc6358c36a9a62a8764a7c1}"
 
 cleanup() {
   if [ -n "${SERVER_PID:-}" ]; then
@@ -66,22 +64,6 @@ cleanup() {
   pkill -f "${REPO_ROOT}/authplane-fastmcp/demo/mcpserver.py" || true
 }
 trap cleanup EXIT
-
-register_scope() {
-  local scope_name="$1"
-  local status
-  status="$(
-    curl -sS -o /dev/null -w "%{http_code}" \
-      -X POST "${ADMIN_URL}/admin/scopes" \
-      -H "Authorization: Bearer ${ADMIN_KEY}" \
-      -H "Content-Type: application/json" \
-      -d "{\"resource\":\"${RESOURCE_URL}\",\"name\":\"${scope_name}\",\"description\":\"Manual E2E smoke scope ${scope_name}\"}" \
-      || true
-  )"
-  if [ "${status}" != "201" ] && [ "${status}" != "409" ]; then
-    echo "WARN: could not ensure scope ${scope_name} for ${RESOURCE_URL} (status=${status}); continuing" >&2
-  fi
-}
 
 if [ "${RUN_SETUP}" -eq 1 ]; then
   bash "${SCRIPT_DIR}/manual-e2e-setup.sh"
@@ -118,10 +100,6 @@ if [ ! -f /tmp/authserver-demo.client-id ] || [ ! -f /tmp/authserver-demo.key ];
   echo "ERROR: missing /tmp/authserver-demo.client-id or /tmp/authserver-demo.key" >&2
   exit 1
 fi
-
-echo "==> Ensuring authserver scopes for resource: ${RESOURCE_URL}"
-register_scope "tools/add"
-register_scope "tools/multiply"
 
 CLIENT_ID="$(cat /tmp/authserver-demo.client-id)"
 CLIENT_SECRET="$(cat /tmp/authserver-demo.key)"

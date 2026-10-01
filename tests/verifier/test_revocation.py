@@ -217,6 +217,42 @@ async def test_introspection_active_false_raises(
         await verifier_with_introspection.verify(token)
 
 
+async def test_introspection_active_false_warns_about_ownership_once(
+    verifier_with_introspection: AuthplaneResource,
+    token_factory: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """active=false after a valid JWT names the runtime-client requirement, once.
+
+    authserver >= 0.1.2 answers active=false to any client that is neither
+    the issuing client nor a runtime-client of the resource, and that is
+    indistinguishable from a revocation on the wire. The warning is the only
+    signal the operator gets; repeating it per token would drown the log.
+    """
+    respx.post(INTROSPECTION_URL).mock(return_value=respx.MockResponse(200, json={"active": False}))
+    with caplog.at_level("WARNING", logger="authplane.verifier.verifier"):
+        for _ in range(3):
+            with pytest.raises(TokenRevokedError):
+                await verifier_with_introspection.verify(token_factory())
+
+    ownership = [
+        r for r in caplog.records if "does not recognise this resource server" in r.message
+    ]
+    assert len(ownership) == 1
+    assert "runtime-client add" in ownership[0].message
+
+
+async def test_introspection_active_true_does_not_warn_about_ownership(
+    verifier_with_introspection: AuthplaneResource,
+    token_factory: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    respx.post(INTROSPECTION_URL).mock(return_value=respx.MockResponse(200, json={"active": True}))
+    with caplog.at_level("WARNING", logger="authplane.verifier.verifier"):
+        await verifier_with_introspection.verify(token_factory())
+    assert not any("does not recognise" in r.message for r in caplog.records)
+
+
 async def test_introspection_http_error_fails_open(
     verifier_with_introspection: AuthplaneResource,
     token_factory: Any,
@@ -358,6 +394,188 @@ async def test_fail_closed_without_checker_warns(
                 fail_closed=True,
             )
         assert any("fail_closed=True has no effect" in record.message for record in caplog.records)
+    finally:
+        await c.aclose()
+
+
+async def test_fail_open_revocation_checker_warns(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A revocation checker left on the fail-open default warns at construction.
+
+    The operator who configures a checker has opted into a stricter posture,
+    so the default answering an unanswerable check with "accept" is the
+    surprising direction. Surfacing it at startup is the point: the per-check
+    warning in verify() only fires once a check has already failed, and only
+    after the token was accepted.
+    """
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("INFO", logger="authplane.client"):
+            c.resource(
+                resource=RESOURCE,
+                scopes=["read:data"],
+                revocation_checker=IntrospectionRevocation(),
+            )
+        assert any(
+            "Revocation checking is fail-open" in record.message and record.levelname == "INFO"
+            for record in caplog.records
+        )
+    finally:
+        await c.aclose()
+
+
+async def test_introspection_without_credentials_warns_at_construction(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """IntrospectionRevocation on a client with no auth= warns at construction.
+
+    Unauthenticated introspection is not an error path — the AS answers 200
+    with active=false — so nothing later would flag it; every token would be
+    rejected as revoked with no explanation.
+    """
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("WARNING", logger="authplane.client"):
+            c.resource(
+                resource=RESOURCE,
+                scopes=["read:data"],
+                revocation_checker=IntrospectionRevocation(),
+            )
+        matching = [
+            r
+            for r in caplog.records
+            if "IntrospectionRevocation configured without AS credentials" in r.message
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelname == "WARNING"
+        assert "active=false" in matching[0].message
+    finally:
+        await c.aclose()
+
+
+async def test_introspection_without_credentials_warns_on_direct_construction(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """AuthplaneResource is exported, so direct construction must warn too.
+
+    The gate lives on __init__ rather than on the client factory precisely so
+    this path is not silent: it is the same misconfiguration, and it produces
+    no error anywhere.
+    """
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("WARNING", logger="authplane.client"):
+            AuthplaneResource(
+                client=c,
+                resource=RESOURCE,
+                scopes=["read:data"],
+                allowed_algorithms=["RS256"],
+                revocation_checker=IntrospectionRevocation(),
+            )
+        matching = [
+            r
+            for r in caplog.records
+            if "IntrospectionRevocation configured without AS credentials" in r.message
+        ]
+        assert len(matching) == 1
+    finally:
+        await c.aclose()
+
+
+async def test_introspection_with_credentials_does_not_warn_at_construction(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        auth=ASCredentials(client_id="rs", client_secret="s3cret"),
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("WARNING", logger="authplane.client"):
+            c.resource(
+                resource=RESOURCE,
+                scopes=["read:data"],
+                revocation_checker=IntrospectionRevocation(),
+            )
+        assert not any("without AS credentials" in r.message for r in caplog.records)
+    finally:
+        await c.aclose()
+
+
+async def test_custom_checker_without_credentials_does_not_warn_about_introspection(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The credentials warning is about introspection; a custom checker needs none."""
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+
+    async def never_revoked(claims: Any, raw_token: str) -> bool:
+        return False
+
+    try:
+        with caplog.at_level("WARNING", logger="authplane.client"):
+            c.resource(resource=RESOURCE, scopes=["read:data"], revocation_checker=never_revoked)
+        assert not any("without AS credentials" in r.message for r in caplog.records)
+    finally:
+        await c.aclose()
+
+
+async def test_fail_closed_revocation_checker_does_not_warn(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pairing the operator meant to configure stays quiet."""
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("INFO", logger="authplane.client"):
+            c.resource(
+                resource=RESOURCE,
+                scopes=["read:data"],
+                revocation_checker=IntrospectionRevocation(),
+                fail_closed=True,
+            )
+        assert not any(
+            "Revocation checking is fail-open" in record.message for record in caplog.records
+        )
+    finally:
+        await c.aclose()
+
+
+async def test_no_revocation_checker_does_not_warn(
+    mock_jwks: Route,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No checker configured is not the fail-open posture — nothing to warn about."""
+    c = await AuthplaneClient.create(
+        issuer=ISSUER,
+        fetch_settings=FetchSettings(ssrf_protection=False),
+    )
+    try:
+        with caplog.at_level("INFO", logger="authplane.client"):
+            c.resource(resource=RESOURCE, scopes=["read:data"])
+        assert not any(
+            "Revocation checking is fail-open" in record.message for record in caplog.records
+        )
     finally:
         await c.aclose()
 

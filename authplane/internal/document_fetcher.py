@@ -102,6 +102,7 @@ class DocumentFetcher:
             return FetchResult(
                 document=http_response.body,
                 expires_at=parse_expires_at(http_response.headers),
+                source=self._url,
             )
         else:
             # Direct fetch without SSRF protection — new client per call
@@ -112,4 +113,5 @@ class DocumentFetcher:
                 return FetchResult(
                     document=response.json(),
                     expires_at=parse_expires_at(dict(response.headers)),
+                    source=self._url,
                 )

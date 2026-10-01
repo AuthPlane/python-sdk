@@ -1,11 +1,26 @@
 name: Conformance catalog drift
 
 # Weekly (plus on-demand) check that the SDK's @pytest.mark.conformance markers
-# still cover the LATEST conformance catalog default branch, independent of the
-# pinned SHA that gates PR CI (.conformance-catalog-ref). A newly added,
-# uncovered catalog case FAILS this scheduled job so the drift is visible on the
-# Actions dashboard; it never breaks PR CI, which has no pull_request trigger and
-# runs against the pinned .conformance-catalog-ref.
+# still agree with the LATEST conformance catalog default branch, independent of
+# the pinned SHA that gates PR CI (.conformance-catalog-ref). Drift FAILS this
+# scheduled job so it is visible on the Actions dashboard; it never breaks PR CI,
+# which has no pull_request trigger and runs against the pinned
+# .conformance-catalog-ref.
+#
+# The job runs TWO checks, because they see different things:
+#
+#   1. Case-ID alignment against the tip. Reports cases ADDED to the catalog that
+#      no marker covers, and markers naming a case the catalog no longer carries.
+#      This is a set comparison over ids.
+#
+#   2. Case-BODY drift for the cases the markers register. Reports a case that
+#      was re-tightened IN PLACE — same id, changed requirement. Check 1 is blind
+#      to this by construction: the id set is unchanged, so the case still looks
+#      covered while the requirement underneath it has moved, and the SDK keeps
+#      declaring conformance to wording nothing verified it against. That has
+#      already happened once, to the metadata jwks_uri rotation case. Check 2
+#      needs the catalog at BOTH refs in the same job, which is why the pinned
+#      catalog is fetched here alongside the tip.
 
 on:
   schedule:
@@ -45,20 +60,146 @@ jobs:
         env:
           AUTHPLANE_CONFORMANCE_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
         run: |
-          pytest conformance-tests/test_catalog_alignment.py -v
+          # Tee'd so the Report step can tell drift from a harness fault: only
+          # the two disagreement assertions carry the drift prefix.
+          set -o pipefail
+          pytest conformance-tests/test_catalog_alignment.py -v \
+            | tee "$RUNNER_TEMP/align.log"
+
+      # The catalog at the ref this repo PINS, alongside the tip cloned above.
+      # The body check needs both to compare anything; with only the tip it
+      # would have nothing to compare against and could report nothing but
+      # green. Reuses the same fetch the pinned workflows use — including its
+      # 40-hex-SHA guard and its unreachable-ref failure — rather than a second
+      # copy of that logic that could be tightened in one place and not the
+      # other. CONFORMANCE_CATALOG_DEST keeps it off the default path, which
+      # the tip clone above already occupies.
+      #
+      # Placed AFTER the alignment check, with if: always(), so the two checks
+      # fail independently. Only check 2 reads the pinned catalog. Run before
+      # `align`, a failed fetch — a transient error on this second clone, or a
+      # pinned SHA that has become unreachable — would skip the alignment step
+      # (it carries no `if:`, so it defaults to `success()`) and silently drop
+      # the id-level check that ran on its own before check 2 existed. `Report
+      # drift` would then find no align.log and report the skip as a build or
+      # harness problem, which is the wrong diagnosis for a check that never
+      # started.
+      - name: Fetch pinned conformance catalog (out of tree)
+        if: always()
+        env:
+          CONFORMANCE_CATALOG_DEST: ${{ runner.temp }}/conformance-pinned
+        run: .github/scripts/fetch-conformance-catalog.sh
+
+      # The ids for check 2. They come from the harness's own report rather than
+      # from a grep over the test sources, so they cannot disagree with what
+      # actually registered.
+      #
+      # Run against the PINNED catalog, not the tip. The question the body check
+      # asks is "which cases does this SDK declare conformance to under its
+      # current pin", and anchoring the list to the pin keeps it stable while
+      # the tip moves. It also keeps this step independent of the step above,
+      # which is EXPECTED to go red whenever the tip has drifted.
+      #
+      # if: always() because of that: the id-level check failing is the normal
+      # way this job reports, and the body check must still run after it.
+      #
+      # A consequence worth naming, so the silence is not misread as a check
+      # that ran: conftest.py builds the report by iterating the ids of the
+      # catalog it was pointed at, which here is the pinned one, so this list is
+      # a SUBSET of the pinned catalog by construction. The drift script's
+      # "registers a case the pinned catalog does not hold" branch is therefore
+      # unreachable from this workflow. A marker naming a case the pin does not
+      # carry is reported by test_catalog_alignment.py, which ci.yml runs
+      # against the pin on every PR.
+      - name: Collect the case ids this SDK registers
+        if: always()
+        env:
+          AUTHPLANE_CONFORMANCE_CATALOG: ${{ runner.temp }}/conformance-pinned/oauth-sdk-conformance-catalog.yaml
+        run: |
+          # Delete the report the step above wrote against the TIP catalog. If
+          # the run below fails to produce a new one, the id script must find
+          # nothing rather than silently read the previous step's report and
+          # describe the wrong catalog.
+          rm -f "$GITHUB_WORKSPACE/conformance-report.json"
+
+          # The whole directory, not just the alignment module: conftest records
+          # a case id only for a marked test that actually ran, so a narrower
+          # selection would shorten the id list without saying so.
+          status=0
+          pytest conformance-tests/ > "$RUNNER_TEMP/pinned-suite.log" 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            # Not this job's signal to raise: a suite that fails against its own
+            # pinned catalog is red on every PR in ci.yml already. Surfaced, and
+            # the id list still comes from THIS run's report, never an older one.
+            echo "::warning::The conformance suite did not pass against the pinned catalog (exit $status). This job reports catalog drift, not suite health — see ci.yml. Log tail follows."
+            tail -n 40 "$RUNNER_TEMP/pinned-suite.log"
+          fi
+
+          .github/scripts/conformance-registered-case-ids.py \
+            > "$RUNNER_TEMP/registered-case-ids.txt"
+          echo "This SDK registers $(wc -l < "$RUNNER_TEMP/registered-case-ids.txt") conformance case(s)."
+
+      # Check 2. Fails the job when a case this SDK registers changed body
+      # between the pinned ref and the tip, and fails just as loudly when it
+      # cannot do that comparison at all.
+      - name: Check pinned case bodies against the catalog tip
+        id: bodies
+        if: always()
+        env:
+          PINNED_CATALOG: ${{ runner.temp }}/conformance-pinned/oauth-sdk-conformance-catalog.yaml
+          TIP_CATALOG: ${{ runner.temp }}/conformance/oauth-sdk-conformance-catalog.yaml
+          # Both of the next two are inputs the generic script knows nothing
+          # about, so both are passed explicitly. Its header still describes the
+          # layout it was written against — it names the id producer as a `.sh`
+          # and defaults COVERAGE_DIR to a directory this tree does not have —
+          # and is left alone on purpose: the values below decide what runs, and
+          # the byte-identity of a verbatim copy is worth more than correcting
+          # two comment lines here and forking it.
+          REGISTERED_IDS: ${{ runner.temp }}/registered-case-ids.txt
+          COVERAGE_DIR: conformance-tests/
+        run: |
+          DRIFT_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            .github/scripts/conformance-case-body-drift.sh
 
       - name: Report drift
         if: always()
         run: |
-          if [ "${{ steps.align.outcome }}" = "success" ]; then
-            echo "Conformance markers cover the latest catalog default branch." >> "$GITHUB_STEP_SUMMARY"
+          # The body check writes its own detail into the step summary when it
+          # finds something. Recorded here either way, so a green run states
+          # that both checks ran rather than only the one that prints on
+          # success — a check whose silence is indistinguishable from its
+          # absence is how this class went unnoticed in the first place.
+          if [ "${{ steps.bodies.outcome }}" = "success" ]; then
+            echo "Conformance case bodies: no registered case changed shape under an unchanged id." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::Conformance catalog drift detected: the SDK's @pytest.mark.conformance markers do not cover every case in the latest catalog default branch. Extend coverage in conformance-tests/, then bump .conformance-catalog-ref to adopt the new cases."
+            echo "::warning::The pinned case-body check did not pass (outcome: ${{ steps.bodies.outcome }}). Either a case this SDK registers was re-tightened under the same id, or the check could not run. Read its step log — it names the case."
+          fi
+
+          if [ "${{ steps.align.outcome }}" = "success" ]; then
+            echo "Conformance markers agree with the latest catalog default branch in both directions." >> "$GITHUB_STEP_SUMMARY"
+          elif ! grep -qF "Conformance-catalog drift:" "$RUNNER_TEMP/align.log" 2>/dev/null; then
+            # Red, but neither assertion fired: an unparseable catalog, a failed
+            # clone, a collection error. Calling that "drift" sends the reader
+            # to reconcile markers against a catalog that was never read.
+            echo "::warning::Catalog alignment could not run: the step failed without either drift assertion firing — a build or harness problem, not catalog drift. Read the step log."
+            {
+              echo "## Catalog alignment could not run"
+              echo ""
+              echo "The alignment step failed, but neither disagreement assertion fired — so this is a **build or harness problem, not catalog drift**: an unparseable or unfetched catalog, or a collection error."
+              echo ""
+              echo "Read the step log. Nothing in \`conformance-tests/\` needs reconciling until this run can read a catalog."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Conformance catalog drift detected: the SDK's @pytest.mark.conformance markers and the latest catalog default branch disagree — either a case has no marker, or a marker names a case the catalog no longer carries. Read the pytest output for which direction failed, reconcile conformance-tests/, then bump .conformance-catalog-ref to adopt the new catalog."
             {
               echo "## Conformance catalog drift detected"
               echo ""
-              echo "The SDK's \`@pytest.mark.conformance\` markers do not cover every case in the **latest** conformance catalog default branch."
+              echo "The SDK's \`@pytest.mark.conformance\` markers and the **latest** conformance catalog default branch disagree. The step output names the direction:"
+              echo ""
+              echo "- a case in the latest catalog has no marker — extend coverage in \`conformance-tests/\`;"
+              echo "- a marker names a case id the latest catalog no longer carries — the case was renamed or dropped upstream, so update the marker to follow it."
+              echo ""
               echo "PR CI is unaffected — it runs against the pinned \`.conformance-catalog-ref\`."
-              echo "Extend coverage in \`conformance-tests/\`, then bump \`.conformance-catalog-ref\` to adopt the new cases."
+              echo "Reconcile \`conformance-tests/\`, then bump \`.conformance-catalog-ref\` to adopt the new catalog."
             } >> "$GITHUB_STEP_SUMMARY"
           fi

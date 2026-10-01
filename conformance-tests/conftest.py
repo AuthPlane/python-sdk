@@ -56,7 +56,7 @@ xfails.
 
 import json
 import os
-import re
+import sys
 from datetime import UTC, datetime
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -66,11 +66,23 @@ import pytest
 
 import authplane
 
+# `--import-mode=importlib` (pyproject) does not put a test directory on
+# sys.path, so the sibling `_catalog` module is not importable by name without
+# this. conftest is imported before the test modules in its directory, so doing
+# it here covers `test_catalog_alignment.py` too.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _catalog import (
+    catalog_path,
+    load_catalog_case_ids,
+    load_catalog_version,
+)
+
 _ROOT = Path(__file__).resolve().parents[1]
 # Default layout: python-sdk and conformance cloned as siblings (see README
 # `Catalog path` section). Contributors with a different layout override via
 # AUTHPLANE_CONFORMANCE_CATALOG.
-_DEFAULT_CATALOG_PATH = _ROOT.parent / "conformance" / "oauth-sdk-conformance-catalog.yaml"
+_DEFAULT_CATALOG_PATH = catalog_path()
 _CATALOG_PATH = (
     Path(os.environ["AUTHPLANE_CONFORMANCE_CATALOG"])
     if "AUTHPLANE_CONFORMANCE_CATALOG" in os.environ
@@ -101,6 +113,7 @@ _results: dict[str, dict[str, Any]] = {}
 _uncatalogued_results: dict[str, dict[str, Any]] = {}
 
 jwks_keypair = _MODULE.jwks_keypair
+signing_key_factory = _MODULE.signing_key_factory
 token_factory = _MODULE.token_factory
 mock_jwks = _MODULE.mock_jwks
 mock_as_metadata = _MODULE.mock_as_metadata
@@ -108,17 +121,20 @@ client = _MODULE.client
 verifier = _MODULE.verifier
 client_with_discovery = _MODULE.client_with_discovery
 verifier_with_discovery = _MODULE.verifier_with_discovery
+# Deliberately NOT re-exported here: the unit suite's seam for bringing a
+# refresh interval forward reaches into the cache to do it. That is fine where
+# it lives, but the rotation case in this suite names reflection into cache
+# internals among the mechanisms it prohibits — a conformance test that used it
+# would be asserting the SDK can do something only the test can reach. Shorten
+# the interval through the constructor and let real time pass instead.
 
 
 def _load_catalog_metadata() -> tuple[str, list[str]]:
-    text = _CATALOG_PATH.read_text(encoding="utf-8")
-    version_match = re.search(r'^catalog_version:\s*"([^"]+)"\s*$', text, flags=re.MULTILINE)
-    if version_match is None:  # pragma: no cover - defensive guard
-        raise RuntimeError(f"Unable to locate catalog_version in {_CATALOG_PATH}")
-    catalog_ids = re.findall(
-        r'^\s+- id: "([^"]+)"\s*$', text.split("cases:", 1)[1], flags=re.MULTILINE
-    )
-    return version_match.group(1), catalog_ids
+    # Through `_catalog` so the report iterates exactly the ids
+    # `test_catalog_alignment` checks the markers against. Two copies of this
+    # parse can drift, and then the alignment test certifies a mapping the
+    # report never used.
+    return load_catalog_version(_CATALOG_PATH), sorted(load_catalog_case_ids(_CATALOG_PATH))
 
 
 def _extract_conformance_marker(item: Any) -> tuple[str | None, dict[str, Any]]:
