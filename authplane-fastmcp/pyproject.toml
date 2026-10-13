@@ -29,13 +29,13 @@ dependencies = [
     # Upper bound on 4.x is anticipatory — when fastmcp 4 ships we need to
     # re-verify the `FastMCP` constructor + `fastmcp.server.auth.require_scopes`
     # surface the adapter consumes.
-    "fastmcp>=3.2,<4",
+    "fastmcp>=3.2,<5",
     # This adapter imports the top-level `mcp` package directly (e.g.
     # `mcp.shared.exceptions`, `mcp.types`), so it needs a direct floor of
-    # 1.28.1 to reach the PYSEC-2026-3483 fix — `fastmcp>=3.2,<4` alone does not
+    # 1.28.1 to reach the PYSEC-2026-3483 fix — `fastmcp>=3.2,<5` alone does not
     # guarantee it. Upper bound excludes mcp 2.0, which renames the URL
     # elicitation field to snake_case `elicitation_id` (a separate port).
-    "mcp>=1.28.1,<2",
+    "mcp>=1.28.1,<3",
     "pydantic>=2.0",
 ]
 
@@ -53,7 +53,7 @@ dev = [
     "respx>=0.21",
     "cryptography>=42",
     "coverage>=7",
-    "ruff>=0.16,<0.17",
+    "ruff>=0.16,<0.18",
 ]
 
 [tool.pytest.ini_options]
